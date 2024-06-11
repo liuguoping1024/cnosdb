@@ -1,12 +1,10 @@
 use std::fmt::Debug;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use models::predicate::domain::TimeRange;
 use trace::{debug, info};
 
 use crate::compaction::CompactReq;
-use crate::kv_option::StorageOptions;
 use crate::tseries_family::{ColumnFile, LevelInfo, Version};
 use crate::LevelId;
 
@@ -16,10 +14,7 @@ pub trait Picker: Send + Sync + Debug {
 
 /// Compaction picker for picking files in level
 #[derive(Debug)]
-pub struct LevelCompactionPicker {
-    picking: AtomicBool,
-    storage: Arc<StorageOptions>,
-}
+pub struct LevelCompactionPicker {}
 
 impl Picker for LevelCompactionPicker {
     fn pick_compaction(&self, version: Arc<Version>) -> Option<CompactReq> {
@@ -145,9 +140,9 @@ impl Picker for LevelCompactionPicker {
         );
 
         Some(CompactReq {
-            ts_family_id: version.ts_family_id,
-            database: version.database.clone(),
-            storage_opt: version.storage_opt.clone(),
+            ts_family_id: version.tf_id(),
+            database: version.tenant_database(),
+            storage_opt: version.storage_opt(),
             files: picking_files,
             version: version.clone(),
             out_level,
@@ -156,13 +151,6 @@ impl Picker for LevelCompactionPicker {
 }
 
 impl LevelCompactionPicker {
-    pub fn new(storage_opt: Arc<StorageOptions>) -> LevelCompactionPicker {
-        Self {
-            picking: AtomicBool::new(false),
-            storage: storage_opt,
-        }
-    }
-
     /// Weight of file number of a level to be picked.
     fn level_weight_file_num(level: LevelId) -> f64 {
         match level {
@@ -171,18 +159,6 @@ impl LevelCompactionPicker {
             2 => 0.4,
             3 => 0.2,
             4 => 0.1,
-            _ => 0.0,
-        }
-    }
-
-    /// Weight of the ramaining size of a level to be picked.
-    fn level_weight_remaining_size(level: LevelId) -> f64 {
-        match level {
-            0 => 1.0,
-            1 => 1.0,
-            2 => 1.0,
-            3 => 1.0,
-            4 => 1.0,
             _ => 0.0,
         }
     }
@@ -296,17 +272,15 @@ impl LevelCompactionPicker {
 mod test {
     use std::sync::Arc;
 
-    use lru_cache::asynchronous::ShardedCache;
+    use cache::ShardedAsyncCache;
     use memory_pool::{GreedyMemoryPool, MemoryPoolRef};
     use metrics::metric_register::MetricsRegister;
     use models::predicate::domain::TimeRange;
-    use tokio::sync::mpsc;
 
     use crate::compaction::test::create_options;
     use crate::compaction::{LevelCompactionPicker, Picker};
-    use crate::file_utils::make_tsm_file_name;
+    use crate::file_utils::make_tsm_file;
     use crate::kv_option::Options;
-    use crate::kvcore::COMPACT_REQ_CHANNEL_CAP;
     use crate::memcache::MemCache;
     use crate::tseries_family::{ColumnFile, LevelInfo, TseriesFamily, Version};
 
@@ -348,7 +322,7 @@ mod test {
                     TimeRange::new(fts_min, fts_max),
                     file_size,
                     level == 0,
-                    make_tsm_file_name(tsm_dir, file_id),
+                    make_tsm_file(tsm_dir, file_id),
                 );
                 if compacting {
                     col.mark_compacting();
@@ -366,7 +340,7 @@ mod test {
                 time_range: TimeRange::new(lts_min, lts_max),
             };
         }
-        let memory_pool: MemoryPoolRef = Arc::new(GreedyMemoryPool::new(1024 * 1024 * 1024));
+        let memory_pool: MemoryPoolRef = Arc::new(GreedyMemoryPool::default());
         let version = Arc::new(Version::new(
             1,
             Arc::new("version_1".to_string()),
@@ -374,19 +348,16 @@ mod test {
             1,
             level_infos,
             1000,
-            Arc::new(ShardedCache::with_capacity(1)),
+            Arc::new(ShardedAsyncCache::create_lru_sharded_cache(1)),
         ));
-        let (flush_task_sender, _) = mpsc::channel(opt.storage.flush_req_channel_cap);
-        let (compactt_task_sender, _) = mpsc::channel(COMPACT_REQ_CHANNEL_CAP);
+
         TseriesFamily::new(
             1,
             Arc::new("ts_family_1".to_string()),
-            MemCache::new(1, 1000, 1, &memory_pool),
+            MemCache::new(1, 1000, 2, 1, &memory_pool),
             version,
             opt.cache.clone(),
             opt.storage.clone(),
-            flush_task_sender,
-            compactt_task_sender,
             memory_pool,
             &Arc::new(MetricsRegister::default()),
         )
@@ -427,9 +398,8 @@ mod test {
             ]), // 0.00001
         ];
 
-        let storage_opt = opt.storage.clone();
         let tsf = create_tseries_family(Arc::new("dba".to_string()), opt, levels_sketch);
-        let picker = LevelCompactionPicker::new(storage_opt);
+        let picker = LevelCompactionPicker {};
         let compact_req = picker.pick_compaction(tsf.version()).unwrap();
         assert_eq!(compact_req.out_level, 2);
         assert_eq!(compact_req.files.len(), 2);

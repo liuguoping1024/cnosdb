@@ -3,7 +3,7 @@ use std::sync::Arc;
 use chrono::Duration;
 use datafusion::arrow::array::ArrayRef;
 use datafusion::arrow::datatypes::{
-    DataType, Field, IntervalDayTimeType, IntervalMonthDayNanoType, TimeUnit,
+    DataType, Field, Fields, IntervalDayTimeType, IntervalMonthDayNanoType, TimeUnit,
 };
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::type_coercion::aggregates::TIMESTAMPS;
@@ -15,7 +15,7 @@ use datafusion::physical_plan::ColumnarValue;
 use datafusion::scalar::ScalarValue;
 use once_cell::sync::Lazy;
 use spi::query::function::FunctionMetadataManager;
-use spi::Result;
+use spi::QueryResult;
 
 use super::{TIME_WINDOW, WINDOW_END, WINDOW_START};
 use crate::extension::expr::INTERVALS;
@@ -24,7 +24,7 @@ pub static TIME_WINDOW_UDF: Lazy<Arc<ScalarUDF>> = Lazy::new(|| Arc::new(new()))
 pub static DEFAULT_TIME_WINDOW_START: Lazy<ScalarValue> =
     Lazy::new(|| ScalarValue::TimestampNanosecond(Some(0), Some("+00:00".into())));
 
-pub fn register_udf(func_manager: &mut dyn FunctionMetadataManager) -> Result<ScalarUDF> {
+pub fn register_udf(func_manager: &mut dyn FunctionMetadataManager) -> QueryResult<ScalarUDF> {
     let udf = new();
     func_manager.register_udf(udf.clone())?;
     Ok(udf)
@@ -81,10 +81,10 @@ fn new() -> ScalarUDF {
 
     // Struct(_start, _end)
     let return_type: ReturnTypeFunction = Arc::new(move |input_expr_types| {
-        let window = DataType::Struct(vec![
+        let window = DataType::Struct(Fields::from(vec![
             Field::new(WINDOW_START, input_expr_types[0].clone(), false),
             Field::new(WINDOW_END, input_expr_types[0].clone(), false),
-        ]);
+        ]));
 
         Ok(Arc::new(window))
     });

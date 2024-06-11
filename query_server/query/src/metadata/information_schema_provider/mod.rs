@@ -2,8 +2,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+pub use builder::columns::{
+    COLUMNS_COLUMN_NAME, COLUMNS_COLUMN_TYPE, COLUMNS_COMPRESSION_CODEC, COLUMNS_DATABASE_NAME,
+    COLUMNS_DATA_TYPE, COLUMNS_TABLE_NAME,
+};
 pub use builder::databases::{
-    DATABASES_DATABASE_NAME, DATABASES_PERCISION, DATABASES_REPLICA, DATABASES_SHARD,
+    DATABASES_DATABASE_NAME, DATABASES_PRECISION, DATABASES_REPLICA, DATABASES_SHARD,
     DATABASES_TENANT_NAME, DATABASES_TTL, DATABASES_VNODE_DURATION,
 };
 pub use builder::tables::{
@@ -11,7 +15,9 @@ pub use builder::tables::{
     TABLES_TABLE_TENANT, TABLES_TABLE_TYPE,
 };
 use datafusion::datasource::TableProvider;
+pub use factory::columns::INFORMATION_SCHEMA_COLUMNS;
 pub use factory::databases::INFORMATION_SCHEMA_DATABASES;
+pub use factory::queries::INFORMATION_SCHEMA_QUERIES;
 pub use factory::tables::INFORMATION_SCHEMA_TABLES;
 use meta::error::MetaError;
 use meta::model::MetaClientRef;
@@ -23,6 +29,7 @@ use self::factory::databases::DatabasesFactory;
 use self::factory::enabled_roles::EnabledRolesFactory;
 use self::factory::members::MembersFactory;
 use self::factory::queries::QueriesFactory;
+use self::factory::resource_status::InformationSchemaResourceStatusFactory;
 use self::factory::roles::RolesFactory;
 use super::INFORMATION_SCHEMA;
 use crate::dispatcher::query_tracker::QueryTracker;
@@ -52,6 +59,7 @@ impl InformationSchemaProvider {
         provider.register_table_factory(Box::new(DatabasePrivilegesFactory {}));
         provider.register_table_factory(Box::new(MembersFactory {}));
         provider.register_table_factory(Box::new(QueriesFactory {}));
+        provider.register_table_factory(Box::new(InformationSchemaResourceStatusFactory {}));
 
         provider
     }
@@ -77,7 +85,7 @@ impl InformationSchemaProvider {
         metadata: MetaClientRef,
     ) -> Result<Arc<dyn TableProvider>, MetaError> {
         match self.table_factories.get(name.to_ascii_lowercase().as_str()) {
-            Some(f) => Ok(f.create(user, metadata.clone(), self.query_tracker.clone())),
+            Some(f) => Ok(f.create(user, metadata, self.query_tracker.clone())),
             None => Err(MetaError::TableNotFound {
                 table: name.to_string(),
             }),

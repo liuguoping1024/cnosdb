@@ -4,10 +4,10 @@ use std::collections::{HashMap, HashSet};
 
 use models::auth::privilege::DatabasePrivilege;
 use models::auth::role::{SystemTenantRole, TenantRoleIdentifier};
-use models::auth::user::UserOptions;
+use models::auth::user::{UserDesc, UserOptions};
 use models::meta_data::*;
 use models::oid::Oid;
-use models::schema::{DatabaseSchema, TableSchema, TenantOptions};
+use models::schema::{DatabaseSchema, ResourceInfo, TableSchema, Tenant, TenantOptions};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -27,6 +27,17 @@ pub struct UpdateVnodeReplSetArgs {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ChangeReplSetLeaderArgs {
+    pub cluster: String,
+    pub tenant: String,
+    pub db_name: String,
+    pub bucket_id: u32,
+    pub repl_id: u32,
+    pub leader_node_id: NodeId,
+    pub leader_vnode_id: VnodeId,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct UpdateVnodeArgs {
     pub cluster: String,
     pub vnode_info: VnodeAllInfo,
@@ -40,6 +51,8 @@ pub enum WriteCommand {
 
     UpdateVnodeReplSet(UpdateVnodeReplSetArgs),
 
+    ChangeReplSetLeader(ChangeReplSetLeaderArgs),
+
     UpdateVnode(UpdateVnodeArgs),
     // cluster, node info
     AddDataNode(String, NodeInfo),
@@ -52,6 +65,9 @@ pub enum WriteCommand {
 
     // cluster, tenant, db schema
     AlterDB(String, String, DatabaseSchema),
+
+    // cluster, tenant, db, db_is_hidden
+    SetDBIsHidden(String, String, String, bool),
 
     // cluster, tenant, db name
     DropDB(String, String, String),
@@ -69,7 +85,7 @@ pub enum WriteCommand {
     DropTable(String, String, String, String),
 
     // cluster, user_name, user_options, is_admin
-    CreateUser(String, String, UserOptions, bool),
+    CreateUser(String, UserDesc),
     // cluster, user_id, user_options
     AlterUser(String, String, UserOptions),
     // cluster, old_name, new_name
@@ -78,9 +94,11 @@ pub enum WriteCommand {
     DropUser(String, String),
 
     // cluster, tenant_name, tenant_options
-    CreateTenant(String, String, TenantOptions),
+    CreateTenant(String, Tenant),
     // cluster, tenant_name, tenant_options
     AlterTenant(String, String, TenantOptions),
+    // cluster, tenant_name, tenant_is_hidden
+    SetTenantIsHidden(String, String, bool),
     // cluster, old_name, new_name
     RenameTenant(String, String, String),
     // cluster, tenant_name
@@ -97,7 +115,7 @@ pub enum WriteCommand {
     CreateRole(
         String,
         String,
-        SystemTenantRole,
+        Option<SystemTenantRole>,
         HashMap<String, DatabasePrivilege>,
         String,
     ),
@@ -118,6 +136,10 @@ pub enum WriteCommand {
         tenant: String,
         request: LocalBucketRequest,
     },
+    // cluster, resource_name, ResourceInfo
+    ResourceInfo(String, String, ResourceInfo),
+    // cluster, node_id, is_lock
+    ResourceInfosMark(String, NodeId, bool),
 }
 
 /******************* read command *************************/
@@ -140,87 +162,21 @@ pub enum ReadCommand {
     User(String, String),
     // cluster
     Users(String),
-    // cluster, tenant_name
-    Tenant(String, String),
+    // cluster, tenant_name, is_need_hidden
+    Tenant(String, String, bool),
     // cluster
     Tenants(String),
-}
+    // cluster, tenant, db, table
+    TableSchema(String, String, String, String),
+    // cluster
+    ResourceInfos(String),
+    // cluster, resource_name
+    ResourceInfo(String, String),
+    // cluster
+    ResourceInfosMark(String),
 
-/******************* response  *************************/
-pub const META_REQUEST_FAILED: i32 = -1;
-pub const META_REQUEST_SUCCESS: i32 = 0;
-pub const META_REQUEST_DB_EXIST: i32 = 1;
-pub const META_REQUEST_TABLE_EXIST: i32 = 2;
-pub const META_REQUEST_USER_EXIST: i32 = 3;
-pub const META_REQUEST_USER_NOT_FOUND: i32 = 4;
-pub const META_REQUEST_TENANT_EXIST: i32 = 5;
-pub const META_REQUEST_TENANT_NOT_FOUND: i32 = 6;
-pub const META_REQUEST_ROLE_EXIST: i32 = 7;
-pub const META_REQUEST_ROLE_NOT_FOUND: i32 = 8;
-pub const META_REQUEST_PRIVILEGE_EXIST: i32 = 9;
-pub const META_REQUEST_PRIVILEGE_NOT_FOUND: i32 = 10;
-pub const META_REQUEST_DB_NOT_FOUND: i32 = 11;
-pub const META_REQUEST_TABLE_NOT_FOUND: i32 = 12;
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
-pub struct StatusResponse {
-    pub code: i32,
-    pub msg: String,
-}
-
-impl StatusResponse {
-    pub fn new(code: i32, msg: String) -> Self {
-        Self { code, msg }
-    }
-}
-
-impl ToString for StatusResponse {
-    fn to_string(&self) -> String {
-        serde_json::to_string(&self).unwrap_or("".to_string())
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
-pub struct TenaneMetaDataResp {
-    pub status: StatusResponse,
-    pub data: TenantMetaData,
-}
-
-impl TenaneMetaDataResp {
-    pub fn new(code: i32, msg: String) -> Self {
-        Self {
-            status: StatusResponse::new(code, msg),
-            data: TenantMetaData::new(),
-        }
-    }
-
-    pub fn new_from_data(code: i32, msg: String, data: TenantMetaData) -> Self {
-        let mut rsp = TenaneMetaDataResp::new(code, msg);
-        rsp.data = data;
-
-        rsp
-    }
-}
-
-impl ToString for TenaneMetaDataResp {
-    fn to_string(&self) -> String {
-        serde_json::to_string(&self).unwrap()
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub enum CommonResp<T> {
-    Ok(T),
-    Err(StatusResponse),
-}
-
-impl<T> ToString for CommonResp<T>
-where
-    T: Serialize,
-{
-    fn to_string(&self) -> String {
-        serde_json::to_string(&self).unwrap()
-    }
+    // cluster, tenant, db, replication set id
+    ReplicationSet(String, String, String, u32),
 }
 
 pub const ENTRY_LOG_TYPE_SET: i32 = 1;
@@ -231,7 +187,9 @@ pub const ENTRY_LOG_TYPE_NOP: i32 = 10;
 pub struct EntryLog {
     pub tye: i32,
     pub ver: u64,
+    /// store mache key
     pub key: String,
+    /// store mache val
     pub val: String,
 }
 
@@ -348,7 +306,7 @@ impl CircleBuf {
             };
 
             if self.buf[index].ver <= ver {
-                return index.try_into().unwrap();
+                return index as i32;
             }
         }
 
@@ -363,7 +321,7 @@ impl CircleBuf {
 
         let mut index = (index + 1) % self.capacity;
         while index != self.writer {
-            let entry = self.buf.get(index).unwrap();
+            let entry = &self.buf[index];
             if filter(entry) {
                 entrys.push(entry.clone());
             }
@@ -415,15 +373,22 @@ impl Watch {
         base_ver: u64,
     ) -> (Vec<EntryLog>, i32) {
         let filter = |entry: &EntryLog| -> bool {
-            if entry.key.starts_with(&KeyPath::data_nodes(cluster)) {
-                return true;
-            }
-
-            if tenants.is_empty() {
+            if entry.key == KeyPath::version()
+                || entry.key == KeyPath::already_init()
+                || entry.key == KeyPath::incr_id(cluster)
+            {
                 return false;
             }
 
             if !entry.key.starts_with(&KeyPath::cluster_prefix(cluster)) {
+                return false;
+            }
+
+            if !entry.key.starts_with(&KeyPath::tenants(cluster)) {
+                return true;
+            }
+
+            if tenants.is_empty() {
                 return false;
             }
 
@@ -463,63 +428,5 @@ impl Watch {
 impl Default for Watch {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-mod test {
-    use std::collections::HashSet;
-    use std::sync::Arc;
-
-    use tokio::sync::RwLock;
-
-    use crate::store::command::Watch;
-
-    async fn _watch_data_test(watch: Arc<RwLock<Watch>>, cluster: &str, tenant: &str, ver: u64) {
-        println!("======== {}.{}", cluster, tenant);
-
-        loop {
-            let mut chan = watch.read().await.subscribe();
-            let _ = chan.recv().await;
-
-            let logs = watch.read().await.read_entry_logs(
-                cluster,
-                &HashSet::from([tenant.to_string()]),
-                ver,
-            );
-            println!("=== {}.{}; {:?}", cluster, tenant, logs);
-        }
-    }
-
-    #[tokio::test]
-    #[ignore]
-    async fn test_watch() {
-        use tokio::io::AsyncBufReadExt;
-
-        let watch = Arc::new(RwLock::new(Watch::new()));
-
-        let w_clone = watch.clone();
-        tokio::spawn(_watch_data_test(w_clone, "c", "t", 100));
-
-        let w_clone = watch.clone();
-        tokio::spawn(_watch_data_test(w_clone, "c", "", 200));
-
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-
-        loop {
-            let mut reader = tokio::io::BufReader::new(tokio::io::stdin());
-            let mut line = String::new();
-            let _ = reader.read_line(&mut line).await;
-            let strs: Vec<&str> = line.split(' ').collect();
-
-            let entry = crate::store::command::EntryLog {
-                tye: 0,
-                key: strs[0].to_string(),
-                ver: serde_json::from_str::<u64>(strs[1]).unwrap(),
-                val: "".to_string(),
-            };
-
-            watch.write().await.writer_log(entry.clone());
-            println!("=== write {:?}", entry);
-        }
     }
 }

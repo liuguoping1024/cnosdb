@@ -1,273 +1,240 @@
-use std::sync::Arc;
+use std::borrow::Cow;
 
-use meta::error::{MetaError, MetaResult};
+use async_recursion::async_recursion;
+use meta::error::{MetaError, TenantNotFoundSnafu};
 use meta::model::{MetaClientRef, MetaRef};
 use models::codec::Encoding;
-use models::schema::{ColumnType, DatabaseSchema, TableColumn, TableSchema, TskvTableSchema};
-use models::ColumnId;
-use protos::models::FieldType;
-use trace::error;
+use models::schema::{
+    ColumnType, DatabaseSchema, TableColumn, TableSchema, TskvTableSchema, TskvTableSchemaRef,
+};
+use snafu::OptionExt;
 
-use crate::schema::error::{Result, SchemaError};
-
-const TIME_STAMP_NAME: &str = "time";
+use crate::database::FbSchema;
+use crate::schema::error::{ColumnTypeSnafu, SchemaResult};
 
 #[derive(Debug)]
 pub struct DBschemas {
+    meta: MetaRef,
     tenant_name: String,
     database_name: String,
-    client: MetaClientRef,
 }
 
 impl DBschemas {
-    pub async fn new(db_schema: DatabaseSchema, meta: MetaRef) -> Result<Self> {
-        let client = meta
-            .tenant_manager()
-            .tenant_meta(db_schema.tenant_name())
-            .await
-            .ok_or(SchemaError::TenantNotFound {
-                tenant: db_schema.tenant_name().to_string(),
-            })?;
+    pub async fn new(db_schema: DatabaseSchema, meta: MetaRef) -> SchemaResult<Self> {
+        let client =
+            meta.tenant_meta(db_schema.tenant_name())
+                .await
+                .context(TenantNotFoundSnafu {
+                    tenant: db_schema.tenant_name().to_string(),
+                })?;
+
         if client.get_db_schema(db_schema.database_name())?.is_none() {
             client.create_db(db_schema.clone()).await?;
         }
+
         Ok(Self {
+            meta,
             tenant_name: db_schema.tenant_name().to_string(),
             database_name: db_schema.database_name().to_string(),
-            client,
         })
     }
 
-    pub fn database_name(&self) -> String {
-        self.database_name.clone()
+    pub fn database_name(&self) -> &str {
+        &self.database_name
     }
 
-    pub fn check_field_type_from_cache(
+    pub fn tenant_name(&self) -> &str {
+        &self.tenant_name
+    }
+
+    async fn tenant_meta(&self) -> SchemaResult<MetaClientRef> {
+        let client =
+            self.meta
+                .tenant_meta(self.tenant_name())
+                .await
+                .context(TenantNotFoundSnafu {
+                    tenant: self.tenant_name().to_string(),
+                })?;
+
+        Ok(client)
+    }
+
+    #[async_recursion]
+    async fn check_field_type_or_else_add_impl<'a>(
         &self,
-        table_name: &str,
-        tag_names: &[&str],
-        field_names: &[&str],
-        field_type: &[FieldType],
-    ) -> Result<()> {
-        let schema = self
-            .client
-            .get_tskv_table_schema(&self.database_name, table_name)?
-            .ok_or(SchemaError::DatabaseNotFound {
-                database: self.database_name.clone(),
-            })?;
+        fb_schema: &'a FbSchema<'a>,
+        get_schema_from_meta: bool,
+    ) -> SchemaResult<TskvTableSchemaRef> {
+        let mut schema_changed = false;
+        let mut new_schema = false;
+        if get_schema_from_meta {
+            self.get_table_schema_by_meta(fb_schema.table).await?;
+        } else {
+            self.get_table_schema(fb_schema.table).await?;
+        }
+        let opt_schema = self.get_table_schema(fb_schema.table).await?;
+        let mut schema = match opt_schema.as_ref() {
+            Some(schema) => Cow::Borrowed(schema.as_ref()),
+            None => {
+                let mut schema = TskvTableSchema::new(
+                    self.tenant_name().into(),
+                    self.database_name().into(),
+                    fb_schema.table.to_string(),
+                    vec![],
+                );
+                let db_schema = self.db_schema().await?;
+                let precision = db_schema.config.precision_or_default();
+                schema.add_column(TableColumn::new_time_column(
+                    schema.next_column_id(),
+                    (*precision).into(),
+                ));
+                new_schema = true;
+                Cow::Owned(schema)
+            }
+        };
 
-        for (field_name, field_type) in field_names.iter().zip(field_type) {
-            if let Some(v) = schema.column(field_name) {
-                if field_type.0 != v.column_type.field_type() as i32 {
-                    error!(
-                        "type mismatch, point: {}, schema: {}",
-                        field_type.0,
-                        v.column_type.field_type()
-                    );
-                    return Err(SchemaError::FieldType {
-                        field: field_name.to_string(),
-                    });
+        for tag_name in &fb_schema.tag_names {
+            match schema.column(tag_name) {
+                Some(column) => {
+                    if !column.column_type.is_tag() {
+                        return Err(ColumnTypeSnafu {
+                            column: tag_name.to_string(),
+                            found: ColumnType::Tag,
+                            expected: column.column_type.clone(),
+                        }
+                        .build());
+                    }
                 }
-            } else {
-                return Err(SchemaError::NotFoundField {
-                    field: field_name.to_string(),
-                });
+                None => {
+                    let next_column_id = schema.next_column_id();
+                    schema.to_mut().add_column(TableColumn::new_tag_column(
+                        next_column_id,
+                        tag_name.to_string(),
+                    ));
+                    schema_changed = true;
+                }
+            };
+        }
+
+        for (field_name, field_type) in fb_schema
+            .field_names
+            .iter()
+            .zip(fb_schema.field_types.iter())
+        {
+            match schema.column(field_name) {
+                Some(column) => {
+                    let column_type = ColumnType::from_proto_field_type(*field_type);
+                    if !column.column_type.matches_type(&column_type) {
+                        return Err(ColumnTypeSnafu {
+                            column: field_name.to_string(),
+                            found: column_type,
+                            expected: column.column_type.clone(),
+                        }
+                        .build());
+                    }
+                }
+                None => {
+                    let next_column_id = schema.next_column_id();
+                    schema.to_mut().add_column(TableColumn::new(
+                        next_column_id,
+                        field_name.to_string(),
+                        ColumnType::from_proto_field_type(*field_type),
+                        Encoding::Default,
+                    ));
+                    schema_changed = true;
+                }
             }
         }
 
-        for tag_name in tag_names {
-            if let Some(v) = schema.column(tag_name) {
-                if ColumnType::Tag != v.column_type {
-                    error!("type mismatch, point: tag, schema: {}", &v.column_type);
-                    return Err(SchemaError::FieldType {
-                        field: tag_name.to_string(),
-                    });
-                }
+        let client = self.tenant_meta().await?;
+        //schema changed store it
+        let schema = if new_schema {
+            schema.to_mut().schema_version = 0;
+            let schema: TskvTableSchemaRef = schema.into_owned().into();
+            let res = client
+                .create_table(&TableSchema::TsKvTableSchema(schema.clone()))
+                .await;
+            if let Err(MetaError::TableAlreadyExists { .. }) = res.as_ref() {
+                self.check_field_type_or_else_add_impl(fb_schema, true)
+                    .await?;
             } else {
-                return Err(SchemaError::NotFoundField {
-                    field: tag_name.to_string(),
-                });
+                res?;
             }
-        }
-        Ok(())
+            schema
+        } else if schema_changed {
+            schema.to_mut().schema_version += 1;
+            let schema: TskvTableSchemaRef = schema.into_owned().into();
+            let res = client
+                .update_table(&TableSchema::TsKvTableSchema(schema.clone()))
+                .await;
+            if let Err(MetaError::UpdateTableConflict { .. }) = &res {
+                self.check_field_type_or_else_add_impl(fb_schema, true)
+                    .await?;
+            } else {
+                res?;
+            }
+            schema
+        } else {
+            // Safety
+            // if opt_schema is none then create new schema
+            unsafe { opt_schema.unwrap_unchecked() }
+        };
+        Ok(schema)
     }
 
     pub async fn check_field_type_or_else_add(
         &self,
-        db_name: &str,
-        table_name: &str,
-        tag_names: &[&str],
-        field_names: &[&str],
-        field_type: &[FieldType],
-    ) -> Result<()> {
-        //load schema first from cache,or else from storage and than cache it!
-        let schema = self.client.get_tskv_table_schema(db_name, table_name)?;
-        let db_schema =
-            self.client
-                .get_db_schema(db_name)?
-                .ok_or(SchemaError::DatabaseNotFound {
-                    database: db_name.to_string(),
-                })?;
-        let precision = db_schema.config.precision_or_default();
-        let mut new_schema = false;
-        let mut schema = match schema {
-            None => {
-                let mut schema = TskvTableSchema::default();
-                schema.tenant = self.tenant_name.clone();
-                schema.db = db_name.to_string();
-                schema.name = table_name.to_string();
-                new_schema = true;
-                Arc::new(schema)
-            }
-            Some(schema) => schema,
-        };
-
-        let mut schema_change = false;
-        let mut check_fn = |field: &mut TableColumn| -> Result<()> {
-            let encoding = match schema.column(&field.name) {
-                None => Encoding::Default,
-                Some(v) => v.encoding,
-            };
-            field.encoding = encoding;
-
-            match schema.column(&field.name) {
-                Some(v) => {
-                    if field.column_type != v.column_type {
-                        trace::debug!(
-                            "type mismatch, point: {}, schema: {}",
-                            &field.column_type,
-                            &v.column_type
-                        );
-                        trace::debug!("type mismatch, schema: {:?}", &schema);
-                        return Err(SchemaError::FieldType {
-                            field: field.name.to_owned(),
-                        });
-                    }
-                }
-                None => {
-                    schema_change = true;
-                    field.id = schema.columns().len() as ColumnId;
-                    let mut schema_t = schema.as_ref().clone();
-                    schema_t.add_column(field.clone());
-                    schema = Arc::new(schema_t)
-                }
-            }
-            Ok(())
-        };
-        //check timestamp
-        check_fn(&mut TableColumn::new_with_default(
-            TIME_STAMP_NAME.to_string(),
-            ColumnType::Time((*precision).into()),
-        ))?;
-
-        //check tags
-        for tag_name in tag_names {
-            check_fn(&mut TableColumn::new_with_default(
-                tag_name.to_string(),
-                ColumnType::Tag,
-            ))?
-        }
-
-        //check fields
-        for (field_name, field_type) in field_names.iter().zip(field_type) {
-            check_fn(&mut TableColumn::new_with_default(
-                field_name.to_string(),
-                ColumnType::from_i32(field_type.0),
-            ))?
-        }
-
-        //schema changed store it
-        if new_schema {
-            let mut schema = schema.as_ref().clone();
-            schema.schema_id = 0;
-            let schema = Arc::new(schema);
-            let res = self
-                .client
-                .create_table(&TableSchema::TsKvTableSchema(schema.clone()))
-                .await;
-            self.check_create_table_res(res, schema).await?;
-        } else if schema_change {
-            let mut schema = schema.as_ref().clone();
-            schema.schema_id += 1;
-            self.client
-                .update_table(&TableSchema::TsKvTableSchema(Arc::new(schema)))
-                .await?;
-        }
-        Ok(())
+        fb_schema: &FbSchema<'_>,
+    ) -> SchemaResult<TskvTableSchemaRef> {
+        //load schema first from cache
+        self.check_field_type_or_else_add_impl(fb_schema, false)
+            .await
     }
 
-    async fn check_create_table_res(
-        &self,
-        res: MetaResult<()>,
-        schema: Arc<TskvTableSchema>,
-    ) -> Result<()> {
-        match res {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                if let MetaError::TableAlreadyExists { .. } = e {
-                    let schema_get = self
-                        .client
-                        .get_tskv_table_schema(&schema.db, &schema.name)
-                        .map_err(|_| MetaError::Retry)?
-                        .ok_or(MetaError::Retry)?;
-                    if schema.tenant == schema_get.tenant
-                        && schema.db == schema_get.db
-                        && schema.columns() == schema_get.columns()
-                    {
-                        Ok(())
-                    } else {
-                        for _ in 0..3 {
-                            let schema_get = self
-                                .client
-                                .get_tskv_table_schema(&schema.db, &schema.name)
-                                .map_err(|_| MetaError::Retry)?
-                                .ok_or(MetaError::Retry)?;
-                            let mut schema = schema.as_ref().clone();
-                            schema.schema_id = schema_get.schema_id + 1;
-                            let schema = Arc::new(schema);
-                            if self
-                                .client
-                                .update_table(&TableSchema::TsKvTableSchema(schema))
-                                .await
-                                .is_ok()
-                            {
-                                return Ok(());
-                            }
-                        }
-                        Err(e.into())
-                    }
-                } else {
-                    Err(e.into())
-                }
-            }
-        }
-    }
-
-    pub fn get_table_schema(&self, tab: &str) -> Result<Option<Arc<TskvTableSchema>>> {
+    pub async fn get_table_schema(&self, tab: &str) -> SchemaResult<Option<TskvTableSchemaRef>> {
         let schema = self
-            .client
+            .tenant_meta()
+            .await?
             .get_tskv_table_schema(&self.database_name, tab)?;
 
         Ok(schema)
     }
 
-    pub fn list_tables(&self) -> Result<Vec<String>> {
-        let tables = self.client.list_tables(&self.database_name)?;
+    pub async fn get_table_schema_by_meta(
+        &self,
+        tab: &str,
+    ) -> SchemaResult<Option<TskvTableSchemaRef>> {
+        let schema = self
+            .tenant_meta()
+            .await?
+            .get_tskv_table_schema_by_meta(&self.database_name, tab)
+            .await?;
+
+        Ok(schema)
+    }
+
+    pub async fn list_tables(&self) -> SchemaResult<Vec<String>> {
+        let tables = self.tenant_meta().await?.list_tables(&self.database_name)?;
+
         Ok(tables)
     }
 
-    pub async fn del_table_schema(&self, tab: &str) -> Result<()> {
-        self.client.drop_table(&self.database_name, tab).await?;
+    pub async fn del_table_schema(&self, tab: &str) -> SchemaResult<()> {
+        self.tenant_meta()
+            .await?
+            .drop_table(&self.database_name, tab)
+            .await?;
         Ok(())
     }
 
-    pub fn db_schema(&self) -> Result<DatabaseSchema> {
-        let db_schema =
-            self.client
-                .get_db_schema(&self.database_name)?
-                .ok_or(MetaError::DatabaseNotFound {
-                    database: self.database_name.clone(),
-                })?;
+    pub async fn db_schema(&self) -> SchemaResult<DatabaseSchema> {
+        let db_schema = self
+            .tenant_meta()
+            .await?
+            .get_db_schema(&self.database_name)?
+            .ok_or_else(|| MetaError::DatabaseNotFound {
+                database: self.database_name.clone(),
+            })?;
         Ok(db_schema)
     }
 }

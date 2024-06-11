@@ -8,7 +8,6 @@ use datafusion::arrow::array::StringArray;
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::Result as DFResult;
-use datafusion::from_slice::FromSlice;
 use datafusion::physical_plan::displayable;
 use datafusion::prelude::SessionConfig;
 use futures::TryStreamExt;
@@ -22,7 +21,7 @@ use spi::query::logical_planner::QueryPlan;
 use spi::query::physical_planner::PhysicalPlanner;
 use spi::query::recordbatch::RecordBatchStreamWrapper;
 use spi::query::scheduler::SchedulerRef;
-use spi::Result;
+use spi::QueryResult;
 use trace::error;
 
 use self::trigger::executor::{TriggerExecutorFactoryRef, TriggerExecutorRef};
@@ -95,7 +94,7 @@ impl MicroBatchStreamExecutionBuilder {
         scheduler: SchedulerRef,
         trigger_executor_factory: TriggerExecutorFactoryRef,
         runtime: Arc<DedicatedExecutor>,
-    ) -> Result<MicroBatchStreamExecution> {
+    ) -> QueryResult<MicroBatchStreamExecution> {
         let MicroBatchStreamExecutionDesc {
             plan,
             options: StreamOptions { trigger_interval },
@@ -140,7 +139,7 @@ pub struct MicroBatchStreamExecution {
 }
 
 impl MicroBatchStreamExecution {
-    fn run_stream(&self) -> Result<Job<()>> {
+    fn run_stream(&self) -> QueryResult<Job<()>> {
         // valid plan
         let _ = UnsupportedOperationChecker::default().analyze(&self.plan.df_plan)?;
 
@@ -202,7 +201,7 @@ impl QueryExecution for MicroBatchStreamExecution {
         QueryType::Stream
     }
 
-    async fn start(&self) -> Result<Output> {
+    async fn start(&self) -> QueryResult<Output> {
         let join_handle = self.run_stream()?;
 
         *self.abort_handle.lock() = Some(join_handle);
@@ -213,17 +212,15 @@ impl QueryExecution for MicroBatchStreamExecution {
             false,
         )]));
         let id = self.query_state_machine.query_id.to_string();
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(StringArray::from_slice([id]))],
-        )?;
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(vec![id]))])?;
         Ok(Output::StreamData(Box::pin(RecordBatchStreamWrapper::new(
             schema,
             vec![batch],
         ))))
     }
 
-    fn cancel(&self) -> Result<()> {
+    fn cancel(&self) -> QueryResult<()> {
         trace::debug!(
             "Cancel sql query execution: query_id: {:?}, sql: {}, state: {:?}",
             &self.query_state_machine.query_id,
@@ -252,7 +249,8 @@ impl QueryExecution for MicroBatchStreamExecution {
             qsm.query.content().to_string(),
             *qsm.session.tenant_id(),
             qsm.session.tenant().to_string(),
-            qsm.session.user().desc().clone(),
+            qsm.session.default_database().to_string(),
+            qsm.session.user().clone(),
         )
     }
 
@@ -287,7 +285,7 @@ where
     T: StateStoreFactory + Send + Sync + Debug + 'static,
     T::SS: Send + Sync + Debug,
 {
-    async fn execute(&self) -> Result<()> {
+    async fn execute(&self) -> QueryResult<()> {
         // 1. Traverse the data source list of the execution plan, check whether there is new data, and update offset_tracker
         update_available_offsets(self.offset_tracker.clone(), &self.stream_providers).await?;
         trace::trace!("Traverse the data source list of the execution plan, check whether there is new data, and update offset_tracker");
@@ -301,7 +299,7 @@ where
         self.execute_once().await
     }
 
-    async fn execute_once(&self) -> Result<()> {
+    async fn execute_once(&self) -> QueryResult<()> {
         let session = &self.query_state_machine.session;
         let current_watermark_ns = self.watermark_tracker.current_watermark_ns();
         let available_offsets = self.offset_tracker.available_offsets();
@@ -342,7 +340,7 @@ where
         trace::debug!(
             "Final stream physical plan:\nOutput partition count: {}\n{}\n",
             exec_plan.output_partitioning().partition_count(),
-            displayable(exec_plan.as_ref()).indent()
+            displayable(exec_plan.as_ref()).indent(false)
         );
 
         let mut stream = self

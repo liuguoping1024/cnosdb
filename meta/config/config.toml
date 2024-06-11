@@ -1,10 +1,8 @@
 id = 1
 host = "127.0.0.1"
 port = 8901
-
-snapshot_path = "/var/lib/cnosdb/meta/snapshot"
-journal_path = "/var/lib/cnosdb/meta/journal"
-snapshot_per_events = 500
+data_path = "/var/lib/cnosdb/meta"
+grpc_enable_gzip = false
 
 [log]
 level = "info"
@@ -13,8 +11,9 @@ path = "/var/log/cnosdb"
 [meta_init]
 cluster_name = "cluster_xxx"
 admin_user = "root"
+admin_pwd = "root"
 system_tenant = "cnosdb"
-default_database = ["public", "usage_schema"]
+default_database = ["public", "usage_schema", "cluster_schema"]
 
 [heartbeat]
 heartbeat_recheck_interval = 300

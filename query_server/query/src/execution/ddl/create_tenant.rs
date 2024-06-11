@@ -1,13 +1,12 @@
 use async_trait::async_trait;
 use meta::error::MetaError;
-use models::schema::{DatabaseSchema, DEFAULT_CATALOG};
+use snafu::ResultExt;
 use spi::query::execution::{Output, QueryStateMachineRef};
 use spi::query::logical_planner::CreateTenant;
-use spi::Result;
+use spi::{MetaSnafu, QueryResult};
 use trace::debug;
 
 use crate::execution::ddl::DDLDefinitionTask;
-use crate::metadata::USAGE_SCHEMA;
 
 pub struct CreateTenantTask {
     stmt: CreateTenant,
@@ -21,7 +20,7 @@ impl CreateTenantTask {
 
 #[async_trait]
 impl DDLDefinitionTask for CreateTenantTask {
-    async fn execute(&self, query_state_machine: QueryStateMachineRef) -> Result<Output> {
+    async fn execute(&self, query_state_machine: QueryStateMachineRef) -> QueryResult<Output> {
         let CreateTenant {
             ref name,
             ref if_not_exists,
@@ -29,8 +28,7 @@ impl DDLDefinitionTask for CreateTenantTask {
         } = self.stmt;
 
         // 元数据接口查询tenant是否存在
-        let tenant_manager = query_state_machine.meta.tenant_manager();
-        let tenant = tenant_manager.tenant_meta(name).await;
+        let tenant = query_state_machine.meta.tenant_meta(name).await;
 
         match (if_not_exists, tenant) {
             // do not create if exists
@@ -38,21 +36,19 @@ impl DDLDefinitionTask for CreateTenantTask {
             // Report an error if it exists
             (false, Some(_)) => Err(MetaError::TenantAlreadyExists {
                 tenant: name.clone(),
-            })?,
+            })
+            .context(MetaSnafu)?,
             // does not exist, create
             (_, None) => {
                 // 创建tenant
                 // name: String
                 // options: TenantOptions
                 debug!("Create tenant {} with options [{}]", name, options);
-                let meta_client = tenant_manager
+                query_state_machine
+                    .meta
                     .create_tenant(name.to_string(), options.clone())
-                    .await?;
-                if name.eq(DEFAULT_CATALOG) {
-                    meta_client
-                        .create_db(DatabaseSchema::new(name, USAGE_SCHEMA))
-                        .await?;
-                }
+                    .await
+                    .context(MetaSnafu)?;
                 Ok(Output::Nil(()))
             }
         }

@@ -96,15 +96,20 @@ impl TableProvider for InformationDatabasePrivilegesTable {
             for role in self.metadata.custom_roles().await.map_err(|e| {
                 DataFusionError::Internal(format!("Failed to get custom roles, cause: {:?}", e))
             })? {
-                for (database_name, privilege) in role.additiona_privileges() {
+                for (database_name, privilege) in role.additional_privileges() {
                     builder.append_row(tenant_name, database_name, privilege.as_str(), role.name())
                 }
             }
         } else {
             // For non-Owner members, only records corresponding to own role are accessed
-            if let Some(role) = self.metadata.member_role(user_id).await.map_err(|e| {
-                DataFusionError::Internal(format!("Failed to get member role, cause: {:?}", e))
-            })? {
+            if let Some(role) = self
+                .metadata
+                .member_role(user_id, false)
+                .await
+                .map_err(|e| {
+                    DataFusionError::Internal(format!("Failed to get member role, cause: {:?}", e))
+                })?
+            {
                 match role {
                     TenantRoleIdentifier::System(_) => {
                         // not show system roles
@@ -118,7 +123,7 @@ impl TableProvider for InformationDatabasePrivilegesTable {
                                 ))
                             })?
                         {
-                            for (database_name, privilege) in role.additiona_privileges() {
+                            for (database_name, privilege) in role.additional_privileges() {
                                 builder.append_row(
                                     tenant_name,
                                     database_name,

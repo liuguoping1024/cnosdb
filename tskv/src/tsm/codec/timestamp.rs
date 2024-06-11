@@ -1,7 +1,8 @@
 use std::error::Error;
 
 use integer_encoding::*;
-use q_compress::{auto_compress, auto_decompress, DEFAULT_COMPRESSION_LEVEL};
+use pco::standalone::{simple_decompress, simpler_compress};
+use pco::DEFAULT_COMPRESSION_LEVEL;
 
 use super::simple8b;
 use crate::byte_utils::decode_be_i64;
@@ -21,7 +22,6 @@ pub fn ts_without_compress_encode(
     src: &[i64],
     dst: &mut Vec<u8>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    dst.clear();
     if src.is_empty() {
         return Ok(());
     }
@@ -33,18 +33,14 @@ pub fn ts_without_compress_encode(
     Ok(())
 }
 
-pub fn ts_q_compress_encode(
-    src: &[i64],
-    dst: &mut Vec<u8>,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
-    dst.clear();
+pub fn ts_pco_encode(src: &[i64], dst: &mut Vec<u8>) -> Result<(), Box<dyn Error + Send + Sync>> {
     if src.is_empty() {
         return Ok(());
     }
 
     dst.push(Encoding::Quantile as u8);
 
-    dst.append(&mut auto_compress(src, DEFAULT_COMPRESSION_LEVEL));
+    dst.append(&mut simpler_compress(src, DEFAULT_COMPRESSION_LEVEL)?);
     Ok(())
 }
 
@@ -59,10 +55,10 @@ pub fn ts_zigzag_simple8b_encode(
     src: &[i64],
     dst: &mut Vec<u8>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    dst.clear(); // reset buffer.
     if src.is_empty() {
         return Ok(());
     }
+    dst.push(Encoding::DeltaTs as u8);
 
     let mut max: u64 = 0;
     let mut deltas = i64_to_u64_vector(src);
@@ -85,15 +81,14 @@ pub fn ts_zigzag_simple8b_encode(
         if use_rle {
             encode_rle(deltas[0], deltas[1], deltas.len() as u64, dst);
             // 4 high bits of first byte used for the encoding type
-            dst[0] |= (DeltaEncoding::Rle as u8) << 4;
-            dst.insert(0, Encoding::Delta as u8);
+            dst[1] |= (DeltaEncoding::Rle as u8) << 4;
             return Ok(());
         }
     }
 
     // write block uncompressed
     if max > simple8b::MAX_VALUE {
-        let cap = 1 + (deltas.len() * 8); // 8 bytes per value plus header byte
+        let cap = 2 + (deltas.len() * 8); // 8 bytes per value plus header byte
         if dst.capacity() < cap {
             dst.reserve_exact(cap - dst.capacity());
         }
@@ -102,7 +97,6 @@ pub fn ts_zigzag_simple8b_encode(
         for delta in &deltas {
             dst.extend_from_slice(&delta.to_be_bytes());
         }
-        dst.insert(0, Encoding::Delta as u8);
         return Ok(());
     }
 
@@ -127,10 +121,9 @@ pub fn ts_zigzag_simple8b_encode(
 
     // first 4 high bits used for encoding type
     dst.push((DeltaEncoding::Simple8b as u8) << 4);
-    dst[0] |= ((div as f64).log10()) as u8; // 4 low bits used for log10 divisor
+    dst[1] |= ((div as f64).log10()) as u8; // 4 low bits used for log10 divisor
     dst.extend_from_slice(&deltas[0].to_be_bytes()); // encode first value
     simple8b::encode(&deltas[1..], dst)?;
-    dst.insert(0, Encoding::Delta as u8);
     Ok(())
 }
 
@@ -151,7 +144,7 @@ fn encode_rle(v: u64, delta: u64, count: u64, dst: &mut Vec<u8>) {
 
     // Keep a byte back for the scaler.
     dst.push(0);
-    let mut n = 1;
+    let mut n = 2;
     // write the first value in as a byte array.
     dst.extend_from_slice(&v.to_be_bytes());
     n += 8;
@@ -173,7 +166,7 @@ fn encode_rle(v: u64, delta: u64, count: u64, dst: &mut Vec<u8>) {
         let scaler = ((div as f64).log10()) as u8;
         assert!(scaler <= 15);
 
-        dst[0] |= scaler; // Set the scaler on low 4 bits of first byte.
+        dst[1] |= scaler; // Set the scaler on low 4 bits of first byte.
         n += (delta / div).encode_var(&mut dst[n..]);
     } else {
         n += delta.encode_var(&mut dst[n..]);
@@ -312,16 +305,13 @@ pub fn ts_without_compress_decode(
     Ok(())
 }
 
-pub fn ts_q_compress_decode(
-    src: &[u8],
-    dst: &mut Vec<i64>,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
+pub fn ts_pco_decode(src: &[u8], dst: &mut Vec<i64>) -> Result<(), Box<dyn Error + Send + Sync>> {
     if src.is_empty() {
         return Ok(());
     }
 
     let src = &src[1..];
-    let mut decode: Vec<i64> = auto_decompress(src)?;
+    let mut decode: Vec<i64> = simple_decompress(src)?;
     dst.append(&mut decode);
     Ok(())
 }
@@ -340,7 +330,7 @@ mod tests {
         // check for error
         ts_zigzag_simple8b_encode(&src, &mut dst).expect("failed to encode src");
         assert_eq!(dst.len(), 0);
-        ts_q_compress_encode(&src, &mut dst).unwrap();
+        ts_pco_encode(&src, &mut dst).unwrap();
         assert_eq!(dst.len(), 0);
         ts_without_compress_encode(&src, &mut dst).unwrap();
         assert_eq!(dst.len(), 0);
@@ -365,18 +355,18 @@ mod tests {
     }
 
     #[test]
-    fn encode_q_compress_and_uncompress() {
+    fn encode_pco_and_uncompress() {
         let src: Vec<i64> = vec![-1000, 0, simple8b::MAX_VALUE as i64, 213123421];
         let mut dst = vec![];
         let mut got = vec![];
         let exp = src.clone();
 
-        ts_q_compress_encode(&src, &mut dst).unwrap();
+        ts_pco_encode(&src, &mut dst).unwrap();
         let exp_code_type = Encoding::Quantile;
         let got_code_type = get_encoding(&dst);
         assert_eq!(exp_code_type, got_code_type);
 
-        ts_q_compress_decode(&dst, &mut got).unwrap();
+        ts_pco_decode(&dst, &mut got).unwrap();
         assert_eq!(exp, got);
 
         dst.clear();

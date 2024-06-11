@@ -9,7 +9,7 @@ edition.workspace = true
 trace = { path = "../../common/trace" }
 sqllogictest = { workspace = true }
 async-trait = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["full", "tracing"] }
 arrow = { workspace = true }
 arrow-flight = { workspace = true, features = ["flight-sql-experimental"] }
 tonic = { workspace = true, features = ["transport", "tls"] }
@@ -17,7 +17,12 @@ prost = { workspace = true }
 futures = { workspace = true, default-features = false, features = ["alloc"] }
 snafu = { workspace = true }
 async-backtrace = { workspace = true, optional = true }
-
+nom = { workspace = true }
+humantime = { workspace = true }
+reqwest = { workspace = true }
+url = { workspace = true }
+clap = {workspace = true, features = ["derive"]}
+regex = {workspace = true}
 [features]
 default = []
 backtrace = ["async-backtrace"]

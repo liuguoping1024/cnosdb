@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Display;
 use std::ops::Not;
 use std::str::FromStr;
@@ -9,7 +9,7 @@ use datafusion::sql::sqlparser::ast::{
     DataType, Expr, Ident, ObjectName, Offset, OrderByExpr, SqlOption, TableFactor,
 };
 use datafusion::sql::sqlparser::dialect::keywords::Keyword;
-use datafusion::sql::sqlparser::dialect::{Dialect, GenericDialect};
+use datafusion::sql::sqlparser::dialect::Dialect;
 use datafusion::sql::sqlparser::parser::{IsOptional, Parser, ParserError};
 use datafusion::sql::sqlparser::tokenizer::{Token, TokenWithLocation, Tokenizer};
 use models::codec::Encoding;
@@ -21,13 +21,15 @@ use spi::query::ast::{
     CopyIntoLocation, CopyIntoTable, CopyTarget, CopyVnode, CreateDatabase, CreateRole,
     CreateStream, CreateTable, CreateTenant, CreateUser, DatabaseOptions, DescribeDatabase,
     DescribeTable, DropDatabaseObject, DropGlobalObject, DropTenantObject, DropVnode, Explain,
-    ExtStatement, GrantRevoke, MoveVnode, OutputMode, Privilege, ShowSeries, ShowTagBody,
-    ShowTagValues, Trigger, UriLocation, With,
+    ExtStatement, GrantRevoke, MoveVnode, OutputMode, Privilege, RecoverDatabase, RecoverTenant,
+    ShowSeries, ShowTagBody, ShowTagValues, Trigger, UriLocation, With,
 };
 use spi::query::logical_planner::{DatabaseObjectType, GlobalObjectType, TenantObjectType};
 use spi::query::parser::Parser as CnosdbParser;
 use spi::ParserSnafu;
 use trace::debug;
+
+use super::dialect::CnosDBDialect;
 
 // support tag token
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +110,20 @@ enum CnosKeyWord {
     APPEND,
     #[allow(non_camel_case_types, clippy::upper_case_acronyms)]
     UNSET,
+    #[allow(non_camel_case_types, clippy::upper_case_acronyms)]
+    AFTER,
+    #[allow(non_camel_case_types, clippy::upper_case_acronyms)]
+    RECOVER,
+    #[allow(non_camel_case_types, clippy::upper_case_acronyms)]
+    REPLICA_ID,
+    #[allow(non_camel_case_types, clippy::upper_case_acronyms)]
+    NODE_ID,
+    #[allow(non_camel_case_types, clippy::upper_case_acronyms)]
+    PROMOTE,
+    #[allow(non_camel_case_types, clippy::upper_case_acronyms)]
+    DESTORY,
+    #[allow(non_camel_case_types, clippy::upper_case_acronyms)]
+    REPLICAS,
 }
 
 impl FromStr for CnosKeyWord {
@@ -149,6 +165,13 @@ impl FromStr for CnosKeyWord {
             "COMPLETE" => Ok(CnosKeyWord::COMPLETE),
             "APPEND" => Ok(CnosKeyWord::APPEND),
             "UNSET" => Ok(CnosKeyWord::UNSET),
+            "AFTER" => Ok(CnosKeyWord::AFTER),
+            "RECOVER" => Ok(CnosKeyWord::RECOVER),
+            "REPLICA_ID" => Ok(CnosKeyWord::REPLICA_ID),
+            "NODE_ID" => Ok(CnosKeyWord::NODE_ID),
+            "PROMOTE" => Ok(CnosKeyWord::PROMOTE),
+            "DESTORY" => Ok(CnosKeyWord::DESTORY),
+            "REPLICAS" => Ok(CnosKeyWord::REPLICAS),
             _ => Err(ParserError::ParserError(format!(
                 "fail parse {} to CnosKeyWord",
                 s
@@ -170,7 +193,7 @@ macro_rules! parser_err {
 pub struct DefaultParser {}
 
 impl CnosdbParser for DefaultParser {
-    fn parse(&self, sql: &str) -> spi::Result<VecDeque<ExtStatement>> {
+    fn parse(&self, sql: &str) -> spi::QueryResult<VecDeque<ExtStatement>> {
         ExtParser::parse_sql(sql).context(ParserSnafu)
     }
 }
@@ -183,7 +206,7 @@ pub struct ExtParser<'a> {
 impl<'a> ExtParser<'a> {
     /// Parse the specified tokens
     pub fn new(sql: &str) -> Result<Self> {
-        let dialect = &GenericDialect {};
+        let dialect = &CnosDBDialect {};
         ExtParser::new_with_dialect(sql, dialect)
     }
     /// Parse the specified tokens with dialect
@@ -197,7 +220,7 @@ impl<'a> ExtParser<'a> {
 
     /// Parse a SQL statement and produce a set of statements
     pub fn parse_sql(sql: &str) -> Result<VecDeque<ExtStatement>> {
-        let dialect = &GenericDialect {};
+        let dialect = &CnosDBDialect {};
         ExtParser::parse_sql_with_dialect(sql, dialect)
     }
 
@@ -227,7 +250,7 @@ impl<'a> ExtParser<'a> {
             expecting_statement_delimiter = true;
         }
 
-        debug!("Parser sql: {}, stmts: {:#?}", sql, stmts);
+        // debug!("Parser sql: {}, stmts: {:#?}", sql, stmts);
 
         Ok(stmts)
     }
@@ -272,6 +295,11 @@ impl<'a> ExtParser<'a> {
                     self.parser.next_token();
                     self.parse_explain()
                 }
+                Keyword::UPDATE => {
+                    self.parser.next_token();
+                    let update_ast = self.parser.parse_update()?;
+                    Ok(ExtStatement::SqlStatement(Box::new(update_ast)))
+                }
                 _ => {
                     if let Ok(word) = CnosKeyWord::from_str(&w.to_string()) {
                         return match word {
@@ -286,6 +314,14 @@ impl<'a> ExtParser<'a> {
                             CnosKeyWord::CHECKSUM => {
                                 self.parser.next_token();
                                 self.parse_checksum()
+                            }
+                            CnosKeyWord::RECOVER => {
+                                self.parser.next_token();
+                                self.parse_recover()
+                            }
+                            CnosKeyWord::REPLICA => {
+                                self.parser.next_token();
+                                self.parse_replica()
                             }
                             _ => Ok(ExtStatement::SqlStatement(Box::new(
                                 self.parser.parse_statement()?,
@@ -334,11 +370,10 @@ impl<'a> ExtParser<'a> {
                 .then_some(true)
                 .unwrap_or_default();
             Ok(ExtStatement::ShowStreams(ast::ShowStreams { verbose }))
+        } else if self.parse_cnos_keyword(CnosKeyWord::REPLICAS) {
+            self.parse_show_replicas()
         } else {
-            self.expected(
-                "TABLES or DATABASES or SERIES or TAG or QUERIES or STREAMS",
-                self.parser.peek_token(),
-            )
+            parser_err!(format!("nonsupport: {}", self.parser.peek_token()))
         }
     }
 
@@ -491,6 +526,10 @@ impl<'a> ExtParser<'a> {
         Ok(ExtStatement::ShowTables(self.parse_on_database()?))
     }
 
+    fn parse_show_replicas(&mut self) -> Result<ExtStatement> {
+        Ok(ExtStatement::ShowReplicas)
+    }
+
     /// Parse a SQL DESCRIBE DATABASE statement
     fn parse_describe_database(&mut self) -> Result<ExtStatement> {
         debug!("Parse Describe DATABASE statement");
@@ -544,21 +583,17 @@ impl<'a> ExtParser<'a> {
             self.parse_alter_table_alter_column(table_name)
         } else if self.parser.parse_keyword(Keyword::DROP) {
             self.parse_alter_table_drop_column(table_name)
+        } else if self.parser.parse_keyword(Keyword::RENAME) {
+            let alter_tbl = self.parse_alter_table_rename(table_name)?;
+            Ok(ExtStatement::AlterTable(alter_tbl))
         } else {
-            self.expected("ADD or ALTER or DROP", self.parser.peek_token())
+            self.expected("ADD or ALTER or DROP or RENAME", self.parser.peek_token())
         }
     }
 
     fn parse_alter_table_add_column(&mut self, table_name: ObjectName) -> Result<ExtStatement> {
         if self.parse_cnos_keyword(CnosKeyWord::FIELD) {
-            let field_name = self.parser.parse_identifier()?;
-            let data_type = self.parse_column_type()?;
-            let encoding = if self.peek_cnos_keyword().eq(&Ok(CnosKeyWord::CODEC)) {
-                Some(self.parse_codec_type()?)
-            } else {
-                None
-            };
-            let column = ColumnOption::new_field(field_name, data_type, encoding);
+            let column = self.parse_cnos_field()?;
             Ok(ExtStatement::AlterTable(AlterTable {
                 table_name,
                 alter_action: AlterTableAction::AddColumn { column },
@@ -583,9 +618,29 @@ impl<'a> ExtParser<'a> {
         }))
     }
 
+    fn parse_alter_table_rename(&mut self, table_name: ObjectName) -> Result<AlterTable> {
+        if self.parser.parse_keyword(Keyword::COLUMN) {
+            let old_column_name = self.parser.parse_identifier()?;
+            self.parser.expect_keyword(Keyword::TO)?;
+            let new_column_name = self.parser.parse_identifier()?;
+            Ok(AlterTable {
+                table_name,
+                alter_action: AlterTableAction::RenameColumn {
+                    old_column_name,
+                    new_column_name,
+                },
+            })
+        } else {
+            self.expected("COLUMN", self.parser.peek_token())?
+        }
+    }
+
     fn parse_alter_table_alter_column(&mut self, table_name: ObjectName) -> Result<ExtStatement> {
         let column_name = self.parser.parse_identifier()?;
+        // parse: SET CODEC(encoding_type)
         self.parser.expect_keyword(Keyword::SET)?;
+
+        self.expect_cnos_keyword(CnosKeyWord::CODEC)?;
         let encoding = self.parse_codec_type()?;
         Ok(ExtStatement::AlterTable(AlterTable {
             table_name,
@@ -632,7 +687,7 @@ impl<'a> ExtParser<'a> {
                 let role_name = self.parser.parse_identifier()?;
                 AlterTenantOperation::SetUser(user_name, role_name)
             } else {
-                let sql_option = self.parser.parse_sql_option()?;
+                let sql_option = ExtParser::parse_sql_option(&mut self.parser)?;
                 AlterTenantOperation::Set(sql_option)
             }
         } else if self.parse_cnos_keyword(CnosKeyWord::UNSET) {
@@ -653,7 +708,7 @@ impl<'a> ExtParser<'a> {
             let new_name = self.parser.parse_identifier()?;
             AlterUserOperation::RenameTo(new_name)
         } else if self.parser.parse_keyword(Keyword::SET) {
-            let sql_option = self.parser.parse_sql_option()?;
+            let sql_option = ExtParser::parse_sql_option(&mut self.parser)?;
             AlterUserOperation::Set(sql_option)
         } else {
             self.expected("RENAME,SET", self.parser.peek_token())?
@@ -684,22 +739,6 @@ impl<'a> ExtParser<'a> {
         }
     }
 
-    fn parse_has_file_compression_type(&mut self) -> bool {
-        self.parser
-            .parse_keywords(&[Keyword::COMPRESSION, Keyword::TYPE])
-    }
-
-    /// This is a copy of the equivalent implementation in Datafusion.
-    fn parse_csv_has_header(&mut self) -> bool {
-        self.parser
-            .parse_keywords(&[Keyword::WITH, Keyword::HEADER, Keyword::ROW])
-    }
-
-    /// This is a copy of the equivalent implementation in Datafusion.
-    fn parse_has_delimiter(&mut self) -> bool {
-        self.parser.parse_keyword(Keyword::DELIMITER)
-    }
-
     /// This is a copy of the equivalent implementation in Datafusion.
     fn parse_delimiter(&mut self) -> Result<char, ParserError> {
         let token = self.parser.parse_literal_string()?;
@@ -721,54 +760,127 @@ impl<'a> ExtParser<'a> {
         }
     }
 
-    fn parse_create_external_table(&mut self) -> Result<ExtStatement> {
+    fn parse_create_external_table(&mut self, unbounded: bool) -> Result<ExtStatement> {
         self.parser.expect_keyword(Keyword::TABLE)?;
         let if_not_exists =
             self.parser
                 .parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]);
         let table_name = self.parser.parse_object_name()?;
         let (columns, _) = self.parser.parse_columns()?;
-        self.parser
-            .expect_keywords(&[Keyword::STORED, Keyword::AS])?;
 
-        // THIS is the main difference: we parse a different file format.
-        let file_type = self.parse_file_format()?;
+        #[derive(Default)]
+        struct Builder {
+            file_type: Option<String>,
+            location: Option<String>,
+            has_header: Option<bool>,
+            delimiter: Option<char>,
+            file_compression_type: Option<CompressionTypeVariant>,
+            table_partition_cols: Option<Vec<String>>,
+            order_exprs: Vec<Vec<OrderByExpr>>,
+            options: Option<HashMap<String, String>>,
+        }
+        let mut builder = Builder::default();
 
-        let has_header = self.parse_csv_has_header();
+        fn ensure_not_set<T>(field: &Option<T>, name: &str) -> Result<(), ParserError> {
+            if field.is_some() {
+                return Err(ParserError::ParserError(format!(
+                    "{name} specified more than once",
+                )));
+            }
+            Ok(())
+        }
 
-        let has_delimiter = self.parse_has_delimiter();
-        let delimiter = match has_delimiter {
-            true => self.parse_delimiter()?,
-            false => ',',
-        };
+        loop {
+            if let Some(keyword) = self.parser.parse_one_of_keywords(&[
+                Keyword::STORED,
+                Keyword::LOCATION,
+                Keyword::WITH,
+                Keyword::DELIMITER,
+                Keyword::COMPRESSION,
+                Keyword::PARTITIONED,
+                Keyword::OPTIONS,
+            ]) {
+                match keyword {
+                    Keyword::STORED => {
+                        self.parser.expect_keyword(Keyword::AS)?;
+                        ensure_not_set(&builder.file_type, "STORED AS")?;
+                        builder.file_type = Some(self.parse_file_format()?);
+                    }
+                    Keyword::LOCATION => {
+                        ensure_not_set(&builder.location, "LOCATION")?;
+                        builder.location = Some(self.parser.parse_literal_string()?);
+                    }
+                    Keyword::WITH => {
+                        if self.parser.parse_keyword(Keyword::ORDER) {
+                            builder.order_exprs.push(self.parse_order_by_exprs()?);
+                        } else {
+                            self.parser.expect_keyword(Keyword::HEADER)?;
+                            self.parser.expect_keyword(Keyword::ROW)?;
+                            ensure_not_set(&builder.has_header, "WITH HEADER ROW")?;
+                            builder.has_header = Some(true);
+                        }
+                    }
+                    Keyword::DELIMITER => {
+                        ensure_not_set(&builder.delimiter, "DELIMITER")?;
+                        builder.delimiter = Some(self.parse_delimiter()?);
+                    }
+                    Keyword::COMPRESSION => {
+                        self.parser.expect_keyword(Keyword::TYPE)?;
+                        ensure_not_set(&builder.file_compression_type, "COMPRESSION TYPE")?;
+                        builder.file_compression_type = Some(self.parse_file_compression_type()?);
+                    }
+                    Keyword::PARTITIONED => {
+                        self.parser.expect_keyword(Keyword::BY)?;
+                        ensure_not_set(&builder.table_partition_cols, "PARTITIONED BY")?;
+                        builder.table_partition_cols = Some(self.parse_partitions()?);
+                    }
+                    Keyword::OPTIONS => {
+                        ensure_not_set(&builder.options, "OPTIONS")?;
+                        builder.options = Some(self.parse_string_options()?);
+                    }
+                    _ => {
+                        unreachable!()
+                    }
+                }
+            } else {
+                let token = self.parser.next_token();
+                if token == Token::EOF || token == Token::SemiColon {
+                    break;
+                } else {
+                    return Err(ParserError::ParserError(format!(
+                        "Unexpected token {token}"
+                    )));
+                }
+            }
+        }
 
-        let file_compression_type = if self.parse_has_file_compression_type() {
-            self.parse_file_compression_type()?
-        } else {
-            CompressionTypeVariant::UNCOMPRESSED
-        };
-
-        let order_exprs = if self.parser.parse_keywords(&[Keyword::WITH, Keyword::ORDER]) {
-            self.parse_order_by_exprs()?
-        } else {
-            vec![]
-        };
-
-        self.parser.expect_keyword(Keyword::LOCATION)?;
-        let location = self.parser.parse_literal_string()?;
+        // Validations: location and file_type are required
+        if builder.file_type.is_none() {
+            return Err(ParserError::ParserError(
+                "Missing STORED AS clause in CREATE EXTERNAL TABLE statement".into(),
+            ));
+        }
+        if builder.location.is_none() {
+            return Err(ParserError::ParserError(
+                "Missing LOCATION clause in CREATE EXTERNAL TABLE statement".into(),
+            ));
+        }
 
         let create = CreateExternalTable {
             name: table_name.to_string(),
             columns,
-            file_type,
-            has_header,
-            delimiter,
-            location,
-            table_partition_cols: Default::default(),
+            file_type: builder.file_type.unwrap(),
+            has_header: builder.has_header.unwrap_or(false),
+            delimiter: builder.delimiter.unwrap_or(','),
+            location: builder.location.unwrap(),
+            table_partition_cols: builder.table_partition_cols.unwrap_or(vec![]),
+            order_exprs: builder.order_exprs,
             if_not_exists,
-            file_compression_type,
-            options: Default::default(),
-            order_exprs,
+            file_compression_type: builder
+                .file_compression_type
+                .unwrap_or(CompressionTypeVariant::UNCOMPRESSED),
+            unbounded,
+            options: builder.options.unwrap_or(HashMap::new()),
         };
         Ok(ExtStatement::CreateExternalTable(create))
     }
@@ -802,14 +914,27 @@ impl<'a> ExtParser<'a> {
 
     fn parse_database_option(&mut self, options: &mut DatabaseOptions) -> Result<bool> {
         if self.parse_cnos_keyword(CnosKeyWord::TTL) {
+            let _ = self.parser.expect_token(&Token::Eq);
             options.ttl = Some(self.parse_string_value()?);
         } else if self.parse_cnos_keyword(CnosKeyWord::SHARD) {
-            options.shard_num = Some(self.parse_number::<u64>()?);
+            let _ = self.parser.expect_token(&Token::Eq);
+            let shard_num = self.parse_number::<u64>()?;
+            if shard_num == 0 {
+                return parser_err!("shard number should be greater than 0");
+            }
+            options.shard_num = Some(shard_num);
         } else if self.parse_cnos_keyword(CnosKeyWord::VNODE_DURATION) {
+            let _ = self.parser.expect_token(&Token::Eq);
             options.vnode_duration = Some(self.parse_string_value()?);
         } else if self.parse_cnos_keyword(CnosKeyWord::REPLICA) {
-            options.replica = Some(self.parse_number::<u64>()?);
+            let _ = self.parser.expect_token(&Token::Eq);
+            let replica = self.parse_number::<u64>()?;
+            if replica == 0 {
+                return parser_err!("replica number should be greater than 0");
+            }
+            options.replica = Some(replica);
         } else if self.parse_cnos_keyword(CnosKeyWord::PRECISION) {
+            let _ = self.parser.expect_token(&Token::Eq);
             options.precision = Some(self.parse_string_value()?);
         } else {
             return Ok(false);
@@ -828,6 +953,56 @@ impl<'a> ExtParser<'a> {
                 ))
             }
         }
+    }
+
+    fn parse_partitions(&mut self) -> Result<Vec<String>, ParserError> {
+        let mut partitions: Vec<String> = vec![];
+        if !self.parser.consume_token(&Token::LParen) || self.parser.consume_token(&Token::RParen) {
+            return Ok(partitions);
+        }
+
+        loop {
+            if let Token::Word(_) = self.parser.peek_token().token {
+                let identifier = self.parser.parse_identifier()?;
+                partitions.push(identifier.to_string());
+            } else {
+                return self.expected("partition name", self.parser.peek_token());
+            }
+            let comma = self.parser.consume_token(&Token::Comma);
+            if self.parser.consume_token(&Token::RParen) {
+                // allow a trailing comma, even though it's not in standard
+                break;
+            } else if !comma {
+                return self.expected(
+                    "',' or ')' after partition definition",
+                    self.parser.peek_token(),
+                );
+            }
+        }
+        Ok(partitions)
+    }
+
+    /// Parses (key value) style options where the values are literal strings.
+    fn parse_string_options(&mut self) -> Result<HashMap<String, String>, ParserError> {
+        let mut options = HashMap::new();
+        self.parser.expect_token(&Token::LParen)?;
+
+        loop {
+            let key = self.parser.parse_literal_string()?;
+            let value = self.parser.parse_literal_string()?;
+            options.insert(key, value);
+            let comma = self.parser.consume_token(&Token::Comma);
+            if self.parser.consume_token(&Token::RParen) {
+                // allow a trailing comma, even though it's not in standard
+                break;
+            } else if !comma {
+                return self.expected(
+                    "',' or ')' after option definition",
+                    self.parser.peek_token(),
+                );
+            }
+        }
+        Ok(options)
     }
 
     fn parse_string_value(&mut self) -> Result<String> {
@@ -916,7 +1091,7 @@ impl<'a> ExtParser<'a> {
 
         let with_options = if self.parser.parse_keyword(Keyword::WITH) {
             self.parser
-                .parse_comma_separated(Parser::parse_sql_option)?
+                .parse_comma_separated(ExtParser::parse_sql_option)?
         } else {
             vec![]
         };
@@ -957,7 +1132,7 @@ impl<'a> ExtParser<'a> {
 
         let with_options = if self.parser.parse_keyword(Keyword::WITH) {
             self.parser
-                .parse_comma_separated(Parser::parse_sql_option)?
+                .parse_comma_separated(ExtParser::parse_sql_option)?
         } else {
             vec![]
         };
@@ -1057,7 +1232,10 @@ impl<'a> ExtParser<'a> {
     fn parse_create(&mut self) -> Result<ExtStatement> {
         // Currently only supports the creation of external tables
         if self.parser.parse_keyword(Keyword::EXTERNAL) {
-            self.parse_create_external_table()
+            self.parse_create_external_table(false)
+        } else if self.parser.parse_keyword(Keyword::UNBOUNDED) {
+            self.parser.expect_keyword(Keyword::EXTERNAL)?;
+            self.parse_create_external_table(true)
         } else if self.parser.parse_keyword(Keyword::TABLE) {
             self.parse_create_table()
         } else if self.parser.parse_keyword(Keyword::DATABASE) {
@@ -1243,11 +1421,33 @@ impl<'a> ExtParser<'a> {
 
         let options = self
             .parser
-            .parse_comma_separated(Parser::parse_sql_option)?;
+            .parse_comma_separated(ExtParser::parse_sql_option)?;
 
         self.parser.expect_token(&Token::RParen)?;
 
         Ok(options)
+    }
+
+    fn parse_recover(&mut self) -> Result<ExtStatement> {
+        let ast = if self.parser.parse_keyword(Keyword::DATABASE) {
+            let if_exist = self.parser.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
+            let object_name = self.parser.parse_identifier()?;
+            ExtStatement::RecoverDatabase(RecoverDatabase {
+                object_name,
+                if_exist,
+            })
+        } else if self.parse_cnos_keyword(CnosKeyWord::TENANT) {
+            let if_exist = self.parser.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
+            let object_name = self.parser.parse_identifier()?;
+            ExtStatement::RecoverTenant(RecoverTenant {
+                object_name,
+                if_exist,
+            })
+        } else {
+            return self.expected("DATABASE,TENANT after RECOVER", self.parser.peek_token());
+        };
+
+        Ok(ast)
     }
 
     /// Parse a SQL DROP statement
@@ -1263,18 +1463,28 @@ impl<'a> ExtParser<'a> {
         } else if self.parser.parse_keyword(Keyword::DATABASE) {
             let if_exist = self.parser.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
             let object_name = self.parser.parse_identifier()?;
+            let mut after = None;
+            if self.parse_cnos_keyword(CnosKeyWord::AFTER) {
+                after = Some(self.parse_string_value()?);
+            }
             ExtStatement::DropTenantObject(DropTenantObject {
                 object_name,
                 if_exist,
                 obj_type: TenantObjectType::Database,
+                after,
             })
         } else if self.parse_cnos_keyword(CnosKeyWord::TENANT) {
             let if_exist = self.parser.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
             let object_name = self.parser.parse_identifier()?;
+            let mut after = None;
+            if self.parse_cnos_keyword(CnosKeyWord::AFTER) {
+                after = Some(self.parse_string_value()?);
+            }
             ExtStatement::DropGlobalObject(DropGlobalObject {
                 object_name,
                 if_exist,
                 obj_type: GlobalObjectType::Tenant,
+                after,
             })
         } else if self.parser.parse_keyword(Keyword::USER) {
             let if_exist = self.parser.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
@@ -1283,6 +1493,7 @@ impl<'a> ExtParser<'a> {
                 object_name,
                 if_exist,
                 obj_type: GlobalObjectType::User,
+                after: None,
             })
         } else if self.parser.parse_keyword(Keyword::ROLE) {
             let if_exist = self.parser.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
@@ -1291,6 +1502,7 @@ impl<'a> ExtParser<'a> {
                 object_name,
                 if_exist,
                 obj_type: TenantObjectType::Role,
+                after: None,
             })
         } else if self.parse_cnos_keyword(CnosKeyWord::VNODE) {
             let vnode_id = self.parse_number::<VnodeId>()?;
@@ -1358,6 +1570,59 @@ impl<'a> ExtParser<'a> {
         }
     }
 
+    fn parse_replica(&mut self) -> Result<ExtStatement> {
+        if self.parser.parse_keyword(Keyword::ADD) {
+            if !self.parse_cnos_keyword(CnosKeyWord::REPLICA_ID) {
+                return parser_err!("expected REPLICA_ID, after ADD");
+            }
+            let replica_id = self.parse_number::<ReplicationSetId>()?;
+            if !self.parse_cnos_keyword(CnosKeyWord::NODE_ID) {
+                return parser_err!("expected NODE_ID, after REPLICA_ID");
+            }
+            let node_id = self.parse_number::<NodeId>()?;
+            Ok(ExtStatement::ReplicaAdd(ast::ReplicaAdd {
+                replica_id,
+                node_id,
+            }))
+        } else if self.parse_cnos_keyword(CnosKeyWord::REMOVE) {
+            if !self.parse_cnos_keyword(CnosKeyWord::REPLICA_ID) {
+                return parser_err!("expected REPLICA_ID, after ADD");
+            }
+            let replica_id = self.parse_number::<ReplicationSetId>()?;
+            if !self.parse_cnos_keyword(CnosKeyWord::NODE_ID) {
+                return parser_err!("expected NODE_ID, after REPLICA_ID");
+            }
+            let node_id = self.parse_number::<NodeId>()?;
+            Ok(ExtStatement::ReplicaRemove(ast::ReplicaRemove {
+                replica_id,
+                node_id,
+            }))
+        } else if self.parse_cnos_keyword(CnosKeyWord::PROMOTE) {
+            if !self.parse_cnos_keyword(CnosKeyWord::REPLICA_ID) {
+                return parser_err!("expected REPLICA_ID, after ADD");
+            }
+            let replica_id = self.parse_number::<ReplicationSetId>()?;
+            if !self.parse_cnos_keyword(CnosKeyWord::NODE_ID) {
+                return parser_err!("expected NODE_ID, after REPLICA_ID");
+            }
+            let node_id = self.parse_number::<NodeId>()?;
+            Ok(ExtStatement::ReplicaPromote(ast::ReplicaPromote {
+                replica_id,
+                node_id,
+            }))
+        } else if self.parse_cnos_keyword(CnosKeyWord::DESTORY) {
+            if !self.parse_cnos_keyword(CnosKeyWord::REPLICA_ID) {
+                return parser_err!("expected REPLICA_ID, after ADD");
+            }
+            let replica_id = self.parse_number::<ReplicationSetId>()?;
+            Ok(ExtStatement::ReplicaDestory(ast::ReplicaDestory {
+                replica_id,
+            }))
+        } else {
+            parser_err!("expected VNODE, after MOVE")
+        }
+    }
+
     /// Parse a comma-separated list of 1+ items accepted by `F`
     pub fn parse_comma_separated<T, F>(&mut self, mut f: F) -> Result<Vec<T>, ParserError>
     where
@@ -1386,6 +1651,29 @@ impl<'a> ExtParser<'a> {
         }
     }
 
+    fn expect_cnos_keyword(&mut self, key_word: CnosKeyWord) -> Result<()> {
+        if self.parse_cnos_keyword(key_word) {
+            Ok(())
+        } else {
+            self.parser.expected(
+                format!("{:?}", &key_word).as_str(),
+                self.parser.peek_token(),
+            )
+        }
+    }
+
+    // parse: ident data_type [CODEC(encoding_type)]
+    fn parse_cnos_field(&mut self) -> Result<ColumnOption, ParserError> {
+        let name = self.parser.parse_identifier()?;
+        let column_type = self.parser.parse_data_type()?;
+        let encoding = if self.parse_cnos_keyword(CnosKeyWord::CODEC) {
+            Some(self.parse_codec_type()?)
+        } else {
+            None
+        };
+        Ok(ColumnOption::new_field(name, column_type, encoding))
+    }
+
     fn parse_cnos_columns(&mut self) -> Result<Vec<ColumnOption>> {
         // -- Parse as is without adding any semantics
         let mut all_columns: Vec<ColumnOption> = vec![];
@@ -1395,86 +1683,34 @@ impl<'a> ExtParser<'a> {
             return parser_err!("Expected field columns when create table");
         }
         loop {
-            let name = self.parser.parse_identifier()?;
-            let column_type = self.parse_column_type()?;
-
-            let encoding = if self.parser.peek_token().eq(&Token::Comma) {
-                None
+            let column = self.parse_cnos_field()?;
+            field_columns.push(column);
+            if self.consume_token(&Token::Comma) {
+                // parse TAGS(...,...)
+                if self.parse_cnos_keyword(CnosKeyWord::TAGS) {
+                    let idents: Vec<Ident> = self
+                        .parser
+                        .parse_parenthesized_column_list(IsOptional::Mandatory, true)?;
+                    let column_options = idents.into_iter().map(|i| ColumnOption {
+                        name: i,
+                        is_tag: true,
+                        data_type: DataType::String,
+                        encoding: None,
+                    });
+                    all_columns.extend(column_options);
+                    self.parser.expect_token(&Token::RParen)?;
+                    break;
+                }
+            } else if self.parser.consume_token(&Token::RParen) {
+                break;
             } else {
-                Some(self.parse_codec_type()?)
-            };
-
-            field_columns.push(ColumnOption {
-                name,
-                is_tag: false,
-                data_type: column_type,
-                encoding,
-            });
-            let comma = self.consume_token(&Token::Comma);
-            if self.consume_token(&Token::RParen) {
-                // allow a trailing comma, even though it's not in standard
-                // return parser_err!(format!("table should have TAGS"));
-                break;
-            } else if !comma {
-                return self.expected(
-                    "',' or ')' after column definition",
-                    self.parser.peek_token(),
-                );
-            }
-            if self.parse_cnos_keyword(CnosKeyWord::TAGS) {
-                self.parse_tag_columns(&mut all_columns)?;
-                self.parser.expect_token(&Token::RParen)?;
-                break;
+                return parser_err!("Expected token ',', 'TAGS' or ')'");
             }
         }
         // tag1, tag2, ..., field1, field2, ...
         all_columns.append(&mut field_columns);
 
         Ok(all_columns)
-    }
-
-    fn parse_tag_columns(&mut self, columns: &mut Vec<ColumnOption>) -> Result<()> {
-        if !self.consume_token(&Token::LParen) || self.consume_token(&Token::RParen) {
-            return Ok(());
-        }
-        loop {
-            let name = self.parser.parse_identifier()?;
-            columns.push(ColumnOption {
-                name,
-                is_tag: true,
-                data_type: DataType::String,
-                encoding: None,
-            });
-            let is_comma = self.consume_token(&Token::Comma);
-            if self.consume_token(&Token::RParen) {
-                break;
-            }
-            if !is_comma {
-                return parser_err!(format!(", is expected after column"));
-            }
-        }
-        Ok(())
-    }
-
-    fn parse_column_type(&mut self) -> Result<DataType> {
-        let TokenWithLocation { token, location: _ } = self.parser.next_token();
-        match token {
-            Token::Word(w) => match w.keyword {
-                Keyword::TIMESTAMP => parser_err!(format!("already have timestamp column")),
-                Keyword::BIGINT => {
-                    if self.parser.parse_keyword(Keyword::UNSIGNED) {
-                        Ok(DataType::UnsignedBigInt(None))
-                    } else {
-                        Ok(DataType::BigInt(None))
-                    }
-                }
-                Keyword::DOUBLE => Ok(DataType::Double),
-                Keyword::STRING => Ok(DataType::String),
-                Keyword::BOOLEAN => Ok(DataType::Boolean),
-                _ => parser_err!(format!("{} is not a supported type", w)),
-            },
-            unexpected => parser_err!(format!("{} is not a type", unexpected)),
-        }
     }
 
     fn parse_codec_encoding(&mut self) -> Result<Encoding, String> {
@@ -1489,10 +1725,6 @@ impl<'a> ExtParser<'a> {
     }
 
     fn parse_codec_type(&mut self) -> Result<Encoding> {
-        if !self.parse_cnos_keyword(CnosKeyWord::CODEC) {
-            return self.expected("CODEC or ','", self.parser.peek_token());
-        }
-
         self.parser.expect_token(&Token::LParen)?;
         if self.parser.peek_token().eq(&Token::RParen) {
             return parser_err!(format!("expect codec encoding type in ()"));
@@ -1503,6 +1735,13 @@ impl<'a> ExtParser<'a> {
         };
         self.parser.expect_token(&Token::RParen)?;
         Ok(encoding)
+    }
+
+    fn parse_sql_option(parser: &mut Parser<'_>) -> Result<SqlOption, ParserError> {
+        let name = parser.parse_identifier()?;
+        let _ = parser.expect_token(&Token::Eq);
+        let value = parser.parse_value()?;
+        Ok(SqlOption { name, value })
     }
 }
 
@@ -1518,8 +1757,8 @@ mod tests {
     use datafusion::sql::sqlparser::ast::{
         ColumnDef, Ident, ObjectName, SetExpr, Statement, TableFactor, TimezoneInfo, Value,
     };
-    use spi::query::ast::{AlterTable, DropDatabaseObject, ExtStatement, ShowStreams, UriLocation};
-    use spi::query::logical_planner::{DatabaseObjectType, TenantObjectType};
+    use spi::query::ast::{AlterTable, ExtStatement, ShowStreams, UriLocation};
+    use spi::query::logical_planner::TenantObjectType;
 
     use super::*;
 
@@ -1545,38 +1784,6 @@ mod tests {
 
     #[test]
     fn test_drop() {
-        let sql = "drop table test_tb";
-        let statements = ExtParser::parse_sql(sql).unwrap();
-        assert_eq!(statements.len(), 1);
-        match &statements[0] {
-            ExtStatement::DropDatabaseObject(DropDatabaseObject {
-                object_name,
-                if_exist,
-                obj_type,
-            }) => {
-                assert_eq!(object_name.to_string(), "test_tb".to_string());
-                assert_eq!(if_exist.to_string(), "false".to_string());
-                assert_eq!(obj_type, &DatabaseObjectType::Table);
-            }
-            _ => panic!("failed"),
-        }
-
-        let sql = "drop table if exists test_tb";
-        let statements = ExtParser::parse_sql(sql).unwrap();
-        assert_eq!(statements.len(), 1);
-        match &statements[0] {
-            ExtStatement::DropDatabaseObject(DropDatabaseObject {
-                object_name,
-                if_exist,
-                obj_type,
-            }) => {
-                assert_eq!(object_name.to_string(), "test_tb".to_string());
-                assert_eq!(if_exist.to_string(), "true".to_string());
-                assert_eq!(obj_type, &DatabaseObjectType::Table);
-            }
-            _ => panic!("failed"),
-        }
-
         let sql = "drop database if exists test_db";
         let statements = ExtParser::parse_sql(sql).unwrap();
         assert_eq!(statements.len(), 1);
@@ -1585,6 +1792,7 @@ mod tests {
                 object_name,
                 if_exist,
                 obj_type,
+                after: None,
             }) => {
                 assert_eq!(object_name.to_string(), "test_db".to_string());
                 assert_eq!(if_exist.to_string(), "true".to_string());
@@ -1601,6 +1809,7 @@ mod tests {
                 object_name,
                 if_exist,
                 obj_type,
+                after: None,
             }) => {
                 assert_eq!(object_name.to_string(), "test_db".to_string());
                 assert_eq!(if_exist.to_string(), "false".to_string());
@@ -1608,6 +1817,193 @@ mod tests {
             }
             _ => panic!("failed"),
         }
+
+        let sql = "drop database test_db after '1h'";
+        let statements = ExtParser::parse_sql(sql).unwrap();
+        assert_eq!(statements.len(), 1);
+        match &statements[0] {
+            ExtStatement::DropTenantObject(DropTenantObject {
+                object_name,
+                if_exist,
+                obj_type,
+                after,
+            }) => {
+                assert_eq!(object_name.to_string(), "test_db".to_string());
+                assert_eq!(if_exist.to_string(), "false".to_string());
+                assert_eq!(obj_type, &TenantObjectType::Database);
+                assert_eq!(*after, Some("1h".to_string()));
+            }
+            _ => panic!("failed"),
+        }
+
+        let sql = "drop database if exists test_db after '1h'";
+        let statements = ExtParser::parse_sql(sql).unwrap();
+        assert_eq!(statements.len(), 1);
+        match &statements[0] {
+            ExtStatement::DropTenantObject(DropTenantObject {
+                object_name,
+                if_exist,
+                obj_type,
+                after,
+            }) => {
+                assert_eq!(object_name.to_string(), "test_db".to_string());
+                assert_eq!(if_exist.to_string(), "true".to_string());
+                assert_eq!(obj_type, &TenantObjectType::Database);
+                assert_eq!(*after, Some("1h".to_string()));
+            }
+            _ => panic!("failed"),
+        }
+
+        let sql = "drop tenant if exists test_tt";
+        let statements = ExtParser::parse_sql(sql).unwrap();
+        assert_eq!(statements.len(), 1);
+        match &statements[0] {
+            ExtStatement::DropGlobalObject(DropGlobalObject {
+                object_name,
+                if_exist,
+                obj_type,
+                after: None,
+            }) => {
+                assert_eq!(object_name.to_string(), "test_tt".to_string());
+                assert_eq!(if_exist.to_string(), "true".to_string());
+                assert_eq!(obj_type, &GlobalObjectType::Tenant);
+            }
+            _ => panic!("failed"),
+        }
+
+        let sql = "drop tenant test_tt";
+        let statements = ExtParser::parse_sql(sql).unwrap();
+        assert_eq!(statements.len(), 1);
+        match &statements[0] {
+            ExtStatement::DropGlobalObject(DropGlobalObject {
+                object_name,
+                if_exist,
+                obj_type,
+                after: None,
+            }) => {
+                assert_eq!(object_name.to_string(), "test_tt".to_string());
+                assert_eq!(if_exist.to_string(), "false".to_string());
+                assert_eq!(obj_type, &GlobalObjectType::Tenant);
+            }
+            _ => panic!("failed"),
+        }
+
+        let sql = "drop tenant test_tt after '1h'";
+        let statements = ExtParser::parse_sql(sql).unwrap();
+        assert_eq!(statements.len(), 1);
+        match &statements[0] {
+            ExtStatement::DropGlobalObject(DropGlobalObject {
+                object_name,
+                if_exist,
+                obj_type,
+                after,
+            }) => {
+                assert_eq!(object_name.to_string(), "test_tt".to_string());
+                assert_eq!(if_exist.to_string(), "false".to_string());
+                assert_eq!(obj_type, &GlobalObjectType::Tenant);
+                assert_eq!(*after, Some("1h".to_string()));
+            }
+            _ => panic!("failed"),
+        }
+
+        let sql = "drop tenant if exists test_tt after '1h'";
+        let statements = ExtParser::parse_sql(sql).unwrap();
+        assert_eq!(statements.len(), 1);
+        match &statements[0] {
+            ExtStatement::DropGlobalObject(DropGlobalObject {
+                object_name,
+                if_exist,
+                obj_type,
+                after,
+            }) => {
+                assert_eq!(object_name.to_string(), "test_tt".to_string());
+                assert_eq!(if_exist.to_string(), "true".to_string());
+                assert_eq!(obj_type, &GlobalObjectType::Tenant);
+                assert_eq!(*after, Some("1h".to_string()));
+            }
+            _ => panic!("failed"),
+        }
+    }
+
+    #[test]
+    fn test_recover() {
+        let sql = "recover database test_db";
+        let statements = ExtParser::parse_sql(sql).unwrap();
+        assert_eq!(statements.len(), 1);
+        match &statements[0] {
+            ExtStatement::RecoverDatabase(RecoverDatabase {
+                object_name,
+                if_exist,
+            }) => {
+                assert_eq!(object_name.to_string(), "test_db".to_string());
+                assert_eq!(if_exist.to_string(), "false".to_string());
+            }
+            _ => panic!("failed"),
+        }
+
+        let sql = "recover database if exists test_db";
+        let statements = ExtParser::parse_sql(sql).unwrap();
+        assert_eq!(statements.len(), 1);
+        match &statements[0] {
+            ExtStatement::RecoverDatabase(RecoverDatabase {
+                object_name,
+                if_exist,
+            }) => {
+                assert_eq!(object_name.to_string(), "test_db".to_string());
+                assert_eq!(if_exist.to_string(), "true".to_string());
+            }
+            _ => panic!("failed"),
+        }
+
+        let sql = "recover tenant test_tt";
+        let statements = ExtParser::parse_sql(sql).unwrap();
+        assert_eq!(statements.len(), 1);
+        match &statements[0] {
+            ExtStatement::RecoverTenant(RecoverTenant {
+                object_name,
+                if_exist,
+            }) => {
+                assert_eq!(object_name.to_string(), "test_tt".to_string());
+                assert_eq!(if_exist.to_string(), "false".to_string());
+            }
+            _ => panic!("failed"),
+        }
+
+        let sql = "recover tenant if exists test_tt";
+        let statements = ExtParser::parse_sql(sql).unwrap();
+        assert_eq!(statements.len(), 1);
+        match &statements[0] {
+            ExtStatement::RecoverTenant(RecoverTenant {
+                object_name,
+                if_exist,
+            }) => {
+                assert_eq!(object_name.to_string(), "test_tt".to_string());
+                assert_eq!(if_exist.to_string(), "true".to_string());
+            }
+            _ => panic!("failed"),
+        }
+    }
+
+    #[test]
+    fn test_create_table_without_tags() {
+        let sql = "CREATE TABLE test(column1 BIGINT);";
+        let statement1 = ExtParser::parse_sql(sql).unwrap().pop_front().unwrap();
+        assert_eq!(
+            statement1,
+            ExtStatement::CreateTable(CreateTable {
+                name: ObjectName(vec!["test".into()]),
+                if_not_exists: false,
+                columns: vec![ColumnOption {
+                    name: "column1".into(),
+                    is_tag: false,
+                    data_type: DataType::BigInt(None),
+                    encoding: None
+                }]
+            })
+        );
+
+        let sql = "CREATE TABLE test(column1 BIGINT,);";
+        ExtParser::parse_sql(sql).err().unwrap();
     }
 
     #[test]
@@ -1935,6 +2331,50 @@ mod tests {
     }
 
     #[test]
+    fn test_replica_sql() {
+        let sql1 = "replica add replica_id 111 node_id 2001;";
+        let statement = ExtParser::parse_sql(sql1).unwrap();
+        assert_eq!(
+            statement[0],
+            ExtStatement::ReplicaAdd(ast::ReplicaAdd {
+                replica_id: 111,
+                node_id: 2001,
+            })
+        );
+
+        let sql1 = "replica remove replica_id 111 node_id 2001;";
+        let statement = ExtParser::parse_sql(sql1).unwrap();
+        assert_eq!(
+            statement[0],
+            ExtStatement::ReplicaRemove(ast::ReplicaRemove {
+                replica_id: 111,
+                node_id: 2001,
+            })
+        );
+
+        let sql1 = "replica promote replica_id 111 node_id 2001;";
+        let statement = ExtParser::parse_sql(sql1).unwrap();
+        assert_eq!(
+            statement[0],
+            ExtStatement::ReplicaPromote(ast::ReplicaPromote {
+                replica_id: 111,
+                node_id: 2001,
+            })
+        );
+
+        let sql1 = "replica destory replica_id 111;";
+        let statement = ExtParser::parse_sql(sql1).unwrap();
+        assert_eq!(
+            statement[0],
+            ExtStatement::ReplicaDestory(ast::ReplicaDestory { replica_id: 111 })
+        );
+
+        let sql1 = "show replicas;";
+        let statement = ExtParser::parse_sql(sql1).unwrap();
+        assert_eq!(statement[0], ExtStatement::ShowReplicas);
+    }
+
+    #[test]
     fn test_vnode_sql() {
         let sql1 = "move vnode 1 to node 2;";
         let statement = ExtParser::parse_sql(sql1).unwrap();
@@ -2155,6 +2595,58 @@ mod tests {
                 panic!("expect CreateStreamTable")
             }
             _ => panic!("expect CreateStream"),
+        }
+    }
+
+    #[test]
+    fn test_alter_table_rename_column() {
+        let statement = parse_sql("ALTER TABLE TskvTable RENAME COLUMN tag1 to tag2;");
+
+        match statement {
+            ExtStatement::AlterTable(AlterTable {
+                table_name,
+                alter_action:
+                    AlterTableAction::RenameColumn {
+                        old_column_name,
+                        new_column_name,
+                    },
+            }) => {
+                assert_eq!("TskvTable", &table_name.to_string());
+                assert_eq!(Ident::from("tag1"), old_column_name);
+                assert_eq!(Ident::from("tag2"), new_column_name);
+            }
+            _ => panic!("expect RenameColumn"),
+        }
+    }
+
+    #[test]
+    fn test_update() {
+        let statement = parse_sql("UPDATE TskvTable SET tag1 = '1' WHERE tag2 = '2';");
+
+        match statement {
+            ExtStatement::SqlStatement(ast) => match ast.as_ref() {
+                Statement::Update {
+                    table,
+                    assignments,
+                    from,
+                    returning,
+                    ..
+                } => {
+                    assert_eq!("TskvTable", &table.to_string());
+                    assert_eq!(1, assignments.len());
+                    assert_eq!(Ident::from("tag1"), assignments[0].id[0]);
+                    assert_eq!(
+                        Expr::Value(Value::SingleQuotedString("1".into())),
+                        assignments[0].value
+                    );
+                    assert!(from.is_none());
+                    assert!(returning.is_none());
+                }
+                _ => {
+                    panic!("expect Update")
+                }
+            },
+            _ => panic!("expect RenameColumn"),
         }
     }
 }

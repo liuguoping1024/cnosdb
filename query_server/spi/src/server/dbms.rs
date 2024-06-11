@@ -4,42 +4,42 @@ use async_trait::async_trait;
 use datafusion::arrow::array::{Float32Array, Float64Array};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::from_slice::FromSlice;
 use models::auth::role::UserRole;
 use models::auth::user::{User, UserDesc, UserInfo, UserOptionsBuilder};
+use trace::span_ext::SpanExt;
 use trace::SpanContext;
 
 use crate::query::execution::{Output, QueryStateMachine, QueryStateMachineRef};
 use crate::query::logical_planner::Plan;
 use crate::query::recordbatch::RecordBatchStreamWrapper;
 use crate::service::protocol::{Query, QueryHandle, QueryId};
-use crate::Result;
+use crate::QueryResult;
 
 pub type DBMSRef = Arc<dyn DatabaseManagerSystem + Send + Sync>;
 
 #[async_trait]
 pub trait DatabaseManagerSystem {
-    async fn start(&self) -> Result<()>;
-    async fn authenticate(&self, user_info: &UserInfo, tenant_name: Option<&str>) -> Result<User>;
+    async fn start(&self) -> QueryResult<()>;
+    async fn authenticate(&self, user_info: &UserInfo, tenant_name: &str) -> QueryResult<User>;
     async fn execute(
         &self,
         query: &Query,
         span_context: Option<&SpanContext>,
-    ) -> Result<QueryHandle>;
+    ) -> QueryResult<QueryHandle>;
     async fn build_query_state_machine(
         &self,
         query: Query,
         span_context: Option<&SpanContext>,
-    ) -> Result<QueryStateMachineRef>;
+    ) -> QueryResult<QueryStateMachineRef>;
     async fn build_logical_plan(
         &self,
         query_state_machine: QueryStateMachineRef,
-    ) -> Result<Option<Plan>>;
+    ) -> QueryResult<Option<Plan>>;
     async fn execute_logical_plan(
         &self,
         logical_plan: Plan,
         query_state_machine: QueryStateMachineRef,
-    ) -> Result<QueryHandle>;
+    ) -> QueryResult<QueryHandle>;
     fn metrics(&self) -> String;
     fn cancel(&self, query_id: &QueryId);
 }
@@ -48,18 +48,19 @@ pub struct DatabaseManagerSystemMock {}
 
 #[async_trait]
 impl DatabaseManagerSystem for DatabaseManagerSystemMock {
-    async fn start(&self) -> Result<()> {
+    async fn start(&self) -> QueryResult<()> {
         Ok(())
     }
-    async fn authenticate(&self, user_info: &UserInfo, _tenant_name: Option<&str>) -> Result<User> {
+    async fn authenticate(&self, user_info: &UserInfo, _tenant_name: &str) -> QueryResult<User> {
         let options = unsafe {
             UserOptionsBuilder::default()
-                .password(user_info.password.to_string())
+                .password(user_info.password.clone())
+                .unwrap_unchecked()
                 .build()
                 .unwrap_unchecked()
         };
         let mock_desc = UserDesc::new(0_u128, user_info.user.to_string(), options, true);
-        let mock_user = User::new(mock_desc, UserRole::Dba.to_privileges());
+        let mock_user = User::new(mock_desc, UserRole::Dba.to_privileges(), None);
         Ok(mock_user)
     }
 
@@ -67,7 +68,7 @@ impl DatabaseManagerSystem for DatabaseManagerSystemMock {
         &self,
         query: &Query,
         _span_context: Option<&SpanContext>,
-    ) -> Result<QueryHandle> {
+    ) -> QueryResult<QueryHandle> {
         println!("DatabaseManagerSystemMock::execute({:?})", query.content());
 
         // define a schema.
@@ -83,8 +84,8 @@ impl DatabaseManagerSystem for DatabaseManagerSystemMock {
                 RecordBatch::try_new(
                     schema.clone(),
                     vec![
-                        Arc::new(Float32Array::from_slice(vec![i as f32; batch_size])),
-                        Arc::new(Float64Array::from_slice(vec![i as f64; batch_size])),
+                        Arc::new(Float32Array::from(vec![i as f32; batch_size])),
+                        Arc::new(Float64Array::from(vec![i as f64; batch_size])),
                     ],
                 )
                 .unwrap()
@@ -102,7 +103,7 @@ impl DatabaseManagerSystem for DatabaseManagerSystemMock {
         &self,
         query: Query,
         span_context: Option<&SpanContext>,
-    ) -> Result<QueryStateMachineRef> {
+    ) -> QueryResult<QueryStateMachineRef> {
         Ok(Arc::new(QueryStateMachine::test(
             query,
             span_context.cloned(),
@@ -112,7 +113,7 @@ impl DatabaseManagerSystem for DatabaseManagerSystemMock {
     async fn build_logical_plan(
         &self,
         _query_state_machine: QueryStateMachineRef,
-    ) -> Result<Option<Plan>> {
+    ) -> QueryResult<Option<Plan>> {
         Ok(None)
     }
 
@@ -120,13 +121,14 @@ impl DatabaseManagerSystem for DatabaseManagerSystemMock {
         &self,
         _logical_plan: Plan,
         query_state_machine: QueryStateMachineRef,
-    ) -> Result<QueryHandle> {
+    ) -> QueryResult<QueryHandle> {
         self.execute(
             &query_state_machine.query,
             query_state_machine
                 .session
-                .get_child_span_recorder("mock execute logical plan")
-                .span_ctx(),
+                .get_child_span("mock execute logical plan")
+                .context()
+                .as_ref(),
         )
         .await
     }

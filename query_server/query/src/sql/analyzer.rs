@@ -4,13 +4,15 @@ use datafusion::logical_expr::LogicalPlan;
 use datafusion::optimizer::analyzer::Analyzer as DFAnalyzer;
 use spi::query::analyzer::Analyzer;
 use spi::query::session::SessionCtx;
-use spi::Result;
+use spi::QueryResult;
 
 use crate::extension::analyse::initial_plan_checker::InitialPlanChecker;
 use crate::extension::analyse::transform_bottom_func_to_topk_node::TransformBottomFuncToTopkNodeRule;
 use crate::extension::analyse::transform_gapfill::TransformGapFill;
 use crate::extension::analyse::transform_time_window::TransformTimeWindowRule;
 use crate::extension::analyse::transform_topk_func_to_topk_node::TransformTopkFuncToTopkNodeRule;
+use crate::extension::analyse::transform_ts_gen_func::TransformTSGenFunc;
+use crate::extension::analyse::transform_update::TransformUpdateRule;
 
 pub struct DefaultAnalyzer {
     inner: DFAnalyzer,
@@ -21,11 +23,13 @@ impl DefaultAnalyzer {
         let mut analyzer = DFAnalyzer::default();
 
         let rules = &mut analyzer.rules;
+        rules.insert(0, Arc::new(TransformUpdateRule::new()));
         rules.push(Arc::new(InitialPlanChecker {}));
         rules.push(Arc::new(TransformBottomFuncToTopkNodeRule {}));
         rules.push(Arc::new(TransformTopkFuncToTopkNodeRule {}));
         rules.push(Arc::new(TransformGapFill::new()));
         rules.push(Arc::new(TransformTimeWindowRule {}));
+        rules.push(Arc::new(TransformTSGenFunc));
 
         Self { inner: analyzer }
     }
@@ -38,10 +42,10 @@ impl Default for DefaultAnalyzer {
 }
 
 impl Analyzer for DefaultAnalyzer {
-    fn analyze(&self, plan: &LogicalPlan, session: &SessionCtx) -> Result<LogicalPlan> {
-        let plan = self
-            .inner
-            .execute_and_check(plan, session.inner().state().config_options())?;
+    fn analyze(&self, plan: &LogicalPlan, session: &SessionCtx) -> QueryResult<LogicalPlan> {
+        let plan =
+            self.inner
+                .execute_and_check(plan, session.inner().config_options(), |_, _| {})?;
         Ok(plan)
     }
 }

@@ -4,9 +4,9 @@ use datafusion::arrow::datatypes::DataType;
 use datafusion::logical_expr::{create_udaf, AggregateUDF, Volatility};
 use datafusion::physical_plan::expressions::AvgAccumulator;
 use spi::query::function::FunctionMetadataManager;
-use spi::Result;
+use spi::QueryResult;
 
-pub fn register_udaf(func_manager: &mut dyn FunctionMetadataManager) -> Result<AggregateUDF> {
+pub fn register_udaf(func_manager: &mut dyn FunctionMetadataManager) -> QueryResult<AggregateUDF> {
     let udf = new();
     func_manager.register_udaf(udf.clone())?;
     Ok(udf)
@@ -18,7 +18,12 @@ fn new() -> AggregateUDF {
         DataType::Float64,
         Arc::new(DataType::Float64),
         Volatility::Immutable,
-        Arc::new(|_| Ok(Box::new(AvgAccumulator::try_new(&DataType::Float64)?))),
+        Arc::new(|_, _| {
+            Ok(Box::new(AvgAccumulator::try_new(
+                &DataType::Float64,
+                &DataType::Float64,
+            )?))
+        }),
         Arc::new(vec![DataType::UInt64, DataType::Float64]),
     )
 }

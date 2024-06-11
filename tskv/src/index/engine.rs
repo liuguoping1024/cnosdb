@@ -1,18 +1,16 @@
 use std::fs;
-use std::ops::RangeBounds;
-use std::path::{Path, PathBuf};
+use std::ops::{BitAnd, BitOr, RangeBounds};
+use std::path::Path;
 
 use radixdb;
 use radixdb::store;
 use radixdb::store::BlobStore;
-use trace::debug;
+use snafu::ResultExt;
 
-use super::{IndexError, IndexResult};
+use super::{IndexResult, IndexStorageSnafu, RoaringBitmapSnafu};
 
 #[derive(Debug)]
 pub struct IndexEngine {
-    dir: PathBuf,
-
     db: radixdb::RadixTree<store::PagedFileStore>,
     store: store::PagedFileStore,
 }
@@ -21,7 +19,7 @@ impl IndexEngine {
     pub fn new(path: impl AsRef<Path>) -> IndexResult<Self> {
         let path = path.as_ref();
         let _ = fs::create_dir_all(path);
-        debug!("Creating index engine : {:?}", &path);
+        trace::debug!("Creating index engine : {:?}", &path);
 
         let db_path = path.join("index.db");
         let file = fs::OpenOptions::new()
@@ -29,24 +27,20 @@ impl IndexEngine {
             .read(true)
             .write(true)
             .open(db_path)
-            .map_err(|e| IndexError::IndexStroage { msg: e.to_string() })?;
+            .map_err(|e| IndexStorageSnafu { msg: e.to_string() }.build())?;
 
         let store = store::PagedFileStore::new(file, 1024 * 1024)
-            .map_err(|e| IndexError::IndexStroage { msg: e.to_string() })?;
+            .map_err(|e| IndexStorageSnafu { msg: e.to_string() }.build())?;
         let db = radixdb::RadixTree::try_load(store.clone(), store.last_id())
-            .map_err(|e| IndexError::IndexStroage { msg: e.to_string() })?;
+            .map_err(|e| IndexStorageSnafu { msg: e.to_string() }.build())?;
 
-        Ok(Self {
-            db,
-            store,
-            dir: path.into(),
-        })
+        Ok(Self { db, store })
     }
 
     pub fn set(&mut self, key: &[u8], value: &[u8]) -> IndexResult<()> {
         self.db
             .try_insert(key, value)
-            .map_err(|e| IndexError::IndexStroage { msg: e.to_string() })?;
+            .map_err(|e| IndexStorageSnafu { msg: e.to_string() }.build())?;
 
         Ok(())
     }
@@ -55,7 +49,7 @@ impl IndexEngine {
         let val = self
             .db
             .try_get(key)
-            .map_err(|e| IndexError::IndexStroage { msg: e.to_string() })?;
+            .map_err(|e| IndexStorageSnafu { msg: e.to_string() }.build())?;
 
         match val {
             Some(v) => {
@@ -70,15 +64,15 @@ impl IndexEngine {
     pub fn load(&self, val: &radixdb::node::Value<store::PagedFileStore>) -> IndexResult<Vec<u8>> {
         let blob = val
             .load(&self.store)
-            .map_err(|e| IndexError::IndexStroage { msg: e.to_string() })?;
+            .map_err(|e| IndexStorageSnafu { msg: e.to_string() }.build())?;
 
         Ok(blob.to_vec())
     }
 
     pub fn get_rb(&self, key: &[u8]) -> IndexResult<Option<roaring::RoaringBitmap>> {
         if let Some(data) = self.get(key)? {
-            let rb = roaring::RoaringBitmap::deserialize_from(&*data)
-                .map_err(|e| IndexError::RoaringBitmap { source: e })?;
+            let rb =
+                roaring::RoaringBitmap::deserialize_from(&*data).context(RoaringBitmapSnafu)?;
 
             Ok(Some(rb))
         } else {
@@ -86,43 +80,21 @@ impl IndexEngine {
         }
     }
 
-    pub fn load_rb(
+    fn load_rb(
         &self,
         val: &radixdb::node::Value<store::PagedFileStore>,
     ) -> IndexResult<roaring::RoaringBitmap> {
         let data = self.load(val)?;
 
-        let rb = roaring::RoaringBitmap::deserialize_from(&*data)
-            .map_err(|e| IndexError::RoaringBitmap { source: e })?;
+        let rb = roaring::RoaringBitmap::deserialize_from(&*data).context(RoaringBitmapSnafu)?;
 
         Ok(rb)
-    }
-
-    pub fn build_revert_index(&self, key: &[u8], id: u32, add: bool) -> IndexResult<Vec<u8>> {
-        let mut rb = match self.get(key)? {
-            Some(val) => roaring::RoaringBitmap::deserialize_from(&*val)
-                .map_err(|e| IndexError::IndexStroage { msg: e.to_string() })?,
-
-            None => roaring::RoaringBitmap::new(),
-        };
-
-        if add {
-            rb.insert(id);
-        } else {
-            rb.remove(id);
-        }
-
-        let mut bytes = vec![];
-        rb.serialize_into(&mut bytes)
-            .map_err(|e| IndexError::IndexStroage { msg: e.to_string() })?;
-
-        Ok(bytes)
     }
 
     pub fn modify(&mut self, key: &[u8], id: u32, add: bool) -> IndexResult<()> {
         let mut rb = match self.get(key)? {
             Some(val) => roaring::RoaringBitmap::deserialize_from(&*val)
-                .map_err(|e| IndexError::IndexStroage { msg: e.to_string() })?,
+                .map_err(|e| IndexStorageSnafu { msg: e.to_string() }.build())?,
 
             None => roaring::RoaringBitmap::new(),
         };
@@ -135,7 +107,26 @@ impl IndexEngine {
 
         let mut bytes = vec![];
         rb.serialize_into(&mut bytes)
-            .map_err(|e| IndexError::IndexStroage { msg: e.to_string() })?;
+            .map_err(|e| IndexStorageSnafu { msg: e.to_string() }.build())?;
+
+        self.set(key, &bytes)?;
+
+        Ok(())
+    }
+
+    pub fn merge_rb(&mut self, key: &[u8], rb: &roaring::RoaringBitmap) -> IndexResult<()> {
+        let value = match self.get(key)? {
+            Some(val) => roaring::RoaringBitmap::deserialize_from(&*val)
+                .map_err(|e| IndexStorageSnafu { msg: e.to_string() }.build())?,
+
+            None => roaring::RoaringBitmap::new(),
+        };
+
+        let mut bytes = vec![];
+        let value = value.bitor(rb);
+        value
+            .serialize_into(&mut bytes)
+            .map_err(|e| IndexStorageSnafu { msg: e.to_string() }.build())?;
 
         self.set(key, &bytes)?;
 
@@ -145,18 +136,15 @@ impl IndexEngine {
     pub fn delete(&mut self, key: &[u8]) -> IndexResult<()> {
         self.db
             .try_remove(key)
-            .map_err(|e| IndexError::IndexStroage { msg: e.to_string() })?;
+            .map_err(|e| IndexStorageSnafu { msg: e.to_string() }.build())?;
 
         Ok(())
     }
 
-    pub fn combine(&mut self, tree: radixdb::RadixTree) -> IndexResult<()> {
+    pub fn del_prefix(&mut self, prefix: &[u8]) -> IndexResult<()> {
         self.db
-            .try_outer_combine_with(&tree, radixdb::node::DetachConverter, |a, b| {
-                a.set(Some(b.downcast()));
-                Ok(())
-            })
-            .map_err(|e| IndexError::IndexStroage { msg: e.to_string() })?;
+            .try_remove_prefix(prefix)
+            .map_err(|e| IndexStorageSnafu { msg: e.to_string() }.build())?;
 
         Ok(())
     }
@@ -165,17 +153,9 @@ impl IndexEngine {
         let result = self
             .db
             .try_contains_key(key)
-            .map_err(|e| IndexError::IndexStroage { msg: e.to_string() })?;
+            .map_err(|e| IndexStorageSnafu { msg: e.to_string() }.build())?;
 
         Ok(result)
-    }
-
-    pub fn range(&self, range: impl RangeBounds<Vec<u8>>) -> RangeKeyValIter {
-        RangeKeyValIter::new_iterator(
-            copy_bound(range.start_bound()),
-            copy_bound(range.end_bound()),
-            self.db.try_iter(),
-        )
     }
 
     pub fn prefix<'a>(
@@ -184,20 +164,86 @@ impl IndexEngine {
     ) -> IndexResult<radixdb::node::KeyValueIter<store::PagedFileStore>> {
         self.db
             .try_scan_prefix(key)
-            .map_err(|e| IndexError::IndexStroage { msg: e.to_string() })
+            .map_err(|e| IndexStorageSnafu { msg: e.to_string() }.build())
     }
 
     pub fn flush(&mut self) -> IndexResult<()> {
         let _id = self
             .db
             .try_reattach()
-            .map_err(|e| IndexError::IndexStroage { msg: e.to_string() })?;
+            .map_err(|e| IndexStorageSnafu { msg: e.to_string() }.build())?;
 
         self.store
             .sync()
-            .map_err(|e| IndexError::IndexStroage { msg: e.to_string() })?;
+            .map_err(|e| IndexStorageSnafu { msg: e.to_string() }.build())?;
 
         Ok(())
+    }
+
+    //---------------------------------------------------------------------
+    pub fn get_series_id_by_range(
+        &self,
+        range: impl RangeBounds<Vec<u8>>,
+    ) -> IndexResult<roaring::RoaringBitmap> {
+        // process equal special situation
+        if let std::ops::Bound::Included(start) = range.start_bound() {
+            if let std::ops::Bound::Included(end) = range.end_bound() {
+                if start == end {
+                    if let Some(rb) = self.get_rb(start)? {
+                        return Ok(rb);
+                    };
+                    return Ok(roaring::RoaringBitmap::new());
+                }
+            }
+        }
+
+        let mut bitmap = roaring::RoaringBitmap::new();
+        let iter = RangeKeyValIter::new_iterator(
+            copy_bound(range.start_bound()),
+            copy_bound(range.end_bound()),
+            self.db.try_iter(),
+        );
+        for item in iter {
+            let item = item?;
+            let rb = self.load_rb(&item.1)?;
+            bitmap = bitmap.bitor(rb);
+        }
+
+        Ok(bitmap)
+    }
+
+    pub fn get_series_id_by_tags(
+        &self,
+        tab: &str,
+        tags: &[models::Tag],
+    ) -> IndexResult<roaring::RoaringBitmap> {
+        let mut bitmap = roaring::RoaringBitmap::new();
+        if tags.is_empty() {
+            let prefix = format!("{}.", tab);
+            let it = self.prefix(prefix.as_bytes())?;
+            for val in it {
+                let val = val.map_err(|e| IndexStorageSnafu { msg: e.to_string() }.build())?;
+                let rb = self.load_rb(&val.1)?;
+
+                bitmap = bitmap.bitor(rb);
+            }
+        } else {
+            let key = super::ts_index::encode_inverted_index_key(tab, &tags[0].key, &tags[0].value);
+            if let Some(rb) = self.get_rb(&key)? {
+                bitmap = rb;
+            }
+
+            for tag in &tags[1..] {
+                let key = super::ts_index::encode_inverted_index_key(tab, &tag.key, &tag.value);
+                if let Some(rb) = self.get_rb(&key)? {
+                    bitmap = bitmap.bitand(rb);
+                } else {
+                    return Ok(roaring::RoaringBitmap::new());
+                }
+            }
+        }
+
+        Ok(bitmap)
     }
 }
 
@@ -240,7 +286,7 @@ impl Iterator for RangeKeyValIter {
 
                 Some(item) => match item {
                     Err(e) => {
-                        return Some(Err(IndexError::IndexStroage { msg: e.to_string() }));
+                        return Some(Err(IndexStorageSnafu { msg: e.to_string() }.build()));
                     }
 
                     Ok(item) => match &self.start {
@@ -322,12 +368,8 @@ impl Iterator for RangeKeyValIter {
     }
 }
 
+#[cfg(test)]
 mod test {
-    use std::sync::atomic::AtomicU64;
-    use std::sync::{self, Arc};
-
-    use models::utils::now_timestamp_nanos;
-    use tokio::time::{self, Duration};
 
     use super::IndexEngine;
 
@@ -349,69 +391,5 @@ mod test {
         println!("=== {:?}", engine.get(b"key3"));
         println!("=== {:?}", engine.delete(b"key3"));
         println!("=== {:?}", engine.get(b"key3"));
-    }
-
-    async fn test_engine_write_perf() {
-        let mut engine = IndexEngine::new("/tmp/test/2").unwrap();
-
-        let mut begin = now_timestamp_nanos() / 1000000;
-        for i in 1..10001 {
-            let key = format!("key012345678901234567890123456789_{}", i);
-            let val = format!("val012345678901234567890123456789_{}", i);
-            engine.set(key.as_bytes(), val.as_bytes()).unwrap();
-            if i % 100000 == 0 {
-                engine.flush().unwrap();
-
-                let end = now_timestamp_nanos() / 1000000;
-                println!("{}  : time {}", i, end - begin);
-                begin = end;
-            }
-        }
-    }
-
-    async fn test_engine_read_perf() {
-        let engine = IndexEngine::new("/tmp/test/3").unwrap();
-        let engine = Arc::new(engine);
-
-        let atomic = Arc::new(AtomicU64::new(0));
-
-        for _ in 0..8 {
-            //tokio::spawn(random_read(engine.clone(), atomic.clone()));
-            let parm = (engine.clone(), atomic.clone());
-            std::thread::spawn(|| random_read(parm.0, parm.1));
-        }
-
-        time::sleep(Duration::from_secs(3)).await;
-    }
-
-    fn engine_iter(engine: Arc<IndexEngine>) {
-        let it = engine.prefix("key".as_bytes()).unwrap();
-        for item in it {
-            let item = item.unwrap();
-            let key = std::str::from_utf8(item.0.as_ref()).unwrap();
-            let val = engine.load(&item.1).unwrap();
-            let val = std::str::from_utf8(&val).unwrap();
-
-            println!("{}: {}", key, val)
-        }
-    }
-
-    fn random_read(engine: Arc<IndexEngine>, count: Arc<AtomicU64>) {
-        for _i in 1..10000000 {
-            let random: i32 = rand::Rng::gen_range(&mut rand::thread_rng(), 1..=10000000);
-
-            let key = format!("key012345678901234567890123456789_{}", random);
-
-            engine.get(key.as_bytes()).unwrap();
-
-            let total = count.fetch_add(1, sync::atomic::Ordering::SeqCst);
-            if total % 100000 == 0 {
-                println!(
-                    "read total: {}; time: {}",
-                    total,
-                    now_timestamp_nanos() / 1000000
-                );
-            }
-        }
     }
 }

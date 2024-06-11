@@ -20,7 +20,7 @@ use datafusion::physical_plan::{
 };
 use futures::{Stream, StreamExt};
 use models::schema::Watermark;
-use spi::{QueryError, Result};
+use spi::{QueryError, QueryResult};
 use trace::debug;
 
 use crate::extension::WATERMARK_DELAY_MS;
@@ -50,7 +50,7 @@ impl WatermarkExec {
             .fields()
             .iter()
             .map(|e| {
-                let mut field = e.clone();
+                let mut field = e.as_ref().clone();
                 if e.name() == &watermark.column {
                     let mut metadata = e.metadata().clone();
                     let _ = metadata.insert(
@@ -59,9 +59,9 @@ impl WatermarkExec {
                     );
                     field.set_metadata(metadata);
                 }
-                field
+                Arc::new(field)
             })
-            .collect();
+            .collect::<Vec<_>>();
         let schema = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
 
         Ok(Self {
@@ -161,7 +161,7 @@ impl ExecutionPlan for WatermarkExec {
 
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
-            DisplayFormatType::Default => {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(
                     f,
                     "WatermarkExec: event_time={}, delay={}ms",
@@ -255,7 +255,7 @@ impl RecordBatchStream for WatermarkStream {
     }
 }
 
-pub fn max_timestamp(col: &str, array: &ArrayRef) -> Result<Option<i64>> {
+pub fn max_timestamp(col: &str, array: &ArrayRef) -> QueryResult<Option<i64>> {
     let value = match array.data_type() {
         DataType::Timestamp(TimeUnit::Second, _) => {
             let primitive_array = as_primitive_array::<TimestampSecondType>(array.as_ref());

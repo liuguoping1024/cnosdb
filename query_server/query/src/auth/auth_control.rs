@@ -20,12 +20,26 @@ impl AccessControlImpl {
 
 #[async_trait::async_trait]
 impl AccessControl for AccessControlImpl {
-    async fn access_check(&self, user_info: &UserInfo, tenant_name: Option<&str>) -> Result<User> {
-        let user = self.inner.access_check(user_info, tenant_name).await?;
+    async fn access_check(&self, user_info: &UserInfo, tenant_name: &str) -> Result<User> {
+        let user = self
+            .inner
+            .access_check(user_info, tenant_name)
+            .await
+            .map_err(|_err| AuthError::AccessDenied {
+                user_name: user_info.user.clone(),
+                auth_type: "xxx".to_owned(),
+                err: "username or password invalid".to_owned(),
+            })?;
 
         let user_options = user.desc().options();
         // access check
-        AuthType::from(user_options).access_check(user_info)?;
+        AuthType::from(user_options)
+            .access_check(user_info)
+            .map_err(|_err| AuthError::AccessDenied {
+                user_name: user_info.user.clone(),
+                auth_type: "xxx".to_owned(),
+                err: "username or password invalid".to_owned(),
+            })?;
 
         Ok(user)
     }
@@ -51,7 +65,7 @@ impl AccessControlNoCheck {
 
 #[async_trait::async_trait]
 impl AccessControl for AccessControlNoCheck {
-    async fn access_check(&self, user_info: &UserInfo, tenant_name: Option<&str>) -> Result<User> {
+    async fn access_check(&self, user_info: &UserInfo, tenant_name: &str) -> Result<User> {
         let user_name = user_info.user.as_str();
         // only get user info with privileges
         self.meta_manager
@@ -68,10 +82,13 @@ impl AccessControl for AccessControlNoCheck {
     async fn tenant_id(&self, tenant_name: &str) -> Result<Oid> {
         let tenant_client = self
             .meta_manager
-            .tenant_manager()
             .tenant_meta(tenant_name)
             .await
-            .ok_or(AuthError::TenantNotFound)?;
+            .ok_or_else(|| AuthError::TenantNotFound)?;
+
+        if tenant_client.tenant().options().get_tenant_is_hidden() {
+            return Err(AuthError::TenantNotFound);
+        }
 
         Ok(*tenant_client.tenant().id())
     }

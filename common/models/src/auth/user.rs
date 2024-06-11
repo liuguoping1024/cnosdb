@@ -7,25 +7,39 @@ use serde::{Deserialize, Serialize};
 use super::privilege::{
     DatabasePrivilege, GlobalPrivilege, Privilege, PrivilegeChecker, TenantObjectPrivilege,
 };
-use super::role::UserRole;
-use super::{rsa_utils, AuthError, Result};
+use super::role::{TenantRoleIdentifier, UserRole};
+use super::{rsa_utils, AuthError, AuthResult};
+use crate::auth::{bcrypt_hash, bcrypt_verify};
 use crate::oid::{Identifier, Oid};
 
 pub const ROOT: &str = "root";
-pub const ROOT_PWD: &str = "";
+pub const ROOT_PWD: &str = "root";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct User {
     desc: UserDesc,
     privileges: HashSet<Privilege<Oid>>,
+    role: Option<TenantRoleIdentifier>,
 }
 
 impl User {
-    pub fn new(desc: UserDesc, mut privileges: HashSet<Privilege<Oid>>) -> Self {
+    pub fn new(
+        desc: UserDesc,
+        mut privileges: HashSet<Privilege<Oid>>,
+        role: Option<TenantRoleIdentifier>,
+    ) -> Self {
         // 添加修改自身信息的权限
         privileges.insert(Privilege::Global(GlobalPrivilege::User(Some(*desc.id()))));
 
-        Self { desc, privileges }
+        Self {
+            desc,
+            privileges,
+            role,
+        }
+    }
+
+    pub fn role(&self) -> Option<&TenantRoleIdentifier> {
+        self.role.as_ref()
     }
 
     pub fn desc(&self) -> &UserDesc {
@@ -64,17 +78,21 @@ pub struct UserDesc {
     // ident
     name: String,
     options: UserOptions,
-    is_admin: bool,
+    is_root_admin: bool,
 }
 
 impl UserDesc {
-    pub fn new(id: Oid, name: String, options: UserOptions, is_admin: bool) -> Self {
+    pub fn new(id: Oid, name: String, options: UserOptions, is_root_admin: bool) -> Self {
         Self {
             id,
             name,
             options,
-            is_admin,
+            is_root_admin,
         }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     pub fn options(&self) -> &UserOptions {
@@ -83,7 +101,7 @@ impl UserDesc {
 
     /// 初始的系统管理员
     pub fn is_root_admin(&self) -> bool {
-        self.is_admin
+        self.is_root_admin
     }
 
     /// 被授予的管理员权限
@@ -122,20 +140,20 @@ impl Identifier<Oid> for UserDesc {
 #[derive(Debug, Default, Clone, Builder, Serialize, Deserialize)]
 #[builder(setter(into, strip_option), default)]
 pub struct UserOptions {
-    password: Option<String>,
-    #[builder(default = "Some(false)")]
+    hash_password: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     must_change_password: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     rsa_public_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     comment: Option<String>,
-    #[builder(default = "Some(false)")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     granted_admin: Option<bool>,
 }
 
 impl UserOptions {
-    pub fn password(&self) -> Option<&str> {
-        self.password.as_deref()
+    pub fn hash_password(&self) -> Option<&str> {
+        self.hash_password.as_deref()
     }
     pub fn must_change_password(&self) -> Option<bool> {
         self.must_change_password
@@ -152,7 +170,7 @@ impl UserOptions {
 
     pub fn merge(self, other: Self) -> Self {
         Self {
-            password: self.password.or(other.password),
+            hash_password: self.hash_password.or(other.hash_password),
             must_change_password: self.must_change_password.or(other.must_change_password),
             rsa_public_key: self.rsa_public_key.or(other.rsa_public_key),
             comment: self.comment.or(other.comment),
@@ -160,7 +178,24 @@ impl UserOptions {
         }
     }
     pub fn hidden_password(&mut self) {
-        self.password.replace("*****".to_string());
+        self.hash_password.replace("*****".to_string());
+    }
+
+    // when user change password, turn must_change_password to false
+    pub fn change_password(&mut self) {
+        self.must_change_password = Some(false);
+    }
+}
+
+impl UserOptionsBuilder {
+    pub fn password(
+        &mut self,
+        password: impl Into<String>,
+    ) -> Result<&mut Self, UserOptionsBuilderError> {
+        let hash_password = bcrypt_hash(&password.into())
+            .map_err(|e| UserOptionsBuilderError::from(e.to_string()))?;
+        self.hash_password(hash_password);
+        Ok(self)
     }
 }
 
@@ -183,7 +218,7 @@ impl Display for UserOptions {
 }
 
 pub enum AuthType<'a> {
-    Password(Option<&'a str>),
+    HashPassword(Option<&'a str>),
     Rsa(&'a str),
 }
 
@@ -193,23 +228,23 @@ impl<'a> From<&'a UserOptions> for AuthType<'a> {
             return Self::Rsa(key);
         }
 
-        Self::Password(options.password())
+        Self::HashPassword(options.hash_password())
     }
 }
 
 impl<'a> AuthType<'a> {
-    pub fn access_check(&self, user_info: &UserInfo) -> Result<()> {
+    pub fn access_check(&self, user_info: &UserInfo) -> AuthResult<()> {
         let user_name = user_info.user.as_str();
         let password = user_info.password.as_str();
 
         match self {
-            Self::Password(e) => {
-                let password = e.ok_or_else(|| AuthError::PasswordNotSet)?;
-                if password != user_info.password {
+            Self::HashPassword(hash_password) => {
+                let hash_password = hash_password.ok_or_else(|| AuthError::PasswordNotSet)?;
+                if !bcrypt_verify(&user_info.password, hash_password)? {
                     return Err(AuthError::AccessDenied {
                         user_name: user_name.to_string(),
                         auth_type: "password".to_string(),
-                        err: Default::default(),
+                        err: "incorrect password attempt.".into(),
                     });
                 }
 
@@ -246,14 +281,14 @@ impl<'a> AuthType<'a> {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserInfo {
     pub user: String,
     pub password: String,
     pub private_key: Option<String>,
 }
 
-pub fn admin_user(desc: UserDesc) -> User {
+pub fn admin_user(desc: UserDesc, role: Option<TenantRoleIdentifier>) -> User {
     let privileges = UserRole::Dba.to_privileges();
-    User::new(desc, privileges)
+    User::new(desc, privileges, role)
 }

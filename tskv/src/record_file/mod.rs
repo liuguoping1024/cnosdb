@@ -23,7 +23,7 @@
 //! ### Wal
 //! ```text
 //! +------------+--------------+---------------+--------------+--------------+
-//! | 0: 4 bytes | 4: 4 bytes   | 8: 8 bytes   | 16: 8 bytes  | 24: 8 bytes  |
+//! | 0: 4 bytes | 4: 4 bytes   | 8: 8 bytes   | 16: 8 bytes  | 24: 8 bytes   |
 //! +------------+--------------+---------------+--------------+--------------+
 //! | "walo"     | crc32_number | padding_zeros | min_sequence | max_sequence |
 //! +------------+--------------+---------------+--------------+--------------+
@@ -36,6 +36,8 @@
 mod reader;
 mod record;
 mod writer;
+
+use std::fmt::Display;
 
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 pub use reader::*;
@@ -51,11 +53,11 @@ pub const FILE_FOOTER_CRC32_NUMBER_LEN: usize = 4;
 /// If file_len > file_crc_source_len, footer crc32_number is
 /// hash(file[header_len..header_len + 1024]), otherwise
 /// hash(file[header_len..file_len - footer_len])
-pub fn file_crc_source_len(file_len: u64, file_footer_len: usize) -> usize {
-    if file_len > (FILE_MAGIC_NUMBER_LEN + 1024 + file_footer_len) as u64 {
+pub fn file_crc_source_len(file_len: usize, file_footer_len: usize) -> usize {
+    if file_len > (FILE_MAGIC_NUMBER_LEN + 1024 + file_footer_len) {
         1024
     } else {
-        (file_len - (FILE_MAGIC_NUMBER_LEN + file_footer_len) as u64) as usize
+        file_len - (FILE_MAGIC_NUMBER_LEN + file_footer_len)
     }
 }
 
@@ -66,7 +68,6 @@ pub const RECORD_DATA_TYPE_LEN: usize = 1;
 pub const RECORD_DATA_SIZE_LEN: usize = 4;
 pub const RECORD_CRC32_NUMBER_LEN: usize = 4;
 pub const RECORD_HEADER_LEN: usize = 14; // 4 + 1 + 1 + 4 + 4
-pub const BLOCK_SIZE: usize = 4096;
 
 pub const READER_BUF_SIZE: usize = 1024 * 1024 * 64; //64MB
 
@@ -83,4 +84,15 @@ pub enum RecordDataType {
     Tombstone = 4,
     Wal = 8,
     IndexLog = 16,
+}
+
+impl Display for RecordDataType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RecordDataType::Summary => write!(f, "summary"),
+            RecordDataType::Tombstone => write!(f, "tombstone"),
+            RecordDataType::Wal => write!(f, "WAL"),
+            RecordDataType::IndexLog => write!(f, "indexlog"),
+        }
+    }
 }

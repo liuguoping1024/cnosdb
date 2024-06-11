@@ -4,25 +4,27 @@ use std::fmt::Debug;
 use std::sync::Arc;
 use std::todo;
 
+use config::tskv::Config;
 use datafusion::arrow::record_batch::RecordBatch;
-use meta::model::meta_client_mock::{MockMetaClient, MockMetaManager};
+use meta::model::meta_admin::AdminMeta;
+use meta::model::meta_tenant::TenantMeta;
 use meta::model::{MetaClientRef, MetaRef};
-use models::consistency_level::ConsistencyLevel;
-use models::meta_data::{ReplicationSet, VnodeInfo, VnodeStatus};
+use models::meta_data::{ReplicationSet, ReplicationSetId, VnodeId, VnodeInfo, VnodeStatus};
 use models::object_reference::ResolvedTable;
-use models::predicate::domain::ResolvedPredicateRef;
-use models::schema::Precision;
-use protos::kv_service::{AdminCommandRequest, WritePointsRequest};
+use models::predicate::domain::{ResolvedPredicate, ResolvedPredicateRef};
+use models::schema::{Precision, TskvTableSchemaRef};
+use protocol_parser::Line;
+use protos::kv_service::{RaftWriteCommand, UpdateSetValue};
 use trace::SpanContext;
 use tskv::engine_mock::MockEngine;
-use tskv::query_iterator::QueryOption;
+use tskv::reader::QueryOption;
 use tskv::EngineRef;
 
 use crate::errors::CoordinatorResult;
+use crate::raft::manager::RaftNodesManager;
+use crate::raft::writer::TskvRaftWriter;
 use crate::service::CoordServiceMetrics;
-use crate::{
-    Coordinator, SendableCoordinatorRecordBatchStream, VnodeManagerCmdType, VnodeSummarizerCmdType,
-};
+use crate::{Coordinator, ReplicationCmdType, SendableCoordinatorRecordBatchStream};
 
 pub const WITH_NONEMPTY_DATABASE_FOR_TEST: &str = "with_nonempty_database";
 
@@ -36,15 +38,36 @@ impl Coordinator for MockCoordinator {
     }
 
     fn meta_manager(&self) -> MetaRef {
-        Arc::new(MockMetaManager::default())
+        Arc::new(AdminMeta::mock())
     }
 
     fn store_engine(&self) -> Option<EngineRef> {
         Some(Arc::new(MockEngine::default()))
     }
 
+    fn raft_manager(&self) -> Arc<RaftNodesManager> {
+        todo!()
+    }
+
     async fn tenant_meta(&self, tenant: &str) -> Option<MetaClientRef> {
-        Some(Arc::new(MockMetaClient::default()))
+        Some(Arc::new(TenantMeta::mock()))
+    }
+
+    async fn compact_vnodes(&self, tenant: &str, vnode_ids: Vec<VnodeId>) -> CoordinatorResult<()> {
+        todo!()
+    }
+
+    fn tskv_raft_writer(&self, request: RaftWriteCommand) -> TskvRaftWriter {
+        todo!()
+    }
+
+    async fn write_replica_by_raft(
+        &self,
+        replica: ReplicationSet,
+        request: RaftWriteCommand,
+        span_ctx: Option<&SpanContext>,
+    ) -> CoordinatorResult<()> {
+        todo!()
     }
 
     async fn table_vnodes(
@@ -56,6 +79,8 @@ impl Coordinator for MockCoordinator {
             return Ok(vec![
                 ReplicationSet::new(
                     0,
+                    0,
+                    0,
                     vec![VnodeInfo {
                         id: 0,
                         node_id: 0,
@@ -63,6 +88,8 @@ impl Coordinator for MockCoordinator {
                     }],
                 ),
                 ReplicationSet::new(
+                    1,
+                    0,
                     1,
                     vec![VnodeInfo {
                         id: 1,
@@ -72,6 +99,8 @@ impl Coordinator for MockCoordinator {
                 ),
                 ReplicationSet::new(
                     2,
+                    0,
+                    2,
                     vec![VnodeInfo {
                         id: 2,
                         node_id: 0,
@@ -79,6 +108,8 @@ impl Coordinator for MockCoordinator {
                     }],
                 ),
                 ReplicationSet::new(
+                    3,
+                    0,
                     3,
                     vec![VnodeInfo {
                         id: 3,
@@ -88,6 +119,8 @@ impl Coordinator for MockCoordinator {
                 ),
                 ReplicationSet::new(
                     4,
+                    0,
+                    4,
                     vec![VnodeInfo {
                         id: 4,
                         node_id: 0,
@@ -95,6 +128,8 @@ impl Coordinator for MockCoordinator {
                     }],
                 ),
                 ReplicationSet::new(
+                    5,
+                    0,
                     5,
                     vec![VnodeInfo {
                         id: 5,
@@ -104,6 +139,8 @@ impl Coordinator for MockCoordinator {
                 ),
                 ReplicationSet::new(
                     6,
+                    0,
+                    6,
                     vec![VnodeInfo {
                         id: 6,
                         node_id: 0,
@@ -111,6 +148,8 @@ impl Coordinator for MockCoordinator {
                     }],
                 ),
                 ReplicationSet::new(
+                    7,
+                    0,
                     7,
                     vec![VnodeInfo {
                         id: 7,
@@ -123,15 +162,25 @@ impl Coordinator for MockCoordinator {
         Ok(vec![])
     }
 
-    async fn write_points(
+    async fn write_lines<'a>(
         &self,
-        tenant: String,
-        level: ConsistencyLevel,
+        tenant: &str,
+        db: &str,
         precision: Precision,
-        req: WritePointsRequest,
-        _span_ctx: Option<&SpanContext>,
-    ) -> CoordinatorResult<()> {
-        Ok(())
+        line: Vec<Line<'a>>,
+        span_ctx: Option<&SpanContext>,
+    ) -> CoordinatorResult<usize> {
+        todo!()
+    }
+
+    async fn write_record_batch<'a>(
+        &self,
+        table_schema: TskvTableSchemaRef,
+        record_batch: RecordBatch,
+        db_precision: Precision,
+        span_ctx: Option<&SpanContext>,
+    ) -> CoordinatorResult<usize> {
+        todo!()
     }
 
     fn table_scan(
@@ -151,27 +200,44 @@ impl Coordinator for MockCoordinator {
         todo!("tag_scan")
     }
 
-    async fn broadcast_command(&self, req: AdminCommandRequest) -> CoordinatorResult<()> {
-        Ok(())
+    async fn delete_from_table(
+        &self,
+        table: &ResolvedTable,
+        predicate: &ResolvedPredicate,
+    ) -> CoordinatorResult<()> {
+        todo!("delete_from_table")
     }
 
-    async fn vnode_manager(
+    async fn replication_manager(
         &self,
         tenant: &str,
-        cmd_type: VnodeManagerCmdType,
+        cmd_type: ReplicationCmdType,
     ) -> CoordinatorResult<()> {
         Ok(())
     }
 
-    async fn vnode_summarizer(
+    async fn replica_checksum(
         &self,
         tenant: &str,
-        cmd_type: VnodeSummarizerCmdType,
+        replica_id: ReplicationSetId,
     ) -> CoordinatorResult<Vec<RecordBatch>> {
         Ok(vec![])
     }
 
     fn metrics(&self) -> &Arc<CoordServiceMetrics> {
         todo!()
+    }
+
+    async fn update_tags_value(
+        &self,
+        table_schema: TskvTableSchemaRef,
+        new_tags: Vec<UpdateSetValue>,
+        record_batches: Vec<RecordBatch>,
+    ) -> CoordinatorResult<()> {
+        todo!()
+    }
+
+    fn get_config(&self) -> Config {
+        Config::default()
     }
 }

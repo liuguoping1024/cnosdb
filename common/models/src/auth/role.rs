@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt::{Display, Formatter};
 use std::hash::Hash;
 use std::sync::Arc;
 
@@ -6,7 +7,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
 use super::privilege::{DatabasePrivilege, GlobalPrivilege, Privilege, TenantObjectPrivilege};
-use super::Result;
+use super::AuthResult;
 use crate::auth::AuthError;
 use crate::oid::{Id, Identifier};
 
@@ -43,7 +44,7 @@ impl<T: Id> UserRole<T> {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TenantRoleIdentifier {
     System(SystemTenantRole),
     Custom(String),
@@ -106,6 +107,15 @@ impl TryFrom<&str> for SystemTenantRole {
     }
 }
 
+impl Display for SystemTenantRole {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SystemTenantRole::Owner => write!(f, "owner"),
+            SystemTenantRole::Member => write!(f, "member"),
+        }
+    }
+}
+
 impl SystemTenantRole {
     pub fn to_privileges<T>(&self, tenant_id: &T) -> HashSet<Privilege<T>>
     where
@@ -147,7 +157,7 @@ pub type CustomTenantRoleRef<T> = Arc<RwLock<CustomTenantRole<T>>>;
 pub struct CustomTenantRole<T> {
     id: T,
     name: String,
-    system_role: SystemTenantRole,
+    system_role: Option<SystemTenantRole>,
     // database_name -> privileges
     // only add database privilege
     additional_privileges: HashMap<String, DatabasePrivilege>,
@@ -157,7 +167,7 @@ impl<T> CustomTenantRole<T> {
     pub fn new(
         id: T,
         name: String,
-        system_role: SystemTenantRole,
+        system_role: Option<SystemTenantRole>,
         // database_name -> privileges
         // only add database privilege
         additional_privileges: HashMap<String, DatabasePrivilege>,
@@ -170,18 +180,21 @@ impl<T> CustomTenantRole<T> {
         }
     }
 
-    pub fn inherit_role(&self) -> &SystemTenantRole {
+    pub fn inherit_role(&self) -> &Option<SystemTenantRole> {
         &self.system_role
     }
 
-    pub fn additiona_privileges(&self) -> &HashMap<String, DatabasePrivilege> {
+    pub fn additional_privileges(&self) -> &HashMap<String, DatabasePrivilege> {
         &self.additional_privileges
     }
 }
 
 impl<T: Id> CustomTenantRole<T> {
     pub fn to_privileges(&self, tenant_id: &T) -> HashSet<Privilege<T>> {
-        let privileges = self.system_role.to_privileges(tenant_id);
+        let privileges = match &self.system_role {
+            Some(p) => p.to_privileges(tenant_id),
+            None => HashSet::new(),
+        };
 
         let additiona_privileges = self
             .additional_privileges
@@ -201,7 +214,7 @@ impl<T: Id> CustomTenantRole<T> {
         &mut self,
         database_name: String,
         privilege: DatabasePrivilege,
-    ) -> Result<()> {
+    ) -> AuthResult<()> {
         self.additional_privileges.insert(database_name, privilege);
 
         Ok(())
@@ -211,7 +224,7 @@ impl<T: Id> CustomTenantRole<T> {
         &mut self,
         database_name: &str,
         privilege: &DatabasePrivilege,
-    ) -> Result<bool> {
+    ) -> AuthResult<bool> {
         if let Some(p) = self.additional_privileges.get(database_name) {
             if p == privilege {
                 Ok(self.additional_privileges.remove(database_name).is_some())

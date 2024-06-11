@@ -6,6 +6,7 @@ use std::os::windows::io::AsRawHandle;
 use std::os::windows::prelude::RawHandle;
 
 use winapi::shared::minwindef::*;
+use winapi::shared::winerror::ERROR_HANDLE_EOF;
 use winapi::um::fileapi::*;
 use winapi::um::minwinbase::OVERLAPPED;
 
@@ -13,7 +14,7 @@ pub fn fd(file: &File) -> usize {
     file.as_raw_handle() as usize
 }
 
-pub fn pread(raw_handle: usize, pos: u64, len: usize, buf_ptr: u64) -> Result<usize> {
+pub fn pread(raw_handle: usize, pos: usize, len: usize, buf_ptr: u64) -> Result<usize> {
     let mut bytes: DWORD = 0;
     let mut ov = overlapped(pos);
     check_err(unsafe {
@@ -28,7 +29,7 @@ pub fn pread(raw_handle: usize, pos: u64, len: usize, buf_ptr: u64) -> Result<us
     Ok(usize::try_from(bytes).unwrap())
 }
 
-pub fn pwrite(raw_handle: usize, pos: u64, len: usize, buf_ptr: u64) -> Result<usize> {
+pub fn pwrite(raw_handle: usize, pos: usize, len: usize, buf_ptr: u64) -> Result<usize> {
     let mut bytes: DWORD = 0;
     let mut ov = overlapped(pos);
     check_err(unsafe {
@@ -43,15 +44,15 @@ pub fn pwrite(raw_handle: usize, pos: u64, len: usize, buf_ptr: u64) -> Result<u
     Ok(bytes as usize)
 }
 
-pub fn file_size(raw_handle: usize) -> Result<u64> {
+pub fn file_size(raw_handle: usize) -> Result<usize> {
     let mut info = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
     check_err(unsafe { GetFileInformationByHandle(raw_handle as RawHandle, info.as_mut_ptr()) })?;
     let info = unsafe { info.assume_init() };
     let len = u64::from(info.nFileSizeHigh) << 32 | u64::from(info.nFileSizeLow);
-    Ok(len)
+    Ok(len as usize)
 }
 
-fn overlapped(pos: u64) -> OVERLAPPED {
+fn overlapped(pos: usize) -> OVERLAPPED {
     unsafe {
         let mut r: OVERLAPPED = std::mem::zeroed();
         r.u.s_mut().Offset = pos as u32;
@@ -62,7 +63,12 @@ fn overlapped(pos: u64) -> OVERLAPPED {
 
 fn check_err(r: BOOL) -> Result<()> {
     if r == FALSE {
-        Err(Error::last_os_error())
+        let e = Error::last_os_error();
+        if e.raw_os_error() == Some(ERROR_HANDLE_EOF as i32) {
+            Ok(())
+        } else {
+            Err(e)
+        }
     } else {
         Ok(())
     }

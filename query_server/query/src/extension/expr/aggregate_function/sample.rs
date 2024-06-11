@@ -11,19 +11,19 @@ use datafusion::logical_expr::type_coercion::aggregates::{
     DATES, NUMERICS, STRINGS, TIMES, TIMESTAMPS,
 };
 use datafusion::logical_expr::{
-    AccumulatorFunctionImplementation, AggregateUDF, ReturnTypeFunction, Signature,
-    StateTypeFunction, TypeSignature, Volatility,
+    AccumulatorFactoryFunction, AggregateUDF, ReturnTypeFunction, Signature, StateTypeFunction,
+    TypeSignature, Volatility,
 };
 use datafusion::physical_plan::Accumulator;
 use datafusion::scalar::ScalarValue;
 use rand::Rng;
 use spi::query::function::FunctionMetadataManager;
-use spi::Result;
+use spi::{QueryError, QueryResult};
 
 use super::SAMPLE_UDAF_NAME;
 use crate::extension::expr::{BINARYS, INTEGERS};
 
-pub fn register_udaf(func_manager: &mut dyn FunctionMetadataManager) -> Result<AggregateUDF> {
+pub fn register_udaf(func_manager: &mut dyn FunctionMetadataManager) -> QueryResult<AggregateUDF> {
     let udf = new();
     func_manager.register_udaf(udf.clone())?;
     Ok(udf)
@@ -31,14 +31,14 @@ pub fn register_udaf(func_manager: &mut dyn FunctionMetadataManager) -> Result<A
 
 fn new() -> AggregateUDF {
     let return_type: ReturnTypeFunction = Arc::new(move |input| {
-        let date_type = DataType::List(Box::new(Field::new("item", input[0].clone(), true)));
+        let date_type = DataType::List(Arc::new(Field::new("item", input[0].clone(), true)));
         Ok(Arc::new(date_type))
     });
 
     let state_type: StateTypeFunction =
-        Arc::new(move |output| Ok(Arc::new(vec![output.clone(), DataType::UInt32])));
+        Arc::new(move |_, output| Ok(Arc::new(vec![output.clone(), DataType::UInt32])));
 
-    let accumulator: AccumulatorFunctionImplementation = Arc::new(|output| match output {
+    let accumulator: AccumulatorFactoryFunction = Arc::new(|_, output| match output {
         DataType::List(f) => Ok(Box::new(SampleAccumulator::try_new(
             output.clone(),
             f.data_type().clone(),
@@ -126,7 +126,7 @@ impl Accumulator for SampleAccumulator {
                     self.update_batch_inner(state, sample_n as usize)?;
                 }
                 _ => {
-                    trace::info!("merge_batch, skip empty state: {:?}", e)
+                    trace::trace!("merge_batch, skip empty state: {:?}", e)
                 }
             }
 
@@ -182,17 +182,27 @@ impl SampleAccumulator {
 
         let total_num = states.iter().map(|(e, _)| e.len()).sum::<usize>();
 
-        let mut sample_n = 0;
         let mut result = vec![];
 
-        for (s, r) in states {
-            sample_n = *r;
+        let sample_n = states.first().map(|(_, n)| *n).ok_or_else(|| {
+            DataFusionError::External(Box::new(QueryError::Internal {
+                reason: "The state of SampleAccumulator is empty".to_string(),
+            }))
+        })?;
+
+        let mut remain = sample_n;
+        for (s, _) in states {
+            if remain == 0 {
+                break;
+            }
+            // Randomly sample a portion of data from each state
             let num = s.len();
-            let select_num = (num * sample_n + sample_n - 1) / total_num;
+            let select_num = (num * sample_n + total_num - 1) / total_num;
             let indices = generate_unique_random_numbers(select_num as u32, 0, num as u32);
             for i in indices {
                 result.push(s[i as usize].clone());
             }
+            remain = remain.checked_sub(select_num).unwrap_or_default();
         }
 
         Ok((result, sample_n))

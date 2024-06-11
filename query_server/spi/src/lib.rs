@@ -9,10 +9,11 @@ use error_code::ErrorCoder;
 use meta::error::MetaError;
 use models::auth::AuthError;
 use models::codec::Encoding;
-use models::define_result;
 use models::error_code::ErrorCode;
+use models::meta_data::{NodeId, ReplicationSetId};
 use models::schema::{TenantOptionsBuilderError, TIME_FIELD_NAME};
-use snafu::Snafu;
+use models::ModelError;
+use snafu::{Backtrace, IntoError, Location, Snafu};
 
 use crate::service::protocol::QueryId;
 
@@ -20,16 +21,17 @@ pub mod query;
 pub mod server;
 pub mod service;
 
-define_result!(QueryError);
+pub type QueryResult<T> = Result<T, QueryError>;
 
 pub type GenericError = Box<dyn error::Error + Send + Sync>;
+pub type DFResult<T> = datafusion::common::Result<T>;
 
 #[derive(Debug, Snafu, ErrorCoder)]
 #[snafu(visibility(pub))]
 #[error_code(mod_code = "01")]
 pub enum QueryError {
     TsKv {
-        source: tskv::Error,
+        source: tskv::TskvError,
     },
 
     Meta {
@@ -50,10 +52,6 @@ pub enum QueryError {
         reason: String,
     },
 
-    Models {
-        source: models::Error,
-    },
-
     #[error_code(code = 9999)]
     Unimplement {
         msg: String,
@@ -62,11 +60,15 @@ pub enum QueryError {
     #[error_code(code = 1)]
     Datafusion {
         source: DataFusionError,
+        location: Location,
+        backtrace: Backtrace,
     },
 
     #[error_code(code = 2)]
     Arrow {
         source: ArrowError,
+        location: Location,
+        backtrace: Backtrace,
     },
 
     #[snafu(display("Insufficient privileges, expected [{}]", privilege))]
@@ -109,6 +111,8 @@ pub enum QueryError {
     #[error_code(code = 10)]
     Analyzer {
         err: String,
+        location: Location,
+        backtrace: Backtrace,
     },
 
     #[snafu(display("Query not found: {:?}", query_id))]
@@ -146,6 +150,8 @@ pub enum QueryError {
     #[error_code(code = 17)]
     InvalidFlatbuffer {
         source: flatbuffers::InvalidFlatbuffer,
+        location: Location,
+        backtrace: Backtrace,
     },
 
     #[snafu(display(
@@ -156,12 +162,16 @@ pub enum QueryError {
     #[error_code(code = 18)]
     CommonError {
         msg: String,
+        location: Location,
+        backtrace: Backtrace,
     },
 
     #[snafu(display("Failed to write points flat buffer, err: {}", err))]
     #[error_code(code = 19)]
     ToPointsFlatBuffer {
         err: String,
+        location: Location,
+        backtrace: Backtrace,
     },
 
     #[snafu(display("Invalid array type, expected: {}, found: {}", expected, found))]
@@ -169,6 +179,8 @@ pub enum QueryError {
     InvalidArrayType {
         expected: String,
         found: String,
+        location: Location,
+        backtrace: Backtrace,
     },
 
     #[snafu(display("Column {} not found.", col))]
@@ -181,12 +193,16 @@ pub enum QueryError {
     #[error_code(code = 22)]
     PointErrorDataTypeNotSupport {
         type_: String,
+        location: Location,
+        backtrace: Backtrace,
     },
 
     #[snafu(display("Column {} cannot be null.", col))]
     #[error_code(code = 23)]
     PointErrorNotNullConstraint {
         col: String,
+        location: Location,
+        backtrace: Backtrace,
     },
 
     #[snafu(display("Invalid parameter : {}", reason))]
@@ -197,12 +213,17 @@ pub enum QueryError {
 
     #[snafu(display("File has no footer"))]
     #[error_code(code = 25)]
-    NoFooter,
+    NoFooter {
+        location: Location,
+        backtrace: Backtrace,
+    },
 
     #[snafu(display("Read/Write record file block: {}", reason))]
     #[error_code(code = 26)]
     RecordFileIo {
         reason: String,
+        location: Location,
+        backtrace: Backtrace,
     },
 
     #[snafu(display("Semantic error: {}", err))]
@@ -287,11 +308,17 @@ pub enum QueryError {
     #[error_code(code = 40)]
     LimitConstant,
 
-    #[snafu(display("Semantic error: Unexpected data type {} of {}", data_type, column))]
+    #[snafu(display(
+        "Semantic error: Unexpected data type {} of {}, {}",
+        data_type,
+        column,
+        prompt
+    ))]
     #[error_code(code = 41)]
     DataType {
         data_type: String,
         column: String,
+        prompt: String,
     },
 
     #[snafu(display(
@@ -334,56 +361,75 @@ pub enum QueryError {
     },
 
     #[error_code(code = 47)]
+    #[snafu(display("object store error: {}", msg))]
     ObjectStore {
-        source: object_store::Error,
+        msg: String,
+        location: Location,
+        backtrace: Backtrace,
     },
 
     #[error_code(code = 48)]
     #[snafu(display("Failed to close parquet writer, error: {}", source))]
     CloseParquetWriter {
         source: ParquetError,
+        location: Location,
+        backtrace: Backtrace,
     },
 
     #[error_code(code = 49)]
     #[snafu(display("Failed to serialize data to parquet bytes, error: {}", source))]
     SerializeParquet {
         source: ParquetError,
+        location: Location,
+        backtrace: Backtrace,
     },
 
     #[error_code(code = 50)]
     #[snafu(display("Failed to build parquet writer, error: {}", source))]
     BuildParquetArrowWriter {
         source: ParquetError,
+        location: Location,
+        backtrace: Backtrace,
     },
 
     #[error_code(code = 51)]
     #[snafu(display("Failed to serialize data to csv bytes, error: {}", source))]
     SerializeCsv {
         source: ArrowError,
+        location: Location,
+        backtrace: Backtrace,
     },
 
     #[error_code(code = 52)]
     #[snafu(display("Failed to serialize data to json bytes, error: {}", source))]
     SerializeJson {
         source: ArrowError,
+        location: Location,
+        backtrace: Backtrace,
     },
 
     #[error_code(code = 53)]
     #[snafu(display("{}", source))]
     StdIoError {
         source: std::io::Error,
+        location: Location,
+        backtrace: Backtrace,
     },
 
     #[error_code(code = 54)]
     #[snafu(display("{}", source))]
     SerdeJsonError {
         source: serde_json::Error,
+        location: Location,
+        backtrace: Backtrace,
     },
 
     #[error_code(code = 55)]
     #[snafu(display("{}", source))]
     SnappyError {
         source: snap::Error,
+        location: Location,
+        backtrace: Backtrace,
     },
 
     #[error_code(code = 56)]
@@ -432,6 +478,8 @@ pub enum QueryError {
     #[error_code(code = 63)]
     TenantOptionsBuildFail {
         source: TenantOptionsBuilderError,
+        location: Location,
+        backtrace: Backtrace,
     },
 
     #[snafu(display("Tenant \"{}\" forbid drop", name))]
@@ -482,25 +530,66 @@ pub enum QueryError {
     #[error_code(code = 70)]
     BincodeSerialize {
         source: GenericError,
+        location: Location,
+        backtrace: Backtrace,
     },
 
     #[snafu(display("Persist query info, error: {}", reason))]
     #[error_code(code = 71)]
     PersistQuery {
         reason: String,
+        location: Location,
+        backtrace: Backtrace,
     },
 
-    #[snafu(display("Analyze pushed down predicates, error: {}", reason))]
+    #[snafu(display("Analyze pushed down predicates, error: {}", source))]
     #[error_code(code = 72)]
     AnalyzePushedFilter {
+        source: ModelError,
+    },
+
+    #[snafu(display("Invalid geometry type, error: {}", reason))]
+    #[error_code(code = 73)]
+    InvalidGeometryType {
         reason: String,
     },
-}
 
-impl From<ParserError> for QueryError {
-    fn from(value: ParserError) -> Self {
-        QueryError::Parser { source: value }
-    }
+    #[snafu(display("User '{}' is prohibited from being dropped", user))]
+    #[error_code(code = 74)]
+    ForbiddenDropUser {
+        user: String,
+    },
+
+    #[snafu(display("Tenant {} cannot be restricted", tenant))]
+    #[error_code(code = 75)]
+    ForbiddenLimitTenant {
+        tenant: String,
+    },
+
+    #[snafu(display("Couldn't drop system role {}", role))]
+    #[error_code(code = 76)]
+    ForbiddenDropSystemRole {
+        role: String,
+    },
+
+    #[snafu(display("Couldn't create a role with the same name as system role: {}", role))]
+    #[error_code(code = 77)]
+    ForbiddenCreateSystemRole {
+        role: String,
+    },
+
+    #[snafu(display("Replica Set({}) not found replica in node {}", replica_id, node_id))]
+    #[error_code(code = 78)]
+    ReplicaNotFound {
+        replica_id: ReplicationSetId,
+        node_id: NodeId,
+    },
+
+    #[snafu(display("model error {}", source))]
+    #[error_code(code = 79)]
+    Models {
+        source: ModelError,
+    },
 }
 
 impl From<DataFusionError> for QueryError {
@@ -511,55 +600,34 @@ impl From<DataFusionError> for QueryError {
             }
 
             DataFusionError::External(e) if e.downcast_ref::<MetaError>().is_some() => {
-                QueryError::Meta {
-                    source: *e.downcast::<MetaError>().unwrap(),
-                }
+                let meta_error = *e.downcast::<MetaError>().unwrap();
+                MetaSnafu.into_error(meta_error)
             }
 
-            DataFusionError::External(e) if e.downcast_ref::<tskv::Error>().is_some() => {
-                QueryError::TsKv {
-                    source: *e.downcast::<tskv::Error>().unwrap(),
-                }
+            DataFusionError::External(e) if e.downcast_ref::<tskv::TskvError>().is_some() => {
+                let e = *e.downcast::<tskv::TskvError>().unwrap();
+                TsKvSnafu.into_error(e)
             }
 
             DataFusionError::External(e) if e.downcast_ref::<CoordinatorError>().is_some() => {
-                QueryError::Coordinator {
-                    source: *e.downcast::<CoordinatorError>().unwrap(),
-                }
+                let coordinator_error = *e.downcast::<CoordinatorError>().unwrap();
+                CoordinatorSnafu.into_error(coordinator_error)
+            }
+
+            DataFusionError::External(e) if e.downcast_ref::<DataFusionError>().is_some() => {
+                let datafusion_error = *e.downcast::<DataFusionError>().unwrap();
+                DatafusionSnafu.into_error(datafusion_error)
             }
 
             DataFusionError::External(e) if e.downcast_ref::<ArrowError>().is_some() => {
                 let arrow_error = *e.downcast::<ArrowError>().unwrap();
-                arrow_error.into()
+                ArrowSnafu.into_error(arrow_error)
             }
 
-            DataFusionError::ArrowError(e) => e.into(),
-            v => QueryError::Datafusion { source: v },
+            DataFusionError::ArrowError(e) => ArrowSnafu.into_error(e),
+
+            v => DatafusionSnafu.into_error(v),
         }
-    }
-}
-
-impl From<MetaError> for QueryError {
-    fn from(value: MetaError) -> Self {
-        QueryError::Meta { source: value }
-    }
-}
-
-impl From<CoordinatorError> for QueryError {
-    fn from(value: CoordinatorError) -> Self {
-        QueryError::Coordinator { source: value }
-    }
-}
-
-impl From<tskv::Error> for QueryError {
-    fn from(value: tskv::Error) -> Self {
-        QueryError::TsKv { source: value }
-    }
-}
-
-impl From<models::Error> for QueryError {
-    fn from(value: models::Error) -> Self {
-        QueryError::Models { source: value }
     }
 }
 
@@ -570,66 +638,27 @@ impl From<ArrowError> for QueryError {
                 *e.downcast::<QueryError>().unwrap()
             }
             ArrowError::ExternalError(e) if e.downcast_ref::<MetaError>().is_some() => {
-                QueryError::Meta {
-                    source: *e.downcast::<MetaError>().unwrap(),
-                }
+                let meta_error = *e.downcast::<MetaError>().unwrap();
+                MetaSnafu.into_error(meta_error)
             }
-            ArrowError::ExternalError(e) if e.downcast_ref::<tskv::Error>().is_some() => {
-                QueryError::TsKv {
-                    source: *e.downcast::<tskv::Error>().unwrap(),
-                }
+            ArrowError::ExternalError(e) if e.downcast_ref::<tskv::TskvError>().is_some() => {
+                let e = *e.downcast::<tskv::TskvError>().unwrap();
+                TsKvSnafu.into_error(e)
             }
             ArrowError::ExternalError(e) if e.downcast_ref::<DataFusionError>().is_some() => {
                 let df_error = *e.downcast::<DataFusionError>().unwrap();
-                df_error.into()
+                DatafusionSnafu.into_error(df_error)
             }
             ArrowError::ExternalError(e) if e.downcast_ref::<CoordinatorError>().is_some() => {
-                QueryError::Coordinator {
-                    source: *e.downcast::<CoordinatorError>().unwrap(),
-                }
+                let coordinator_error = *e.downcast::<CoordinatorError>().unwrap();
+                CoordinatorSnafu.into_error(coordinator_error)
             }
             ArrowError::ExternalError(e) if e.downcast_ref::<ArrowError>().is_some() => {
                 let arrow_error = *e.downcast::<ArrowError>().unwrap();
                 arrow_error.into()
             }
-            other => QueryError::Arrow { source: other },
+            other => ArrowSnafu.into_error(other),
         }
-    }
-}
-
-impl From<object_store::Error> for QueryError {
-    fn from(source: object_store::Error) -> Self {
-        QueryError::ObjectStore { source }
-    }
-}
-
-impl From<std::io::Error> for QueryError {
-    fn from(source: std::io::Error) -> Self {
-        QueryError::StdIoError { source }
-    }
-}
-
-impl From<serde_json::Error> for QueryError {
-    fn from(source: serde_json::Error) -> Self {
-        QueryError::SerdeJsonError { source }
-    }
-}
-
-impl From<snap::Error> for QueryError {
-    fn from(source: snap::Error) -> Self {
-        QueryError::SnappyError { source }
-    }
-}
-
-impl From<TenantOptionsBuilderError> for QueryError {
-    fn from(value: TenantOptionsBuilderError) -> Self {
-        QueryError::TenantOptionsBuildFail { source: value }
-    }
-}
-
-impl From<AuthError> for QueryError {
-    fn from(value: AuthError) -> Self {
-        QueryError::Auth { source: value }
     }
 }
 

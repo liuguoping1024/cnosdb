@@ -71,7 +71,7 @@ impl Table {
             Table::test_columns()
                 .iter()
                 .map(|c| Field::new(&c.name, c.data_type.clone(), true))
-                .collect(),
+                .collect::<Vec<_>>(),
         ))
     }
 }
@@ -184,7 +184,7 @@ impl ExecutionPlan for TableScanExec {
             self.columns
                 .iter()
                 .map(|c| Field::new(&c.name, c.data_type.clone(), true))
-                .collect(),
+                .collect::<Vec<_>>(),
         ))
     }
 
@@ -371,7 +371,7 @@ async fn test_dataframe() {
 
     time::timeout(Duration::from_secs(10), async move {
         let result = dataframe.collect().await.unwrap();
-        let record_batch = result.get(0).unwrap();
+        let record_batch = result.first().unwrap();
 
         dbg!(record_batch.columns());
     })

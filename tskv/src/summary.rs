@@ -1,35 +1,31 @@
-use std::collections::{HashMap, HashSet};
+use std::cmp::max;
+use std::collections::HashMap;
 use std::fmt::Display;
-use std::fs::{remove_file, rename};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use lru_cache::asynchronous::ShardedCache;
+use cache::ShardedAsyncCache;
 use memory_pool::MemoryPoolRef;
 use meta::model::MetaRef;
 use metrics::metric_register::MetricsRegister;
 use models::Timestamp;
 use parking_lot::RwLock as SyncRwLock;
 use serde::{Deserialize, Serialize};
+use snafu::ResultExt;
 use tokio::runtime::Runtime;
-use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot::Sender as OneShotSender;
 use tokio::sync::RwLock;
 use utils::BloomFilter;
 
-use crate::compaction::{CompactTask, FlushReq};
-use crate::context::{GlobalContext, GlobalSequenceTask};
-use crate::error::{Error, Result};
-use crate::file_system::file_manager::try_exists;
+use crate::context::GlobalContext;
+use crate::error::{IOSnafu, RecordFileDecodeSnafu, RecordFileEncodeSnafu, TskvError, TskvResult};
+use crate::file_system::async_filesystem::LocalFileSystem;
 use crate::kv_option::{Options, StorageOptions, DELTA_PATH, TSM_PATH};
 use crate::memcache::MemCache;
 use crate::record_file::{Reader, RecordDataType, RecordDataVersion, Writer};
-use crate::tseries_family::{ColumnFile, LevelInfo, Version};
-use crate::tsm::TsmReader;
+use crate::tseries_family::{ColumnFile, LevelInfo, TseriesFamily, Version};
 use crate::version_set::VersionSet;
 use crate::{byte_utils, file_utils, ColumnFileId, LevelId, TseriesFamilyId};
-
-const MAX_BATCH_SIZE: usize = 64;
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Clone)]
 pub struct CompactMeta {
@@ -39,8 +35,6 @@ pub struct CompactMeta {
     pub level: LevelId,
     pub min_ts: Timestamp,
     pub max_ts: Timestamp,
-    pub high_seq: u64,
-    pub low_seq: u64,
     pub is_delta: bool,
 }
 
@@ -53,8 +47,6 @@ impl Default for CompactMeta {
             level: 0,
             min_ts: Timestamp::MAX,
             max_ts: Timestamp::MIN,
-            high_seq: u64::MIN,
-            low_seq: u64::MIN,
             is_delta: false,
         }
     }
@@ -87,40 +79,45 @@ impl CompactMeta {
     ) -> PathBuf {
         if self.is_delta {
             let base_dir = storage_opt.delta_dir(database, ts_family_id);
-            file_utils::make_delta_file_name(base_dir, self.file_id)
+            file_utils::make_delta_file(base_dir, self.file_id)
         } else {
             let base_dir = storage_opt.tsm_dir(database, ts_family_id);
-            file_utils::make_tsm_file_name(base_dir, self.file_id)
+            file_utils::make_tsm_file(base_dir, self.file_id)
+        }
+    }
+
+    pub fn relative_path(&self) -> PathBuf {
+        if self.is_delta {
+            let base_dir = PathBuf::from(DELTA_PATH);
+            file_utils::make_delta_file(base_dir, self.file_id)
+        } else {
+            let base_dir = PathBuf::from(TSM_PATH);
+            file_utils::make_tsm_file(base_dir, self.file_id)
         }
     }
 
     pub async fn rename_file(
-        &mut self,
-        storage_opt: &StorageOptions,
-        database: &str,
-        ts_family_id: TseriesFamilyId,
-        file_id: ColumnFileId,
-    ) -> Result<PathBuf> {
-        let old_name = if self.is_delta {
-            let base_dir = storage_opt
-                .move_dir(database, ts_family_id)
-                .join(DELTA_PATH);
-            file_utils::make_delta_file_name(base_dir, self.file_id)
+        &self,
+        old_dir: &Path,
+        new_dir: &Path,
+        new_id: ColumnFileId,
+    ) -> TskvResult<PathBuf> {
+        let old_id = self.file_id;
+        let (old_name, new_name) = if self.is_delta {
+            (
+                file_utils::make_delta_file(old_dir.join(DELTA_PATH), old_id),
+                file_utils::make_delta_file(new_dir.join(DELTA_PATH), new_id),
+            )
         } else {
-            let base_dir = storage_opt.move_dir(database, ts_family_id).join(TSM_PATH);
-            file_utils::make_tsm_file_name(base_dir, self.file_id)
+            (
+                file_utils::make_tsm_file(old_dir.join(TSM_PATH), old_id),
+                file_utils::make_tsm_file(new_dir.join(TSM_PATH), new_id),
+            )
         };
 
-        let new_name = if self.is_delta {
-            let base_dir = storage_opt.delta_dir(database, ts_family_id);
-            file_utils::make_delta_file_name(base_dir, file_id)
-        } else {
-            let base_dir = storage_opt.tsm_dir(database, ts_family_id);
-            file_utils::make_tsm_file_name(base_dir, file_id)
-        };
         trace::info!("rename file from {:?} to {:?}", &old_name, &new_name);
-        file_utils::rename(old_name, &new_name).await?;
-        self.file_id = file_id;
+        file_utils::rename(&old_name, &new_name).await?;
+
         Ok(new_name)
     }
 }
@@ -150,23 +147,19 @@ impl CompactMetaBuilder {
             min_ts,
             max_ts,
             is_delta: level == 0,
-            ..Default::default()
         }
     }
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Clone)]
 pub struct VersionEdit {
-    pub has_seq_no: bool,
     pub seq_no: u64,
-    pub has_file_id: bool,
     pub file_id: u64,
     pub max_level_ts: Timestamp,
     pub add_files: Vec<CompactMeta>,
     pub del_files: Vec<CompactMeta>,
 
-    pub del_tsf: bool,
-    pub add_tsf: bool,
+    pub act_tsf: VnodeAction,
     pub tsf_id: TseriesFamilyId,
     pub tsf_name: String,
 }
@@ -174,15 +167,12 @@ pub struct VersionEdit {
 impl Default for VersionEdit {
     fn default() -> Self {
         Self {
-            has_seq_no: false,
             seq_no: 0,
-            has_file_id: false,
             file_id: 0,
             max_level_ts: i64::MIN,
             add_files: vec![],
             del_files: vec![],
-            del_tsf: false,
-            add_tsf: false,
+            act_tsf: VnodeAction::Update,
             tsf_id: 0,
             tsf_name: String::from(""),
         }
@@ -190,8 +180,11 @@ impl Default for VersionEdit {
 }
 
 impl VersionEdit {
-    pub fn new(vnode_id: TseriesFamilyId) -> Self {
+    pub fn new_update_vnode(vnode_id: u32, owner: String, seq_no: u64) -> Self {
         Self {
+            seq_no,
+            act_tsf: VnodeAction::Update,
+            tsf_name: owner,
             tsf_id: vnode_id,
             ..Default::default()
         }
@@ -199,36 +192,50 @@ impl VersionEdit {
 
     pub fn new_add_vnode(vnode_id: u32, owner: String, seq_no: u64) -> Self {
         Self {
+            seq_no,
+            act_tsf: VnodeAction::Add,
             tsf_id: vnode_id,
             tsf_name: owner,
-            add_tsf: true,
-            has_seq_no: true,
-            seq_no,
+
             ..Default::default()
         }
     }
 
-    pub fn new_del_vnode(vnode_id: u32) -> Self {
+    pub fn new_del_vnode(vnode_id: u32, owner: String, seq_no: u64) -> Self {
         Self {
+            seq_no,
+            act_tsf: VnodeAction::Delete,
             tsf_id: vnode_id,
-            del_tsf: true,
+            tsf_name: owner,
+
             ..Default::default()
         }
     }
 
-    pub fn encode(&self) -> Result<Vec<u8>> {
-        bincode::serialize(self).map_err(|e| Error::RecordFileEncode { source: (e) })
+    pub fn update_vnode_id(&mut self, new_id: u32) {
+        self.tsf_id = new_id;
+
+        for f in self.add_files.iter_mut() {
+            f.tsf_id = new_id;
+        }
+
+        for f in self.del_files.iter_mut() {
+            f.tsf_id = new_id;
+        }
     }
 
-    pub fn decode(buf: &[u8]) -> Result<Self> {
-        bincode::deserialize(buf).map_err(|e| Error::RecordFileDecode { source: (e) })
+    pub fn encode(&self) -> TskvResult<Vec<u8>> {
+        bincode::serialize(self).context(RecordFileEncodeSnafu)
     }
 
-    pub fn encode_vec(data: &[Self]) -> Result<Vec<u8>> {
+    pub fn decode(buf: &[u8]) -> TskvResult<Self> {
+        bincode::deserialize(buf).context(RecordFileDecodeSnafu)
+    }
+
+    pub fn encode_vec(data: &[Self]) -> TskvResult<Vec<u8>> {
         let mut buf: Vec<u8> = Vec::with_capacity(data.len() * 32);
         for ve in data {
-            let ve_buf =
-                bincode::serialize(ve).map_err(|e| Error::RecordFileEncode { source: (e) })?;
+            let ve_buf = bincode::serialize(ve).context(RecordFileEncodeSnafu)?;
             let pos = buf.len();
             buf.resize(pos + 4 + ve_buf.len(), 0_u8);
             buf[pos..pos + 4].copy_from_slice((ve_buf.len() as u32).to_be_bytes().as_slice());
@@ -238,7 +245,7 @@ impl VersionEdit {
         Ok(buf)
     }
 
-    pub fn decode_vec(buf: &[u8]) -> Result<Vec<Self>> {
+    pub fn decode_vec(buf: &[u8]) -> TskvResult<Vec<Self>> {
         let mut list: Vec<Self> = Vec::with_capacity(buf.len() / 32 + 1);
         let mut pos = 0_usize;
         while pos < buf.len() {
@@ -259,16 +266,8 @@ impl VersionEdit {
     }
 
     pub fn add_file(&mut self, compact_meta: CompactMeta, max_level_ts: i64) {
-        if compact_meta.high_seq != 0 {
-            // ComapctMeta.seq_no only makes sense when flush.
-            // In other processes, we set high_seq 0 .
-            self.has_seq_no = true;
-            self.seq_no = compact_meta.high_seq;
-        }
-        self.has_file_id = true;
         self.file_id = self.file_id.max(compact_meta.file_id);
-        self.max_level_ts = max_level_ts;
-        self.tsf_id = compact_meta.tsf_id;
+        self.max_level_ts = max(self.max_level_ts, max_level_ts);
         self.add_files.push(compact_meta);
     }
 
@@ -284,20 +283,39 @@ impl VersionEdit {
 
 impl Display for VersionEdit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "seq_no: {}, file_id: {}, add_files: {}, del_files: {}, del_tsf: {}, add_tsf: {}, tsf_id: {}, tsf_name: {}, has_seq_no: {}, has_file_id: {}, max_level_ts: {}",
-               self.seq_no, self.file_id, self.add_files.len(), self.del_files.len(), self.del_tsf, self.add_tsf, self.tsf_id, self.tsf_name, self.has_seq_no, self.has_file_id, self.max_level_ts)
+        write!(f, "seq_no: {}, file_id: {}, add_files: {}, del_files: {}, act_tsf: {}, tsf_id: {}, tsf_name: {}, max_level_ts: {}",
+               self.seq_no, self.file_id, self.add_files.len(), self.del_files.len(), self.act_tsf, self.tsf_id, self.tsf_name, self.max_level_ts)
     }
 }
 
+#[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Clone)]
+pub enum VnodeAction {
+    Add,
+    Delete,
+    Update,
+}
+
+impl Display for VnodeAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VnodeAction::Add => write!(f, "Add"),
+            VnodeAction::Delete => write!(f, "Delete"),
+            VnodeAction::Update => write!(f, "Update"),
+        }
+    }
+}
+
+const SUMMARY_BUFFER_SIZE: usize = 1024 * 1024;
+
 pub struct Summary {
-    file_no: u64,
+    _meta: MetaRef,
+    _file_no: u64,
     version_set: Arc<RwLock<VersionSet>>,
     ctx: Arc<GlobalContext>,
     writer: Writer,
     opt: Arc<Options>,
-    runtime: Arc<Runtime>,
-    sequence_task_sender: Sender<GlobalSequenceTask>,
-    metrics_register: Arc<MetricsRegister>,
+    _runtime: Arc<Runtime>,
+    _metrics_register: Arc<MetricsRegister>,
 }
 
 impl Summary {
@@ -305,13 +323,15 @@ impl Summary {
     pub async fn new(
         opt: Arc<Options>,
         runtime: Arc<Runtime>,
+        meta: MetaRef,
         memory_pool: MemoryPoolRef,
-        sequence_task_sender: Sender<GlobalSequenceTask>,
         metrics_register: Arc<MetricsRegister>,
-    ) -> Result<Self> {
+    ) -> TskvResult<Self> {
         let db = VersionEdit::default();
         let path = file_utils::make_summary_file(opt.storage.summary_dir(), 0);
-        let mut w = Writer::open(path, RecordDataType::Summary).await.unwrap();
+        let mut w = Writer::open(path, RecordDataType::Summary, SUMMARY_BUFFER_SIZE)
+            .await
+            .unwrap();
         let buf = db.encode()?;
         let _ = w
             .write_record(
@@ -323,8 +343,10 @@ impl Summary {
         w.sync().await?;
 
         Ok(Self {
-            file_no: 0,
+            _meta: meta.clone(),
+            _file_no: 0,
             version_set: Arc::new(RwLock::new(VersionSet::empty(
+                meta.clone(),
                 opt.clone(),
                 runtime.clone(),
                 memory_pool,
@@ -333,9 +355,8 @@ impl Summary {
             ctx: Arc::new(GlobalContext::default()),
             writer: w,
             opt,
-            runtime,
-            sequence_task_sender,
-            metrics_register,
+            _runtime: runtime,
+            _metrics_register: metrics_register,
         })
     }
 
@@ -349,15 +370,13 @@ impl Summary {
         opt: Arc<Options>,
         runtime: Arc<Runtime>,
         memory_pool: MemoryPoolRef,
-        flush_task_sender: Sender<FlushReq>,
-        sequence_task_sender: Sender<GlobalSequenceTask>,
-        compact_task_sender: Sender<CompactTask>,
-        load_field_filter: bool,
         metrics_register: Arc<MetricsRegister>,
-    ) -> Result<Self> {
+    ) -> TskvResult<Self> {
         let summary_path = opt.storage.summary_dir();
         let path = file_utils::make_summary_file(&summary_path, 0);
-        let writer = Writer::open(path, RecordDataType::Summary).await.unwrap();
+        let writer = Writer::open(path, RecordDataType::Summary, SUMMARY_BUFFER_SIZE)
+            .await
+            .unwrap();
         let ctx = Arc::new(GlobalContext::default());
         let rd = Box::new(
             Reader::open(&file_utils::make_summary_file(&summary_path, 0))
@@ -365,28 +384,25 @@ impl Summary {
                 .unwrap(),
         );
         let vs = Self::recover_version(
-            meta,
+            meta.clone(),
             rd,
             &ctx,
             opt.clone(),
             runtime.clone(),
             memory_pool,
-            flush_task_sender,
-            compact_task_sender,
-            load_field_filter,
             metrics_register.clone(),
         )
         .await?;
 
         Ok(Self {
-            file_no: 0,
+            _meta: meta.clone(),
+            _file_no: 0,
             version_set: Arc::new(RwLock::new(vs)),
             ctx,
             writer,
             opt,
-            runtime,
-            sequence_task_sender,
-            metrics_register,
+            _runtime: runtime,
+            _metrics_register: metrics_register,
         })
     }
 
@@ -402,11 +418,8 @@ impl Summary {
         opt: Arc<Options>,
         runtime: Arc<Runtime>,
         memory_pool: MemoryPoolRef,
-        flush_task_sender: Sender<FlushReq>,
-        compact_task_sender: Sender<CompactTask>,
-        load_field_filter: bool,
         metrics_register: Arc<MetricsRegister>,
-    ) -> Result<VersionSet> {
+    ) -> TskvResult<VersionSet> {
         let mut tsf_edits_map: HashMap<TseriesFamilyId, Vec<VersionEdit>> = HashMap::new();
         let mut database_map: HashMap<String, Arc<String>> = HashMap::new();
         let mut tsf_database_map: HashMap<TseriesFamilyId, Arc<String>> = HashMap::new();
@@ -416,24 +429,21 @@ impl Summary {
             match res {
                 Ok(result) => {
                     let ed = VersionEdit::decode(&result.data)?;
-                    if ed.add_tsf {
+                    if ed.act_tsf == VnodeAction::Add {
                         let db_ref = database_map
                             .entry(ed.tsf_name.clone())
                             .or_insert_with(|| Arc::new(ed.tsf_name.clone()));
                         tsf_database_map.insert(ed.tsf_id, db_ref.clone());
-                        if ed.has_file_id {
-                            tsf_edits_map.insert(ed.tsf_id, vec![ed]);
-                        } else {
-                            tsf_edits_map.insert(ed.tsf_id, vec![]);
-                        }
-                    } else if ed.del_tsf {
+                        tsf_edits_map.insert(ed.tsf_id, vec![ed]);
+                    } else if ed.act_tsf == VnodeAction::Delete {
                         tsf_edits_map.remove(&ed.tsf_id);
                         tsf_database_map.remove(&ed.tsf_id);
                     } else if let Some(data) = tsf_edits_map.get_mut(&ed.tsf_id) {
                         data.push(ed);
                     }
                 }
-                Err(Error::Eof) => break,
+                Err(TskvError::Eof) => break,
+                Err(TskvError::RecordFileHashCheckFailed { .. }) => continue,
                 Err(e) => {
                     return Err(e);
                 }
@@ -441,10 +451,7 @@ impl Summary {
         }
 
         let mut versions = HashMap::new();
-        let mut has_seq_no = false;
-        let mut max_seq_no_all = 0_u64;
-        let mut has_file_id = false;
-        let mut max_file_id_all = 0_u64;
+        let mut max_file_id = 0_u64;
         for (tsf_id, edits) in tsf_edits_map {
             let database = tsf_database_map.remove(&tsf_id).unwrap();
 
@@ -452,16 +459,9 @@ impl Summary {
             let mut max_seq_no = 0;
             let mut max_level_ts = i64::MIN;
             for e in edits {
-                if e.has_seq_no {
-                    has_seq_no = true;
-                    max_seq_no = std::cmp::max(max_seq_no, e.seq_no);
-                    max_seq_no_all = std::cmp::max(max_seq_no_all, e.seq_no);
-                }
-                if e.has_file_id {
-                    has_file_id = true;
-                    max_file_id_all = std::cmp::max(max_file_id_all, e.file_id);
-                }
+                max_seq_no = std::cmp::max(max_seq_no, e.seq_no);
                 max_level_ts = std::cmp::max(max_level_ts, e.max_level_ts);
+                max_file_id = std::cmp::max(max_file_id, e.file_id);
                 for m in e.del_files {
                     files.remove(&m.file_id);
                 }
@@ -471,21 +471,15 @@ impl Summary {
             }
 
             // Recover levels_info according to `CompactMeta`s;
-            let tsm_reader_cache =
-                Arc::new(ShardedCache::with_capacity(opt.storage.max_cached_readers));
+            let tsm_reader_cache = Arc::new(ShardedAsyncCache::create_lru_sharded_cache(
+                opt.storage.max_cached_readers,
+            ));
             let weak_tsm_reader_cache = Arc::downgrade(&tsm_reader_cache);
             let mut levels = LevelInfo::init_levels(database.clone(), tsf_id, opt.storage.clone());
             for meta in files.into_values() {
-                let field_filter = if load_field_filter {
-                    let tsm_path = meta.file_path(opt.storage.as_ref(), &database, tsf_id);
-                    let tsm_reader = TsmReader::open(tsm_path).await?;
-                    tsm_reader.bloom_filter()
-                } else {
-                    Arc::new(BloomFilter::default())
-                };
                 levels[meta.level as usize].push_compact_meta(
                     &meta,
-                    field_filter,
+                    RwLock::new(None),
                     weak_tsm_reader_cache.clone(),
                 );
             }
@@ -501,146 +495,83 @@ impl Summary {
             versions.insert(tsf_id, Arc::new(ver));
         }
 
-        if has_seq_no {
-            ctx.set_last_seq(max_seq_no_all + 1);
-        }
-        if has_file_id {
-            ctx.set_file_id(max_file_id_all + 1);
-        }
-        let vs = VersionSet::new(
-            meta,
-            opt,
-            runtime,
-            memory_pool,
-            versions,
-            flush_task_sender,
-            compact_task_sender,
-            metrics_register,
-        )
-        .await?;
+        ctx.set_file_id(max_file_id + 1);
+        let vs =
+            VersionSet::new(meta, opt, runtime, memory_pool, versions, metrics_register).await?;
         Ok(vs)
     }
 
-    /// Applies version edit to summary file, and generates new version for TseriesFamily.
-    pub async fn apply_version_edit(
-        &mut self,
-        version_edits: Vec<VersionEdit>,
-        file_metas: HashMap<ColumnFileId, Arc<BloomFilter>>,
-        mem_caches: HashMap<TseriesFamilyId, Vec<Arc<SyncRwLock<MemCache>>>>,
-    ) -> Result<()> {
-        self.write_summary(version_edits, file_metas, mem_caches)
-            .await?;
-        self.roll_summary_file().await?;
-        Ok(())
-    }
-
     /// Write VersionEdits into summary file, generate and then apply new Versions for TseriesFamilies.
-    async fn write_summary(
-        &mut self,
-        version_edits: Vec<VersionEdit>,
-        mut file_metas: HashMap<ColumnFileId, Arc<BloomFilter>>,
-        mem_caches: HashMap<TseriesFamilyId, Vec<Arc<SyncRwLock<MemCache>>>>,
-    ) -> Result<()> {
+    pub async fn apply_version_edit(&mut self, request: &SummaryRequest) -> TskvResult<()> {
         // Write VersionEdits into summary file and join VersionEdits by Database/TseriesFamilyId.
-        let mut tsf_version_edits: HashMap<TseriesFamilyId, Vec<VersionEdit>> = HashMap::new();
-        let mut tsf_min_seq: HashMap<TseriesFamilyId, u64> = HashMap::new();
-        let mut del_tsf: HashSet<TseriesFamilyId> = HashSet::new();
-        for edit in version_edits.into_iter() {
-            let buf = edit.encode()?;
-            let _ = self
-                .writer
-                .write_record(
-                    RecordDataVersion::V1.into(),
-                    RecordDataType::Summary.into(),
-                    &[&buf],
-                )
-                .await?;
-            self.writer.sync().await?;
+        let tsf_id = request.ts_family.read().await.tf_id();
 
-            tsf_version_edits
-                .entry(edit.tsf_id)
-                .or_default()
-                .push(edit.clone());
-            if edit.has_seq_no {
-                tsf_min_seq.insert(edit.tsf_id, edit.seq_no);
-            }
-            if edit.del_tsf {
-                del_tsf.insert(edit.tsf_id);
-            }
+        trace::info!("Write version edit to summary for ts_family {}.", tsf_id);
+        let buf = request.version_edit.encode()?;
+        let _ = self
+            .writer
+            .write_record(
+                RecordDataVersion::V1.into(),
+                RecordDataType::Summary.into(),
+                &[&buf],
+            )
+            .await?;
+        self.writer.sync().await?;
+
+        // Generate a new Version and then apply it.
+        trace::info!("Applying new version for ts_family {}.", tsf_id);
+        let mut file_metas = HashMap::new();
+        if let Some(tmp) = &request.file_metas {
+            file_metas = tmp.clone();
         }
 
-        // For each TsereiesFamily - VersionEdits，generate a new Version and then apply it.
-        let version_set = self.version_set.read().await;
-        for (tsf_id, edits) in tsf_version_edits {
-            let min_seq = tsf_min_seq.get(&tsf_id);
-            if let Some(tsf) = version_set.get_tsfamily_by_tf_id(tsf_id).await {
-                trace::info!("Applying new version for ts_family {}.", tsf_id);
-                let new_version = tsf.read().await.version().copy_apply_version_edits(
-                    edits,
-                    &mut file_metas,
-                    min_seq.copied(),
-                );
-                let flushed_mem_cahces = mem_caches.get(&tsf_id);
-                tsf.write()
-                    .await
-                    .new_version(new_version, flushed_mem_cahces);
-                trace::info!("Applied new version for ts_family {}.", tsf_id);
-            }
-        }
-        drop(version_set);
-
-        // Send a GlobalSequenceTask to get a global min_sequence
-        if let Err(_e) = self
-            .sequence_task_sender
-            .send(GlobalSequenceTask {
-                del_ts_family: del_tsf,
-                ts_family_min_seq: tsf_min_seq,
-            })
+        let new_version = request
+            .ts_family
+            .read()
             .await
-        {
-            trace::error!("Failed to send AfterSummaryTask");
-        }
+            .version()
+            .copy_apply_version_edits(request.version_edit.clone(), &mut file_metas);
+
+        let new_version = Arc::new(new_version);
+        request
+            .ts_family
+            .write()
+            .await
+            .new_version(new_version, request.mem_caches.as_ref());
+        trace::info!("Applied new version for ts_family {}.", tsf_id);
 
         Ok(())
     }
 
-    async fn roll_summary_file(&mut self) -> Result<()> {
-        if self.writer.file_size() >= self.opt.storage.max_summary_size {
-            let (edits, file_metas) = {
-                let vs = self.version_set.read().await;
-                vs.snapshot().await
-            };
-
-            let new_path = &file_utils::make_summary_file_tmp(self.opt.storage.summary_dir());
-            let old_path = &self.writer.path().clone();
-            if try_exists(new_path) {
-                match remove_file(new_path) {
-                    Ok(_) => (),
-                    Err(e) => {
-                        trace::error!("Failed to remove file '{}': {:?}", new_path.display(), e);
-                    }
-                };
-            }
-            self.writer = Writer::open(new_path, RecordDataType::Summary)
-                .await
-                .unwrap();
-            self.write_summary(edits, file_metas, HashMap::new())
-                .await?;
-            match rename(new_path, old_path) {
-                Ok(_) => (),
-                Err(e) => {
-                    trace::error!(
-                        "Failed to remove old file '{}' and create new file '{}': {:?}",
-                        old_path.display(),
-                        new_path.display(),
-                        e
-                    );
-                }
-            };
-            self.writer = Writer::open(old_path, RecordDataType::Summary)
-                .await
-                .unwrap();
+    pub async fn roll_summary_file(&mut self) -> TskvResult<()> {
+        if self.writer.file_size() < self.opt.storage.max_summary_size {
+            return Ok(());
         }
+
+        let new_path = file_utils::make_summary_file_tmp(self.opt.storage.summary_dir());
+        LocalFileSystem::remove_if_exists(&new_path)
+            .map_err(|e| TskvError::FileSystemError { source: e })?;
+
+        let requests = self
+            .version_set
+            .read()
+            .await
+            .ts_families_version_edit()
+            .await?;
+        self.writer = Writer::open(&new_path, RecordDataType::Summary, SUMMARY_BUFFER_SIZE).await?;
+
+        for request in requests.iter() {
+            self.apply_version_edit(request).await?;
+        }
+
+        let old_path = &self.writer.path().clone();
+        trace::info!("Remove summary file {:?} -> {:?}", new_path, old_path,);
+        std::fs::rename(new_path, old_path).context(IOSnafu)?;
+
+        self.writer = Writer::open(old_path, RecordDataType::Summary, SUMMARY_BUFFER_SIZE)
+            .await
+            .unwrap();
+
         Ok(())
     }
 
@@ -664,181 +595,102 @@ pub async fn print_summary_statistics(path: impl AsRef<Path>) {
                 println!("VersionEdit #{}, vnode_id: {}", i, ve.tsf_id);
                 println!("------------------------------------------------------------");
                 i += 1;
-                if ve.add_tsf {
+                if ve.act_tsf == VnodeAction::Add {
                     println!("  Add ts_family: {}", ve.tsf_id);
                     println!("------------------------------------------------------------");
                 }
-                if ve.del_tsf {
+                if ve.act_tsf == VnodeAction::Delete {
                     println!("  Delete ts_family: {}", ve.tsf_id);
                     println!("------------------------------------------------------------");
                 }
-                if ve.has_seq_no {
-                    println!("  Presist sequence: {}", ve.seq_no);
-                    println!("------------------------------------------------------------");
+
+                println!("  Presist sequence: {}", ve.seq_no);
+                println!("------------------------------------------------------------");
+
+                if ve.add_files.is_empty() && ve.del_files.is_empty() {
+                    println!("  Add file: None. Delete file: None.");
                 }
-                if ve.has_file_id {
-                    if ve.add_files.is_empty() && ve.del_files.is_empty() {
-                        println!("  Add file: None. Delete file: None.");
+                if !ve.add_files.is_empty() {
+                    let mut buffer = String::new();
+                    ve.add_files.iter().for_each(|f| {
+                        buffer.push_str(
+                            format!("{} (level: {}, {} B), ", f.file_id, f.level, f.file_size)
+                                .as_str(),
+                        )
+                    });
+                    if !buffer.is_empty() {
+                        buffer.truncate(buffer.len() - 2);
                     }
-                    if !ve.add_files.is_empty() {
-                        let mut buffer = String::new();
-                        ve.add_files.iter().for_each(|f| {
-                            buffer.push_str(
-                                format!("{} (level: {}, {} B), ", f.file_id, f.level, f.file_size)
-                                    .as_str(),
-                            )
-                        });
-                        if !buffer.is_empty() {
-                            buffer.truncate(buffer.len() - 2);
-                        }
-                        println!("  Add file:[ {} ]", buffer);
+                    println!("  Add file:[ {} ]", buffer);
+                }
+                if !ve.del_files.is_empty() {
+                    let mut buffer = String::new();
+                    ve.del_files.iter().for_each(|f| {
+                        buffer.push_str(format!("{} (level: {}), ", f.file_id, f.level).as_str())
+                    });
+                    if !buffer.is_empty() {
+                        buffer.truncate(buffer.len() - 2);
                     }
-                    if !ve.del_files.is_empty() {
-                        let mut buffer = String::new();
-                        ve.del_files.iter().for_each(|f| {
-                            buffer
-                                .push_str(format!("{} (level: {}), ", f.file_id, f.level).as_str())
-                        });
-                        if !buffer.is_empty() {
-                            buffer.truncate(buffer.len() - 2);
-                        }
-                        println!("  Delete file:[ {} ]", buffer);
-                    }
+                    println!("  Delete file:[ {} ]", buffer);
                 }
             }
-            Err(err) => match err {
-                Error::Eof => break,
-                _ => panic!("Errors when read summary file: {}", err),
-            },
+            Err(TskvError::Eof) => break,
+            Err(TskvError::RecordFileHashCheckFailed { .. }) => continue,
+            Err(err) => panic!("Errors when read summary file: {}", err),
         }
         println!("============================================================");
     }
 }
 
-pub struct SummaryProcessor {
-    summary: Box<Summary>,
-    cbs: Vec<OneShotSender<Result<()>>>,
-    edits: Vec<VersionEdit>,
-    file_metas: HashMap<ColumnFileId, Arc<BloomFilter>>,
-    mem_caches: HashMap<TseriesFamilyId, Vec<Arc<SyncRwLock<MemCache>>>>,
+#[derive(Debug)]
+pub struct SummaryRequest {
+    pub version_edit: VersionEdit,
+    pub ts_family: Arc<RwLock<TseriesFamily>>,
+    pub mem_caches: Option<Vec<Arc<SyncRwLock<MemCache>>>>,
+    pub file_metas: Option<HashMap<ColumnFileId, Arc<BloomFilter>>>,
 }
-
-impl SummaryProcessor {
-    pub fn new(summary: Box<Summary>) -> Self {
-        Self {
-            summary,
-            cbs: Vec::with_capacity(32),
-            edits: Vec::with_capacity(32),
-            file_metas: HashMap::new(),
-            mem_caches: HashMap::new(),
-        }
-    }
-
-    pub fn batch(&mut self, task: SummaryTask) {
-        if let Some(file_metas) = task.file_metas {
-            self.file_metas.extend(file_metas.into_iter());
-        }
-        if let Some(mem_caches) = task.mem_caches {
-            self.mem_caches.extend(mem_caches.into_iter());
-        }
-        let mut req = task.request;
-        self.edits.append(&mut req.version_edits);
-        self.cbs.push(req.call_back);
-    }
-
-    pub async fn apply(&mut self) {
-        let edits = std::mem::replace(&mut self.edits, Vec::with_capacity(32));
-        let file_metas = std::mem::take(&mut self.file_metas);
-        let mem_caches = std::mem::take(&mut self.mem_caches);
-        match self
-            .summary
-            .apply_version_edit(edits, file_metas, mem_caches)
-            .await
-        {
-            Ok(()) => {
-                for cb in self.cbs.drain(..) {
-                    let _ = cb.send(Ok(()));
-                }
-            }
-            Err(_e) => {
-                for cb in self.cbs.drain(..) {
-                    let _ = cb.send(Err(Error::ErrApplyEdit));
-                }
-            }
-        }
-    }
-
-    pub fn summary(&self) -> &Summary {
-        &self.summary
-    }
-}
-
 #[derive(Debug)]
 pub struct SummaryTask {
-    pub request: WriteSummaryRequest,
-    pub file_metas: Option<HashMap<ColumnFileId, Arc<BloomFilter>>>,
-    pub mem_caches: Option<HashMap<TseriesFamilyId, Vec<Arc<SyncRwLock<MemCache>>>>>,
+    pub request: SummaryRequest,
+    pub call_back: OneShotSender<TskvResult<()>>,
 }
 
 impl SummaryTask {
     pub fn new(
-        version_edits: Vec<VersionEdit>,
+        ts_family: Arc<RwLock<TseriesFamily>>,
+        version_edit: VersionEdit,
         file_metas: Option<HashMap<ColumnFileId, Arc<BloomFilter>>>,
-        mem_caches: Option<HashMap<TseriesFamilyId, Vec<Arc<SyncRwLock<MemCache>>>>>,
-        call_back: OneShotSender<Result<()>>,
+        mem_caches: Option<Vec<Arc<SyncRwLock<MemCache>>>>,
+        call_back: OneShotSender<TskvResult<()>>,
     ) -> Self {
         Self {
-            request: WriteSummaryRequest {
-                version_edits,
-                call_back,
+            call_back,
+            request: SummaryRequest {
+                version_edit,
+                ts_family,
+                mem_caches,
+                file_metas,
             },
-            file_metas,
-            mem_caches,
         }
     }
 }
-
-#[derive(Debug)]
-pub struct WriteSummaryRequest {
-    pub version_edits: Vec<VersionEdit>,
-    pub call_back: OneShotSender<Result<()>>,
-}
-
-#[derive(Clone)]
-pub struct SummaryScheduler {
-    sender: Sender<SummaryTask>,
-}
-
-impl SummaryScheduler {
-    pub fn new(sender: Sender<SummaryTask>) -> Self {
-        Self { sender }
-    }
-}
-
 #[cfg(test)]
 mod test {
-    use std::collections::HashMap;
-    use std::fs;
     use std::sync::Arc;
 
+    use config::tskv::Config;
     use memory_pool::GreedyMemoryPool;
-    use meta::model::meta_manager::RemoteMetaManager;
-    use meta::model::MetaRef;
+    use meta::model::meta_admin::AdminMeta;
     use metrics::metric_register::MetricsRegister;
-    use models::schema::{make_owner, DatabaseSchema, TenantOptions};
+    use models::schema::{make_owner, TenantOptions};
+    use sysinfo::{ProcessRefreshKind, RefreshKind, System};
     use tokio::runtime::Runtime;
-    use tokio::sync::mpsc;
-    use tokio::sync::mpsc::Sender;
+    use tokio::sync::RwLock;
     use utils::BloomFilter;
 
-    use crate::compaction::{CompactTask, FlushReq};
-    use crate::context::{GlobalContext, GlobalSequenceTask};
-    use crate::file_system::file_manager;
-    use crate::kv_option::Options;
-    use crate::kvcore::{
-        COMPACT_REQ_CHANNEL_CAP, GLOBAL_TASK_REQ_CHANNEL_CAP, SUMMARY_REQ_CHANNEL_CAP,
-    };
+    use crate::kv_option::{self, Options};
     use crate::summary::{CompactMeta, Summary, SummaryTask, VersionEdit};
+    use crate::{Engine, TsKv, TseriesFamilyId};
 
     #[test]
     fn test_version_edit() {
@@ -866,428 +718,271 @@ mod test {
         assert_eq!(ves, ves_2);
     }
 
-    #[test]
-    fn test_summary() {
-        let mut config = config::get_config_for_test();
-
-        let runtime = Arc::new(
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .worker_threads(4)
-                .build()
-                .unwrap(),
-        );
-
-        // NOTICE: Make sure these channel senders are dropped before test_summary() finished.
-        let (summary_task_sender, mut summary_task_receiver) =
-            mpsc::channel::<SummaryTask>(SUMMARY_REQ_CHANNEL_CAP);
-        let summary_job_mock = runtime.spawn(async move {
-            println!("Mock summary job started (test_summary).");
-            while let Some(t) = summary_task_receiver.recv().await {
-                // Do nothing
-                let _ = t.request.call_back.send(Ok(()));
-            }
-            println!("Mock summary job finished (test_summary).");
-        });
-        let (flush_task_sender, mut flush_task_receiver) =
-            mpsc::channel::<FlushReq>(config.storage.flush_req_channel_cap);
-        let flush_job_mock = runtime.spawn(async move {
-            println!("Mock flush job started (test_summary).");
-            while flush_task_receiver.recv().await.is_some() {
-                // Do nothing
-            }
-            println!("Mock flush job finished (test_summary).");
-        });
-        let (global_seq_task_sender, mut global_seq_task_receiver) =
-            mpsc::channel::<GlobalSequenceTask>(GLOBAL_TASK_REQ_CHANNEL_CAP);
-        let _global_seq_job_mock = runtime.spawn(async move {
-            println!("Mock global sequence job started (test_summary).");
-            while let Some(_t) = global_seq_task_receiver.recv().await {
-                // Do nothing
-            }
-            println!("Mock global sequence job finished (test_summary).");
-        });
-        let (compact_task_sender, mut compact_task_receiver) =
-            mpsc::channel::<CompactTask>(COMPACT_REQ_CHANNEL_CAP);
-        let compact_job_mock = runtime.spawn(async move {
-            println!("Mock compact job started (test_summary).");
-            while compact_task_receiver.recv().await.is_some() {
-                // Do nothing
-            }
-            println!("Mock compact job finished (test_summary).");
-        });
-
-        let runtime_ref = runtime.clone();
-        runtime.block_on(async move {
-            println!("Running test: test_summary_recover");
-            let base_dir = "/tmp/test/summary/test_summary_recover".to_string();
-            let _ = fs::remove_dir_all(&base_dir);
-            config.storage.path = base_dir.clone();
-            test_summary_recover(
-                config.clone(),
-                runtime_ref.clone(),
-                flush_task_sender.clone(),
-                global_seq_task_sender.clone(),
-                compact_task_sender.clone(),
-            )
-            .await;
-
-            println!("Running test: test_tsf_num_recover");
-            let base_dir = "/tmp/test/summary/test_tsf_num_recover".to_string();
-            let _ = fs::remove_dir_all(&base_dir);
-            config.storage.path = base_dir.clone();
-            test_tsf_num_recover(
-                config.clone(),
-                runtime_ref.clone(),
-                flush_task_sender.clone(),
-                global_seq_task_sender.clone(),
-                compact_task_sender.clone(),
-            )
-            .await;
-
-            println!("Running test: test_recover_summary_with_roll_0");
-            let base_dir = "/tmp/test/summary/test_recover_summary_with_roll_0".to_string();
-            let _ = fs::remove_dir_all(&base_dir);
-            config.storage.path = base_dir.clone();
-            test_recover_summary_with_roll_0(
-                config.clone(),
-                runtime_ref.clone(),
-                summary_task_sender.clone(),
-                flush_task_sender.clone(),
-                global_seq_task_sender.clone(),
-                compact_task_sender.clone(),
-            )
-            .await;
-
-            println!("Running test: test_recover_summary_with_roll_1");
-            let base_dir = "/tmp/test/summary/test_recover_summary_with_roll_1".to_string();
-            let _ = fs::remove_dir_all(&base_dir);
-            config.storage.path = base_dir.clone();
-            test_recover_summary_with_roll_1(
-                config.clone(),
-                runtime_ref.clone(),
-                summary_task_sender,
-                flush_task_sender,
-                global_seq_task_sender,
-                compact_task_sender,
-            )
-            .await;
-
-            let _ = tokio::join!(summary_job_mock, flush_job_mock, compact_job_mock);
-        });
+    struct SummaryTestHelper {
+        tskv: TsKv,
+        config: Config,
+        runtime: Arc<Runtime>,
+        meta_manager: Arc<AdminMeta>,
+        _test_case_name: String,
+        memory_pool: Arc<GreedyMemoryPool>,
     }
 
-    async fn test_summary_recover(
-        config: config::Config,
-        runtime: Arc<Runtime>,
-        flush_task_sender: Sender<FlushReq>,
-        global_seq_task_sender: Sender<GlobalSequenceTask>,
-        compact_task_sender: Sender<CompactTask>,
-    ) {
-        let opt = Arc::new(Options::from(&config));
-        let empty_path = "";
-        let meta_manager: MetaRef =
-            RemoteMetaManager::new(config.clone(), empty_path.to_string()).await;
+    impl SummaryTestHelper {
+        fn new(config: Config, test_case_name: String) -> Self {
+            let runtime = Arc::new(
+                tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .worker_threads(4)
+                    .build()
+                    .unwrap(),
+            );
 
-        meta_manager.admin_meta().add_data_node().await.unwrap();
+            let options = Options::from(&config);
+            let runtime_clone = runtime.clone();
+            let memory_pool = Arc::new(GreedyMemoryPool::new(1024 * 1024 * 1024));
 
-        let _ = meta_manager
-            .tenant_manager()
-            .create_tenant("cnosdb".to_string(), TenantOptions::default())
-            .await;
-        let summary_dir = opt.storage.summary_dir();
-        if !file_manager::try_exists(&summary_dir) {
-            std::fs::create_dir_all(&summary_dir).unwrap();
-        }
-        let memory_pool = Arc::new(GreedyMemoryPool::new(1024 * 1024 * 1024));
-        let mut summary = Summary::new(
-            opt.clone(),
-            runtime.clone(),
-            memory_pool.clone(),
-            global_seq_task_sender.clone(),
-            Arc::new(MetricsRegister::default()),
-        )
-        .await
-        .unwrap();
-        let edit = VersionEdit::new_add_vnode(100, "cnosdb.hello".to_string(), 0);
-        summary
-            .apply_version_edit(vec![edit], HashMap::new(), HashMap::new())
-            .await
-            .unwrap();
-        let _summary = Summary::recover(
-            meta_manager,
-            opt.clone(),
-            runtime.clone(),
-            memory_pool,
-            flush_task_sender,
-            global_seq_task_sender,
-            compact_task_sender,
-            false,
-            Arc::new(MetricsRegister::default()),
-        )
-        .await
-        .unwrap();
-    }
-
-    async fn test_tsf_num_recover(
-        config: config::Config,
-        runtime: Arc<Runtime>,
-        flush_task_sender: Sender<FlushReq>,
-        global_seq_task_sender: Sender<GlobalSequenceTask>,
-        compact_task_sender: Sender<CompactTask>,
-    ) {
-        let opt = Arc::new(Options::from(&config));
-        let empty_path = "";
-        let meta_manager: MetaRef =
-            RemoteMetaManager::new(config.clone(), empty_path.to_string()).await;
-
-        meta_manager.admin_meta().add_data_node().await.unwrap();
-
-        let _ = meta_manager
-            .tenant_manager()
-            .create_tenant("cnosdb".to_string(), TenantOptions::default())
-            .await;
-        let summary_dir = opt.storage.summary_dir();
-        if !file_manager::try_exists(&summary_dir) {
-            std::fs::create_dir_all(&summary_dir).unwrap();
-        }
-        let memory_pool = Arc::new(GreedyMemoryPool::new(1024 * 1024 * 1024));
-        let mut summary = Summary::new(
-            opt.clone(),
-            runtime.clone(),
-            memory_pool.clone(),
-            global_seq_task_sender.clone(),
-            Arc::new(MetricsRegister::default()),
-        )
-        .await
-        .unwrap();
-
-        let edit = VersionEdit::new_add_vnode(100, "cnosdb.hello".to_string(), 0);
-        summary
-            .apply_version_edit(vec![edit], HashMap::new(), HashMap::new())
-            .await
-            .unwrap();
-        let mut summary = Summary::recover(
-            meta_manager.clone(),
-            opt.clone(),
-            runtime.clone(),
-            memory_pool.clone(),
-            flush_task_sender.clone(),
-            global_seq_task_sender.clone(),
-            compact_task_sender.clone(),
-            false,
-            Arc::new(MetricsRegister::default()),
-        )
-        .await
-        .unwrap();
-        assert_eq!(summary.version_set.read().await.tsf_num().await, 1);
-        let edit = VersionEdit::new_del_vnode(100);
-        summary
-            .apply_version_edit(vec![edit], HashMap::new(), HashMap::new())
-            .await
-            .unwrap();
-        let summary = Summary::recover(
-            meta_manager,
-            opt.clone(),
-            runtime,
-            memory_pool.clone(),
-            flush_task_sender,
-            global_seq_task_sender,
-            compact_task_sender,
-            false,
-            Arc::new(MetricsRegister::default()),
-        )
-        .await
-        .unwrap();
-        assert_eq!(summary.version_set.read().await.tsf_num().await, 0);
-    }
-
-    // tips : we can use a small max_summary_size
-    #[allow(clippy::too_many_arguments)]
-    async fn test_recover_summary_with_roll_0(
-        config: config::Config,
-        runtime: Arc<Runtime>,
-        summary_task_sender: Sender<SummaryTask>,
-        flush_task_sender: Sender<FlushReq>,
-        global_seq_task_sender: Sender<GlobalSequenceTask>,
-        compact_task_sender: Sender<CompactTask>,
-    ) {
-        let opt = Arc::new(Options::from(&config));
-        let empty_path = "";
-        let meta_manager: MetaRef =
-            RemoteMetaManager::new(config.clone(), empty_path.to_string()).await;
-
-        meta_manager.admin_meta().add_data_node().await.unwrap();
-        let _ = meta_manager
-            .tenant_manager()
-            .create_tenant("cnosdb".to_string(), TenantOptions::default())
-            .await;
-        let database = "test".to_string();
-        let summary_dir = opt.storage.summary_dir();
-        if !file_manager::try_exists(&summary_dir) {
-            std::fs::create_dir_all(&summary_dir).unwrap();
-        }
-        let memory_pool = Arc::new(GreedyMemoryPool::new(1024 * 1024 * 1024));
-        let global = Arc::new(GlobalContext::new());
-        let mut summary = Summary::new(
-            opt.clone(),
-            runtime.clone(),
-            memory_pool.clone(),
-            global_seq_task_sender.clone(),
-            Arc::new(MetricsRegister::default()),
-        )
-        .await
-        .unwrap();
-
-        let mut edits = vec![];
-        let db = summary
-            .version_set
-            .write()
-            .await
-            .create_db(
-                DatabaseSchema::new("cnosdb", &database),
-                meta_manager.clone(),
-                memory_pool.clone(),
-            )
-            .await
-            .unwrap();
-        for i in 0..40 {
-            db.write()
-                .await
-                .add_tsfamily(
-                    i,
-                    0,
-                    None,
-                    summary_task_sender.clone(),
-                    flush_task_sender.clone(),
-                    compact_task_sender.clone(),
-                    global.clone(),
+            runtime_clone.block_on(async {
+                let meta_manager = AdminMeta::new(config.clone()).await;
+                meta_manager.add_data_node().await.unwrap();
+                let _ = meta_manager
+                    .create_tenant("cnosdb".to_string(), TenantOptions::default())
+                    .await;
+                let tskv = TsKv::open(
+                    meta_manager.clone(),
+                    options,
+                    runtime.clone(),
+                    memory_pool.clone(),
+                    Arc::new(MetricsRegister::default()),
                 )
                 .await
-                .expect("add tsfamily successfully");
-            let edit = VersionEdit::new_add_vnode(i, make_owner("cnosdb", &database), 0);
-            edits.push(edit.clone());
+                .unwrap();
+
+                Self {
+                    tskv,
+                    config,
+                    runtime,
+                    meta_manager,
+                    memory_pool,
+                    _test_case_name: test_case_name,
+                }
+            })
         }
 
-        for _ in 0..100 {
-            for i in 0..20 {
-                db.write()
-                    .await
-                    .del_tsfamily(i, summary_task_sender.clone())
-                    .await;
-                edits.push(VersionEdit::new_del_vnode(i));
-            }
+        fn with_default_config(base_dir: String, test_case_name: String) -> Self {
+            let mut config = config::tskv::get_config_for_test();
+            config.storage.path = base_dir;
+            Self::new(config, test_case_name)
         }
-        summary
-            .apply_version_edit(edits, HashMap::new(), HashMap::new())
-            .await
-            .unwrap();
-
-        let summary = Summary::recover(
-            meta_manager.clone(),
-            opt.clone(),
-            runtime,
-            memory_pool.clone(),
-            flush_task_sender.clone(),
-            global_seq_task_sender.clone(),
-            compact_task_sender,
-            false,
-            Arc::new(MetricsRegister::default()),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(summary.version_set.read().await.tsf_num().await, 20);
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn test_recover_summary_with_roll_1(
-        config: config::Config,
-        runtime: Arc<Runtime>,
-        summary_task_sender: Sender<SummaryTask>,
-        flush_task_sender: Sender<FlushReq>,
-        global_seq_task_sender: Sender<GlobalSequenceTask>,
-        compact_task_sender: Sender<CompactTask>,
-    ) {
-        let memory_pool = Arc::new(GreedyMemoryPool::new(1024 * 1024 * 1024));
-
-        let opt = Arc::new(Options::from(&config));
-        let empty_path = "";
-        let meta_manager: MetaRef =
-            RemoteMetaManager::new(config.clone(), empty_path.to_string()).await;
-
-        meta_manager.admin_meta().add_data_node().await.unwrap();
-
-        let _ = meta_manager
-            .tenant_manager()
-            .create_tenant("cnosdb".to_string(), TenantOptions::default())
-            .await;
-        let database = "test".to_string();
-        let summary_dir = opt.storage.summary_dir();
-        if !file_manager::try_exists(&summary_dir) {
-            std::fs::create_dir_all(&summary_dir).unwrap();
+    pub fn kill_process(process_name: &str) {
+        println!("- Killing processes {process_name}...");
+        let system = System::new_with_specifics(
+            RefreshKind::new().with_processes(ProcessRefreshKind::new()),
+        );
+        for (pid, process) in system.processes() {
+            if process.name() == process_name {
+                match process.kill_with(sysinfo::Signal::Kill) {
+                    Some(true) => println!("- Killed process {pid} ('{}')", process.name()),
+                    Some(false) => {
+                        println!("- Failed killing process {pid} ('{}')", process.name())
+                    }
+                    None => println!("- Kill with signal 'Kill' isn't supported on this platform"),
+                }
+            }
         }
-        let mut summary = Summary::new(
-            opt.clone(),
-            runtime.clone(),
-            memory_pool.clone(),
-            global_seq_task_sender.clone(),
-            Arc::new(MetricsRegister::default()),
-        )
-        .await
-        .unwrap();
+    }
 
-        let db = summary
-            .version_set
-            .write()
-            .await
-            .create_db(
-                DatabaseSchema::new("cnosdb", &database),
-                meta_manager.clone(),
-                memory_pool.clone(),
+    #[tokio::test]
+    async fn test_summary_recover_all() {
+        let temp_dir = tempfile::Builder::new().prefix("meta").tempdir().unwrap();
+        let path = temp_dir.path().to_string_lossy().to_string();
+        let cluster_name = "cluster_001".to_string();
+        let addr = "127.0.0.1:8901".to_string();
+        let size = 1024 * 1024 * 1024;
+        meta::service::single::start_singe_meta_server(path, cluster_name, addr, size).await;
+        let join_handle = tokio::spawn(async {
+            let _ = tokio::task::spawn_blocking(|| {
+                test_summary_recover();
+                test_tsf_num_recover();
+                test_recover_summary_with_roll_0();
+                test_recover_summary_with_roll_1();
+            })
+            .await;
+        });
+        join_handle.await.unwrap();
+        kill_process("cnosdb-meta");
+        temp_dir.close().unwrap();
+    }
+
+    fn test_summary_recover() {
+        println!("async run test_summary_recover.");
+        let base_dir = "/tmp/test/summary/test_summary_recover";
+        let _ = std::fs::remove_dir_all(base_dir);
+        std::fs::create_dir_all(base_dir).unwrap();
+        let test_helper = SummaryTestHelper::with_default_config(
+            base_dir.to_string(),
+            "test_summary_recover".to_string(),
+        );
+
+        let runtime = test_helper.runtime.clone();
+        let options = kv_option::Options::from(&test_helper.config);
+
+        test_helper.runtime.block_on(async move {
+            test_helper
+                .tskv
+                .open_tsfamily("cnosdb", "hello", 100)
+                .await
+                .expect("add tsfamily successfully");
+
+            let summary = Summary::recover(
+                test_helper.meta_manager.clone(),
+                Arc::new(options),
+                runtime,
+                test_helper.memory_pool.clone(),
+                Arc::new(MetricsRegister::default()),
             )
             .await
             .unwrap();
-        let cxt = Arc::new(GlobalContext::new());
-        db.write()
-            .await
-            .add_tsfamily(
-                10,
-                0,
-                None,
-                summary_task_sender.clone(),
-                flush_task_sender.clone(),
-                compact_task_sender.clone(),
-                cxt.clone(),
+
+            let version_set = summary.version_set.read().await;
+            let all_db_names: Vec<String> = version_set.get_all_db().keys().cloned().collect();
+            assert_eq!(all_db_names, vec!["cnosdb.hello".to_string()]);
+            let db = version_set.get_all_db().get("cnosdb.hello").unwrap();
+            let vnode_ids: Vec<TseriesFamilyId> =
+                db.read().await.ts_families().keys().cloned().collect();
+            assert_eq!(vnode_ids, vec![100]);
+        });
+    }
+
+    fn test_tsf_num_recover() {
+        println!("async run test_tsf_num_recover.");
+        let base_dir = "/tmp/test/summary/test_tsf_num_recover";
+        let _ = std::fs::remove_dir_all(base_dir);
+        std::fs::create_dir_all(base_dir).unwrap();
+        let test_helper = SummaryTestHelper::with_default_config(
+            base_dir.to_string(),
+            "test_tsf_num_recover".to_string(),
+        );
+
+        let runtime_clone = test_helper.runtime.clone();
+        let options = Arc::new(kv_option::Options::from(&test_helper.config));
+
+        runtime_clone.block_on(async move {
+            test_helper
+                .tskv
+                .open_tsfamily("cnosdb", "test_tsf_num_recover", 100)
+                .await
+                .expect("add tsfamily successfully");
+
+            let summary = Summary::recover(
+                test_helper.meta_manager.clone(),
+                options.clone(),
+                test_helper.runtime.clone(),
+                test_helper.memory_pool.clone(),
+                Arc::new(MetricsRegister::default()),
             )
             .await
-            .expect("add tsfamily failed");
+            .unwrap();
 
-        let mut edits = vec![];
-        let edit = VersionEdit::new_add_vnode(10, "cnosdb.hello".to_string(), 0);
-        edits.push(edit);
+            assert_eq!(summary.version_set.read().await.tsf_num().await, 1);
 
-        for _ in 0..100 {
-            db.write()
+            test_helper
+                .tskv
+                .remove_tsfamily("cnosdb", "test_tsf_num_recover", 100)
                 .await
-                .del_tsfamily(0, summary_task_sender.clone())
-                .await;
-            let edit = VersionEdit::new_del_vnode(0);
-            edits.push(edit);
-        }
+                .unwrap();
 
-        {
-            let vs = summary.version_set.write().await;
-            let tsf = vs.get_tsfamily_by_tf_id(10).await.unwrap();
-            let mut version = tsf.read().await.version().copy_apply_version_edits(
-                edits.clone(),
-                &mut HashMap::new(),
-                None,
-            );
-            let tsm_reader_cache = Arc::downgrade(&version.tsm_reader_cache);
+            let summary = Summary::recover(
+                test_helper.meta_manager.clone(),
+                options.clone(),
+                test_helper.runtime.clone(),
+                test_helper.memory_pool.clone(),
+                Arc::new(MetricsRegister::default()),
+            )
+            .await
+            .unwrap();
 
-            summary.ctx.set_last_seq(1);
-            let mut edit = VersionEdit::new(10);
+            assert_eq!(summary.version_set.read().await.tsf_num().await, 0);
+        });
+    }
+
+    fn test_recover_summary_with_roll_0() {
+        println!("async run test_recover_summary_with_roll_0.");
+        let base_dir = "/tmp/test/summary/test_recover_summary_with_roll_0";
+        let _ = std::fs::remove_dir_all(base_dir);
+        std::fs::create_dir_all(base_dir).unwrap();
+        let test_helper = SummaryTestHelper::with_default_config(
+            base_dir.to_string(),
+            "test_recover_summary_with_roll_0".to_string(),
+        );
+
+        let tenant = "cnosdb";
+        let database = "test_recover_summary_with_roll_0";
+        let options = Arc::new(kv_option::Options::from(&test_helper.config));
+
+        // Create database, add some vnodes then delete some vnodes.
+        test_helper.runtime.block_on(async {
+            for i in 0..20 {
+                test_helper
+                    .tskv
+                    .open_tsfamily(tenant, database, i)
+                    .await
+                    .expect("add tsfamily successfully");
+            }
+
+            for i in 0..10 {
+                test_helper
+                    .tskv
+                    .remove_tsfamily(tenant, database, i)
+                    .await
+                    .expect("add tsfamily successfully");
+            }
+
+            // Recover and compare.
+            let summary = Summary::recover(
+                test_helper.meta_manager.clone(),
+                options,
+                test_helper.runtime.clone(),
+                test_helper.memory_pool.clone(),
+                Arc::new(MetricsRegister::default()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(summary.version_set.read().await.tsf_num().await, 10);
+        });
+    }
+
+    fn test_recover_summary_with_roll_1() {
+        println!("async run test_recover_summary_with_roll_1.");
+        let base_dir = "/tmp/test/summary/test_recover_summary_with_roll_1";
+        let _ = std::fs::remove_dir_all(base_dir);
+        std::fs::create_dir_all(base_dir).unwrap();
+        let test_helper = SummaryTestHelper::with_default_config(
+            base_dir.to_string(),
+            "test_recover_summary_with_roll_1".to_string(),
+        );
+
+        const VNODE_ID: u32 = 10;
+        let tenant = "cnosdb";
+        let database = "test_recover_summary_with_roll_1";
+        let options = Arc::new(kv_option::Options::from(&test_helper.config));
+        let summary_task_sender = test_helper.tskv.context().summary_task_sender.clone();
+
+        // Create database, add some vnodes and delete some vnodes..
+        test_helper.runtime.block_on(async {
+            let vnode = test_helper
+                .tskv
+                .open_tsfamily(tenant, database, VNODE_ID)
+                .await
+                .expect("add tsfamily successfully");
+
+            // Go to the next version.
+            let version = vnode.ts_family().read().await.version();
+            let tsm_reader_cache = Arc::downgrade(version.tsm_reader_cache());
+
+            let owner = make_owner(tenant, database);
+            let mut edit = VersionEdit::new_update_vnode(VNODE_ID, owner, 100);
             let meta = CompactMeta {
                 file_id: 15,
                 is_delta: false,
@@ -1295,52 +990,50 @@ mod test {
                 level: 1,
                 min_ts: 1,
                 max_ts: 1,
-                tsf_id: 10,
-                high_seq: 1,
-                ..Default::default()
+                tsf_id: VNODE_ID,
             };
-            version.levels_info[1].push_compact_meta(
+
+            let mut version = version.inner();
+            version.levels_info_mut()[1].push_compact_meta(
                 &meta,
-                Arc::new(BloomFilter::default()),
+                RwLock::new(Some(Arc::new(BloomFilter::default()))),
                 tsm_reader_cache,
             );
-            tsf.write().await.new_version(version, None);
-            edit.add_file(meta, 1);
-            edits.push(edit);
-        }
 
-        summary
-            .apply_version_edit(edits, HashMap::new(), HashMap::new())
+            let version = Arc::new(version);
+            vnode.ts_family().write().await.new_version(version, None);
+            edit.add_file(meta, 1);
+
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            let task = SummaryTask::new(vnode.ts_family(), edit, None, None, sender);
+            summary_task_sender.send(task).await.unwrap();
+            let _ = receiver.await;
+
+            // Recover and compare.
+            let summary = Summary::recover(
+                test_helper.meta_manager.clone(),
+                options.clone(),
+                test_helper.runtime.clone(),
+                test_helper.memory_pool.clone(),
+                Arc::new(MetricsRegister::default()),
+            )
             .await
             .unwrap();
 
-        let summary = Summary::recover(
-            meta_manager,
-            opt,
-            runtime,
-            memory_pool.clone(),
-            flush_task_sender,
-            global_seq_task_sender,
-            compact_task_sender,
-            false,
-            Arc::new(MetricsRegister::default()),
-        )
-        .await
-        .unwrap();
-
-        let vs = summary.version_set.read().await;
-        let tsf = vs.get_tsfamily_by_tf_id(10).await.unwrap();
-        assert_eq!(tsf.read().await.version().last_seq, 1);
-        assert_eq!(tsf.read().await.version().levels_info[1].tsf_id, 10);
-        assert!(!tsf.read().await.version().levels_info[1].files[0].is_delta());
-        assert_eq!(
-            tsf.read().await.version().levels_info[1].files[0].file_id(),
-            15
-        );
-        assert_eq!(
-            tsf.read().await.version().levels_info[1].files[0].size(),
-            100
-        );
-        assert_eq!(summary.ctx.file_id(), 16);
+            let vs = summary.version_set.read().await;
+            let tsf = vs.get_tsfamily_by_tf_id(VNODE_ID).await.unwrap();
+            assert_eq!(tsf.read().await.version().last_seq(), 100);
+            assert_eq!(tsf.read().await.version().levels_info()[1].tsf_id, VNODE_ID);
+            assert!(!tsf.read().await.version().levels_info()[1].files[0].is_delta());
+            assert_eq!(
+                tsf.read().await.version().levels_info()[1].files[0].file_id(),
+                15
+            );
+            assert_eq!(
+                tsf.read().await.version().levels_info()[1].files[0].size(),
+                100
+            );
+            assert_eq!(summary.ctx.file_id(), 16);
+        });
     }
 }

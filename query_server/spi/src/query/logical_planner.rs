@@ -3,16 +3,15 @@ use std::io::Write;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use config::TenantLimiterConfig;
+use config::common::TenantLimiterConfig;
 use datafusion::arrow::array::ArrayRef;
-use datafusion::arrow::datatypes::{DataType, Schema, SchemaRef};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::datasource::file_format::file_type::{FileCompressionType, FileType};
-use datafusion::logical_expr::expr::AggregateFunction as AggregateFunctionExpr;
 use datafusion::logical_expr::type_coercion::aggregates::{
     DATES, NUMERICS, STRINGS, TIMES, TIMESTAMPS,
 };
 use datafusion::logical_expr::{
-    AggregateFunction, CreateExternalTable, LogicalPlan as DFPlan, ReturnTypeFunction, ScalarUDF,
+    expr, expr_fn, CreateExternalTable, LogicalPlan as DFPlan, ReturnTypeFunction, ScalarUDF,
     Signature, Volatility,
 };
 use datafusion::physical_plan::functions::make_scalar_function;
@@ -27,9 +26,9 @@ use models::meta_data::{NodeId, ReplicationSetId, VnodeId};
 use models::object_reference::ResolvedTable;
 use models::oid::{Identifier, Oid};
 use models::schema::{
-    DatabaseOptions, TableColumn, Tenant, TenantOptions, TenantOptionsBuilder, Watermark,
+    DatabaseOptions, Duration, TableColumn, Tenant, TenantOptions, TenantOptionsBuilder, Watermark,
 };
-use snafu::ResultExt;
+use snafu::{IntoError, ResultExt};
 use tempfile::NamedTempFile;
 
 use super::ast::{parse_bool_value, parse_char_value, parse_string_value, ExtStatement};
@@ -42,7 +41,13 @@ use super::datasource::UriSchema;
 use super::session::SessionCtx;
 use super::AFFECTED_ROWS;
 use crate::service::protocol::QueryId;
-use crate::{ParserSnafu, QueryError, Result};
+use crate::{
+    ParserSnafu, QueryError, QueryResult, SerdeJsonSnafu, StdIoSnafu, TenantOptionsBuildFailSnafu,
+};
+
+pub const TENANT_OPTION_LIMITER: &str = "_limiter";
+pub const TENANT_OPTION_COMMENT: &str = "comment";
+pub const TENANT_OPTION_DROP_AFTER: &str = "drop_after";
 
 lazy_static! {
     static ref TABLE_WRITE_UDF: Arc<ScalarUDF> = Arc::new(ScalarUDF::new(
@@ -54,6 +59,7 @@ lazy_static! {
                 .chain(TIMESTAMPS)
                 .chain(DATES)
                 .chain(TIMES)
+                // .chain(iter::once(str_dict_data_type()))
                 .cloned()
                 .collect::<Vec<_>>(),
             Volatility::Immutable
@@ -75,6 +81,8 @@ pub enum Plan {
     Query(QueryPlan),
     /// Query plan
     DDL(DDLPlan),
+    /// Ext DML plan
+    DML(DMLPlan),
     /// Query plan
     SYSTEM(SYSPlan),
 }
@@ -84,6 +92,7 @@ impl Plan {
         match self {
             Self::Query(p) => SchemaRef::from(p.df_plan.schema().as_ref()),
             Self::DDL(p) => p.schema(),
+            Self::DML(p) => p.schema(),
             Self::SYSTEM(p) => p.schema(),
         }
     }
@@ -124,10 +133,6 @@ pub enum DDLPlan {
 
     CreateRole(CreateRole),
 
-    DescribeTable(DescribeTable),
-
-    DescribeDatabase(DescribeDatabase),
-
     AlterDatabase(AlterDatabase),
 
     AlterTable(AlterTable),
@@ -147,11 +152,31 @@ pub enum DDLPlan {
     CompactVnode(CompactVnode),
 
     ChecksumGroup(ChecksumGroup),
+
+    RecoverDatabase(RecoverDatabase),
+
+    RecoverTenant(RecoverTenant),
+
+    ShowReplicas,
+
+    ReplicaDestory(ReplicaDestory),
+
+    ReplicaAdd(ReplicaAdd),
+
+    ReplicaRemove(ReplicaRemove),
+
+    ReplicaPromote(ReplicaPromote),
 }
 
 impl DDLPlan {
     pub fn schema(&self) -> SchemaRef {
-        Arc::new(Schema::empty())
+        match self {
+            DDLPlan::ChecksumGroup(_) => Arc::new(Schema::new(vec![
+                Field::new("vnode_id", DataType::UInt32, false),
+                Field::new("check_sum", DataType::Utf8, false),
+            ])),
+            _ => Arc::new(Schema::empty()),
+        }
     }
 }
 
@@ -183,8 +208,25 @@ pub struct DropVnode {
 }
 
 #[derive(Debug, Clone)]
+pub enum DMLPlan {
+    DeleteFromTable(DeleteFromTable),
+}
+
+impl DMLPlan {
+    pub fn schema(&self) -> SchemaRef {
+        Arc::new(Schema::empty())
+    }
+}
+
+/// TODO implement UserDefinedLogicalNodeCore
+#[derive(Debug, Clone)]
+pub struct DeleteFromTable {
+    pub table_name: ResolvedTable,
+    pub selection: Option<Expr>,
+}
+
+#[derive(Debug, Clone)]
 pub enum SYSPlan {
-    ShowQueries,
     KillQuery(QueryId),
 }
 
@@ -216,6 +258,7 @@ pub struct DropTenantObject {
     pub name: String,
     pub if_exist: bool,
     pub obj_type: TenantObjectType,
+    pub after: Option<Duration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,12 +272,32 @@ pub struct DropGlobalObject {
     pub name: String,
     pub if_exist: bool,
     pub obj_type: GlobalObjectType,
+    pub after: Option<Duration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GlobalObjectType {
     User,
     Tenant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoverTenant {
+    pub tenant_name: String,
+    pub if_exist: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoverDatabase {
+    pub tenant_name: String,
+    pub db_name: String,
+    pub if_exist: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoverTable {
+    pub table: ResolvedTable,
+    pub if_exist: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -283,32 +346,60 @@ pub struct CreateTenant {
     pub options: TenantOptions,
 }
 
+#[derive(Debug, Clone)]
+pub struct ReplicaDestory {
+    pub replica_id: ReplicationSetId,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReplicaAdd {
+    pub replica_id: ReplicationSetId,
+    pub node_id: NodeId,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReplicaRemove {
+    pub replica_id: ReplicationSetId,
+    pub node_id: NodeId,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReplicaPromote {
+    pub replica_id: ReplicationSetId,
+    pub node_id: NodeId,
+}
+
 pub fn unset_option_to_alter_tenant_action(
     tenant: Tenant,
     ident: Ident,
-) -> Result<(AlterTenantAction, Privilege<Oid>)> {
+) -> QueryResult<(AlterTenantAction, Privilege<Oid>)> {
     let tenant_id = *tenant.id();
     let mut tenant_options_builder = TenantOptionsBuilder::from(tenant.to_own_options());
 
     let privilege = match normalize_ident(&ident).as_str() {
-        "comment" => {
+        TENANT_OPTION_COMMENT => {
             tenant_options_builder.unset_comment();
             Privilege::Global(GlobalPrivilege::Tenant(Some(tenant_id)))
         }
-        "_limiter" => {
+        TENANT_OPTION_LIMITER => {
             tenant_options_builder.unset_limiter_config();
             Privilege::Global(GlobalPrivilege::System)
         }
+        TENANT_OPTION_DROP_AFTER => {
+            tenant_options_builder.unset_drop_after();
+            Privilege::Global(GlobalPrivilege::Tenant(Some(tenant_id)))
+        }
         _ => {
-            return Err(QueryError::Parser {
-                source: ParserError::ParserError(format!(
-                    "Expected option [comment], [limiter] found [{}]",
-                    ident
-                )),
-            })
+            let source = ParserError::ParserError(format!(
+                "Expected option [{TENANT_OPTION_COMMENT}], [{TENANT_OPTION_LIMITER}], [{TENANT_OPTION_DROP_AFTER}] found [{}]",
+                ident
+            ));
+            return Err(ParserSnafu.into_error(source));
         }
     };
-    let tenant_options = tenant_options_builder.build()?;
+    let tenant_options = tenant_options_builder
+        .build()
+        .context(TenantOptionsBuildFailSnafu)?;
 
     Ok((
         AlterTenantAction::SetOption(Box::new(tenant_options)),
@@ -325,52 +416,69 @@ pub fn sql_option_to_alter_tenant_action(
     let mut tenant_options_builder = TenantOptionsBuilder::from(tenant.to_own_options());
 
     let privilege = match normalize_ident(&name).as_str() {
-        "comment" => {
-            let value = parse_string_value(value)?;
+        TENANT_OPTION_COMMENT => {
+            let value = parse_string_value(value).context(ParserSnafu)?;
             tenant_options_builder.comment(value);
             Privilege::Global(GlobalPrivilege::Tenant(Some(tenant_id)))
         }
-        "_limiter" => {
+        TENANT_OPTION_LIMITER => {
             let config =
-                serde_json::from_str::<TenantLimiterConfig>(parse_string_value(value)?.as_str())
-                    .map_err(|_| ParserError::ParserError("limiter format error".to_string()))?;
+                serde_json::from_str::<TenantLimiterConfig>(parse_string_value(value).context(ParserSnafu)?.as_str())
+                    .map_err(|_| ParserError::ParserError("limiter format error".to_string())).context(ParserSnafu)?;
             tenant_options_builder.limiter_config(config);
             Privilege::Global(GlobalPrivilege::System)
+        }
+        TENANT_OPTION_DROP_AFTER => {
+            let drop_after_str = parse_string_value(value).context(ParserSnafu)?;
+            let drop_after = Duration::new(&drop_after_str).ok_or_else(|| QueryError::Parser {
+                source: ParserError::ParserError(format!("{} is not a valid duration", drop_after_str)),
+            })?;
+            tenant_options_builder.drop_after(drop_after);
+            Privilege::Global(GlobalPrivilege::Tenant(Some(tenant_id)))
         }
         _ => {
             return Err(QueryError::Parser {
                 source: ParserError::ParserError(format!(
-                    "Expected option [comment], [limiter] found [{}]",
-                    name
-                )),
+                "Expected option [{TENANT_OPTION_COMMENT}], [{TENANT_OPTION_LIMITER}], [{TENANT_OPTION_DROP_AFTER}] found [{}]",
+                name
+            )),
             })
         }
     };
-    let tenant_options = tenant_options_builder.build()?;
+    let tenant_options = tenant_options_builder
+        .build()
+        .context(TenantOptionsBuildFailSnafu)?;
     Ok((
         AlterTenantAction::SetOption(Box::new(tenant_options)),
         privilege,
     ))
 }
 
-pub fn sql_options_to_tenant_options(options: Vec<SqlOption>) -> Result<TenantOptions> {
+pub fn sql_options_to_tenant_options(options: Vec<SqlOption>) -> QueryResult<TenantOptions> {
     let mut builder = TenantOptionsBuilder::default();
 
     for SqlOption { ref name, value } in options {
         match normalize_ident(name).as_str() {
-            "comment" => {
+            TENANT_OPTION_COMMENT => {
                 builder.comment(parse_string_value(value).context(ParserSnafu)?);
             }
-            "_limiter" => {
+            TENANT_OPTION_LIMITER => {
                 let config = serde_json::from_str::<TenantLimiterConfig>(
                     parse_string_value(value).context(ParserSnafu)?.as_str(),
-                )?;
+                ).context(SerdeJsonSnafu)?;
                 builder.limiter_config(config);
+            }
+            TENANT_OPTION_DROP_AFTER => {
+                let drop_after_str = parse_string_value(value).context(ParserSnafu)?;
+                let drop_after = Duration::new(&drop_after_str).ok_or_else(|| QueryError::Parser {
+                    source: ParserError::ParserError(format!("{} is not a valid duration", drop_after_str)),
+                })?;
+                builder.drop_after(drop_after);
             }
             _ => {
                 return Err(QueryError::Parser {
                     source: ParserError::ParserError(format!(
-                        "Expected option [comment], [limiter] found [{}]",
+                        "Expected option [{TENANT_OPTION_COMMENT}], [{TENANT_OPTION_LIMITER}], [{TENANT_OPTION_DROP_AFTER}] found [{}]",
                         name
                     )),
                 })
@@ -392,13 +500,17 @@ pub struct CreateUser {
 
 pub fn sql_options_to_user_options(
     with_options: Vec<SqlOption>,
-) -> std::result::Result<UserOptions, ParserError> {
+) -> std::result::Result<(UserOptions, String), ParserError> {
+    let mut ret_str = String::new();
     let mut builder = UserOptionsBuilder::default();
 
     for SqlOption { ref name, value } in with_options {
         match normalize_ident(name).as_str() {
             "password" => {
-                builder.password(parse_string_value(value)?);
+                ret_str = parse_string_value(value)?;
+                builder
+                    .password(ret_str.clone())
+                    .map_err(|e| ParserError::ParserError(e.to_string()))?;
             }
             "must_change_password" => {
                 builder.must_change_password(parse_bool_value(value)?);
@@ -412,6 +524,9 @@ pub fn sql_options_to_user_options(
             "granted_admin" => {
                 builder.granted_admin(parse_bool_value(value)?);
             }
+            "hash_password" => {
+                builder.hash_password(parse_string_value(value)?);
+            }
             _ => {
                 return Err(ParserError::ParserError(format!(
                 "Expected option [password | rsa_public_key | comment | granted_admin], found [{}]",
@@ -421,9 +536,11 @@ pub fn sql_options_to_user_options(
         }
     }
 
-    builder
+    let option = builder
         .build()
-        .map_err(|e| ParserError::ParserError(e.to_string()))
+        .map_err(|e| ParserError::ParserError(e.to_string()))?;
+
+    Ok((option, ret_str))
 }
 
 #[derive(Debug, Clone)]
@@ -431,17 +548,7 @@ pub struct CreateRole {
     pub tenant_name: String,
     pub name: String,
     pub if_not_exists: bool,
-    pub inherit_tenant_role: SystemTenantRole,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DescribeDatabase {
-    pub database_name: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DescribeTable {
-    pub table_name: ResolvedTable,
+    pub inherit_tenant_role: Option<SystemTenantRole>,
 }
 
 #[derive(Debug, Clone)]
@@ -515,6 +622,10 @@ pub enum AlterTableAction {
     DropColumn {
         column_name: String,
     },
+    RenameColumn {
+        old_column_name: String,
+        new_column_name: String,
+    },
 }
 
 #[async_trait]
@@ -523,31 +634,23 @@ pub trait LogicalPlanner {
         &self,
         statement: ExtStatement,
         session: &SessionCtx,
-    ) -> Result<Plan>;
+        auth_enable: bool,
+    ) -> QueryResult<Plan>;
 }
 
 /// Additional output information
 pub fn affected_row_expr(args: Vec<Expr>) -> Expr {
-    Expr::ScalarUDF {
-        fun: TABLE_WRITE_UDF.clone(),
-        args,
-    }
-    .alias(AFFECTED_ROWS.0)
+    let udf = expr::ScalarUDF::new(TABLE_WRITE_UDF.clone(), args);
+
+    Expr::ScalarUDF(udf).alias(AFFECTED_ROWS.0)
 }
 
 pub fn merge_affected_row_expr() -> Expr {
-    // lit(ScalarValue::Null).alias("COUNT")
-    Expr::AggregateFunction(AggregateFunctionExpr {
-        fun: AggregateFunction::Sum,
-        args: vec![col(AFFECTED_ROWS.0)],
-        distinct: false,
-        filter: None,
-    })
-    .alias(AFFECTED_ROWS.0)
+    expr_fn::sum(col(AFFECTED_ROWS.0)).alias(AFFECTED_ROWS.0)
 }
 
 /// Normalize a SQL object name
-pub fn normalize_sql_object_name(sql_object_name: &ObjectName) -> String {
+pub fn normalize_sql_object_name_to_string(sql_object_name: &ObjectName) -> String {
     sql_object_name
         .0
         .iter()
@@ -583,7 +686,7 @@ impl CopyOptionsBuilder {
         for SqlOption { ref name, value } in options {
             match normalize_ident(name).as_str() {
                 "auto_infer_schema" => {
-                    self.auto_infer_schema = Some(parse_bool_value(value)?);
+                    self.auto_infer_schema = Some(parse_bool_value(value).context(ParserSnafu)?);
                 }
                 option => {
                     return Err(QueryError::Semantic {
@@ -620,7 +723,7 @@ pub struct FileFormatOptionsBuilder {
 }
 
 impl FileFormatOptionsBuilder {
-    fn parse_file_type(s: &str) -> Result<FileType> {
+    fn parse_file_type(s: &str) -> QueryResult<FileType> {
         let s = s.to_uppercase();
         match s.as_str() {
             "AVRO" => Ok(FileType::AVRO),
@@ -636,7 +739,7 @@ impl FileFormatOptionsBuilder {
         }
     }
 
-    fn parse_file_compression_type(s: &str) -> Result<FileCompressionType> {
+    fn parse_file_compression_type(s: &str) -> QueryResult<FileCompressionType> {
         let s = s.to_uppercase();
         match s.as_str() {
             "GZIP" | "GZ" => Ok(FileCompressionType::GZIP),
@@ -653,22 +756,41 @@ impl FileFormatOptionsBuilder {
 
     // 将sql options转换为受支持的参数
     // 执行值校验
-    pub fn apply_options(mut self, options: Vec<SqlOption>) -> Result<Self> {
+    pub fn apply_options(mut self, options: Vec<SqlOption>) -> QueryResult<Self> {
         for SqlOption { ref name, value } in options {
             match normalize_ident(name).as_str() {
                 "type" => {
-                    let file_type = Self::parse_file_type(&parse_string_value(value)?)?;
+                    let file_type =
+                        Self::parse_file_type(&parse_string_value(value).context(ParserSnafu)?)?;
                     self.file_type = Some(file_type);
                 }
                 "delimiter" => {
-                    self.delimiter = Some(parse_char_value(value)?);
+                    // only support csv
+                    if let Some(file_type) = &self.file_type {
+                        if *file_type != FileType::CSV {
+                            return Err(QueryError::Semantic {
+                                err: "delimiter and with_header fields are specific to CSV"
+                                    .to_string(),
+                            });
+                        }
+                    }
+                    self.delimiter = Some(parse_char_value(value).context(ParserSnafu)?);
                 }
                 "with_header" => {
-                    self.with_header = Some(parse_bool_value(value)?);
+                    if let Some(file_type) = &self.file_type {
+                        if *file_type != FileType::CSV {
+                            return Err(QueryError::Semantic {
+                                err: "delimiter and with_header fields are specific to CSV"
+                                    .to_string(),
+                            });
+                        }
+                    }
+                    self.with_header = Some(parse_bool_value(value).context(ParserSnafu)?);
                 }
                 "file_compression_type" => {
-                    let file_compression_type =
-                        Self::parse_file_compression_type(&parse_string_value(value)?)?;
+                    let file_compression_type = Self::parse_file_compression_type(
+                        &parse_string_value(value).context(ParserSnafu)?,
+                    )?;
                     self.file_compression_type = Some(file_compression_type);
                 }
                 option => {
@@ -709,7 +831,7 @@ pub fn parse_connection_options(
     url: &UriSchema,
     bucket: Option<&str>,
     options: Vec<SqlOption>,
-) -> Result<ConnectionOptions> {
+) -> QueryResult<ConnectionOptions> {
     let parsed_options = match (url, bucket) {
         (UriSchema::S3, Some(bucket)) => ConnectionOptions::S3(parse_s3_options(bucket, options)?),
         (UriSchema::Gcs, Some(bucket)) => {
@@ -735,7 +857,7 @@ pub fn parse_connection_options(
 }
 
 /// s3://<bucket>/<path>
-fn parse_s3_options(bucket: &str, options: Vec<SqlOption>) -> Result<S3StorageConfig> {
+fn parse_s3_options(bucket: &str, options: Vec<SqlOption>) -> QueryResult<S3StorageConfig> {
     let mut builder = S3StorageConfigBuilder::default();
 
     builder.bucket(bucket);
@@ -743,22 +865,22 @@ fn parse_s3_options(bucket: &str, options: Vec<SqlOption>) -> Result<S3StorageCo
     for SqlOption { ref name, value } in options {
         match normalize_ident(name).as_str() {
             "endpoint_url" => {
-                builder.endpoint_url(parse_string_value(value)?);
+                builder.endpoint_url(parse_string_value(value).context(ParserSnafu)?);
             }
             "region" => {
-                builder.region(parse_string_value(value)?);
+                builder.region(parse_string_value(value).context(ParserSnafu)?);
             }
             "access_key_id" => {
-                builder.access_key_id(parse_string_value(value)?);
+                builder.access_key_id(parse_string_value(value).context(ParserSnafu)?);
             }
             "secret_key" => {
-                builder.secret_access_key(parse_string_value(value)?);
+                builder.secret_access_key(parse_string_value(value).context(ParserSnafu)?);
             }
             "token" => {
-                builder.security_token(parse_string_value(value)?);
+                builder.security_token(parse_string_value(value).context(ParserSnafu)?);
             }
             "virtual_hosted_style" => {
-                builder.virtual_hosted_style_request(parse_bool_value(value)?);
+                builder.virtual_hosted_style_request(parse_bool_value(value).context(ParserSnafu)?);
             }
             _ => {
                 return Err(QueryError::Semantic {
@@ -774,22 +896,22 @@ fn parse_s3_options(bucket: &str, options: Vec<SqlOption>) -> Result<S3StorageCo
 }
 
 /// gcs://<bucket>/<path>
-fn parse_gcs_options(bucket: &str, options: Vec<SqlOption>) -> Result<GcsStorageConfig> {
+fn parse_gcs_options(bucket: &str, options: Vec<SqlOption>) -> QueryResult<GcsStorageConfig> {
     let mut sac_builder = ServiceAccountCredentialsBuilder::default();
 
     for SqlOption { ref name, value } in options {
         match normalize_ident(name).as_str() {
             "gcs_base_url" => {
-                sac_builder.gcs_base_url(parse_string_value(value)?);
+                sac_builder.gcs_base_url(parse_string_value(value).context(ParserSnafu)?);
             }
             "disable_oauth" => {
-                sac_builder.disable_oauth(parse_bool_value(value)?);
+                sac_builder.disable_oauth(parse_bool_value(value).context(ParserSnafu)?);
             }
             "client_email" => {
-                sac_builder.client_email(parse_string_value(value)?);
+                sac_builder.client_email(parse_string_value(value).context(ParserSnafu)?);
             }
             "private_key" => {
-                sac_builder.private_key(parse_string_value(value)?);
+                sac_builder.private_key(parse_string_value(value).context(ParserSnafu)?);
             }
             _ => {
                 return Err(QueryError::Semantic {
@@ -802,7 +924,7 @@ fn parse_gcs_options(bucket: &str, options: Vec<SqlOption>) -> Result<GcsStorage
     let sac = sac_builder.build().map_err(|err| QueryError::Semantic {
         err: err.to_string(),
     })?;
-    let mut temp = NamedTempFile::new()?;
+    let mut temp = NamedTempFile::new().context(StdIoSnafu)?;
     write_tmp_service_account_file(sac, &mut temp)?;
 
     Ok(GcsStorageConfig {
@@ -813,23 +935,23 @@ fn parse_gcs_options(bucket: &str, options: Vec<SqlOption>) -> Result<GcsStorage
 
 /// https://<account>.blob.core.windows.net/<container>[/<path>]
 /// azblob://<container>/<path>
-fn parse_azure_options(bucket: &str, options: Vec<SqlOption>) -> Result<AzblobStorageConfig> {
+fn parse_azure_options(bucket: &str, options: Vec<SqlOption>) -> QueryResult<AzblobStorageConfig> {
     let mut builder = AzblobStorageConfigBuilder::default();
     builder.container_name(bucket);
 
     for SqlOption { ref name, value } in options {
         match normalize_ident(name).as_str() {
             "account" => {
-                builder.account_name(parse_string_value(value)?);
+                builder.account_name(parse_string_value(value).context(ParserSnafu)?);
             }
             "access_key" => {
-                builder.access_key(parse_string_value(value)?);
+                builder.access_key(parse_string_value(value).context(ParserSnafu)?);
             }
             "bearer_token" => {
-                builder.bearer_token(parse_string_value(value)?);
+                builder.bearer_token(parse_string_value(value).context(ParserSnafu)?);
             }
             "use_emulator" => {
-                builder.use_emulator(parse_bool_value(value)?);
+                builder.use_emulator(parse_bool_value(value).context(ParserSnafu)?);
             }
             _ => {
                 return Err(QueryError::Semantic {
@@ -847,10 +969,10 @@ fn parse_azure_options(bucket: &str, options: Vec<SqlOption>) -> Result<AzblobSt
 fn write_tmp_service_account_file(
     sac: ServiceAccountCredentials,
     tmp: &mut NamedTempFile,
-) -> Result<()> {
-    let body = serde_json::to_vec(&sac)?;
-    let _ = tmp.write(&body)?;
-    tmp.flush()?;
+) -> QueryResult<()> {
+    let body = serde_json::to_vec(&sac).context(SerdeJsonSnafu)?;
+    let _ = tmp.write(&body).context(StdIoSnafu)?;
+    tmp.flush().context(StdIoSnafu)?;
 
     Ok(())
 }

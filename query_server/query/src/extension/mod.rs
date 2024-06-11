@@ -12,6 +12,7 @@ pub mod expr;
 pub mod logical;
 pub mod physical;
 pub mod utils;
+pub mod variable;
 
 const EVENT_TIME_COLUMN: &str = "event_time_column";
 const WATERMARK_DELAY_MS: &str = "watermark_delay";
@@ -61,7 +62,6 @@ mod tests {
     use datafusion::arrow::error::ArrowError;
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::common::Result;
-    use datafusion::from_slice::FromSlice;
     use datafusion::physical_plan::RecordBatchStream;
     use futures::{Stream, TryStreamExt};
 
@@ -78,8 +78,8 @@ mod tests {
         RecordBatch::try_new(
             test_custom_schema_ref(),
             vec![
-                Arc::new(Int32Array::from_slice([1, 10, 10, 100])),
-                Arc::new(Int32Array::from_slice([2, 12, 12, 120])),
+                Arc::new(Int32Array::from(vec![1, 10, 10, 100])),
+                Arc::new(Int32Array::from(vec![2, 12, 12, 120])),
             ],
         )
     }

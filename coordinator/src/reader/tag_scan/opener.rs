@@ -1,30 +1,27 @@
-use std::sync::Arc;
-use std::time::Duration;
-
-use config::QueryConfig;
+use config::tskv::QueryConfig;
+use futures::TryStreamExt;
 use meta::model::MetaRef;
 use models::meta_data::VnodeInfo;
-use protos::kv_service::tskv_service_client::TskvServiceClient;
-use tonic::transport::Channel;
-use tower::timeout::Timeout;
-use trace::{SpanContext, SpanExt, SpanRecorder};
-use trace_http::ctx::append_trace_context;
-use tskv::query_iterator::QueryOption;
+use protos::{tskv_service_time_out_client, DEFAULT_GRPC_SERVER_MESSAGE_LEN};
+use snafu::{IntoError, ResultExt};
+use trace::http::http_ctx::grpc_append_trace_context;
+use trace::span_ext::SpanExt;
+use trace::{Span, SpanContext};
+use tskv::reader::tag_scan::LocalTskvTagScanStream;
+use tskv::reader::QueryOption;
 use tskv::EngineRef;
 
-use super::local::LocalTskvTagScanStream;
-use crate::errors::{CoordinatorError, CoordinatorResult};
-use crate::reader::table_scan::remote::TonicRecordBatchDecoder;
+use crate::errors::{CommonSnafu, CoordinatorError, CoordinatorResult, ModelsSnafu, TskvSnafu};
+use crate::reader::deserialize::TonicRecordBatchDecoder;
 use crate::reader::{VnodeOpenFuture, VnodeOpener};
-use crate::service::CoordServiceMetrics;
 use crate::SendableCoordinatorRecordBatchStream;
 
 pub struct TemporaryTagScanOpener {
     config: QueryConfig,
     kv_inst: Option<EngineRef>,
     meta: MetaRef,
-    coord_metrics: Arc<CoordServiceMetrics>,
     span_ctx: Option<SpanContext>,
+    grpc_enable_gzip: bool,
 }
 
 impl TemporaryTagScanOpener {
@@ -32,15 +29,15 @@ impl TemporaryTagScanOpener {
         config: QueryConfig,
         kv_inst: Option<EngineRef>,
         meta: MetaRef,
-        coord_metrics: Arc<CoordServiceMetrics>,
         span_ctx: Option<&SpanContext>,
+        grpc_enable_gzip: bool,
     ) -> Self {
         Self {
             config,
             kv_inst,
             meta,
-            coord_metrics,
             span_ctx: span_ctx.cloned(),
+            grpc_enable_gzip,
         }
     }
 }
@@ -51,20 +48,15 @@ impl VnodeOpener for TemporaryTagScanOpener {
         let vnode_id = vnode.id;
         let curren_nodet_id = self.meta.node_id();
         let kv_inst = self.kv_inst.clone();
-        let coord_metrics = self.coord_metrics.clone();
         let option = option.clone();
-        let admin_meta = self.meta.admin_meta();
+        let admin_meta = self.meta.clone();
         let config = self.config.clone();
-        let span_ctx = self.span_ctx.clone();
+        let span_ctx = self.span_ctx;
+        let grpc_enable_gzip = self.grpc_enable_gzip;
 
         let future = async move {
             // TODO 请求路由的过程应该由通信框架决定，客户端只关心业务逻辑（请求目标和请求内容）
             if node_id == curren_nodet_id {
-                let data_out = coord_metrics.data_out(
-                    option.table_schema.tenant.as_str(),
-                    option.table_schema.db.as_str(),
-                );
-
                 // 路由到进程内的引擎
                 let kv_inst = kv_inst.ok_or(CoordinatorError::KvInstanceNotFound { node_id })?;
                 // TODO U64Counter
@@ -72,11 +64,12 @@ impl VnodeOpener for TemporaryTagScanOpener {
                     vnode_id,
                     option,
                     kv_inst,
-                    data_out,
-                    SpanRecorder::new(
-                        span_ctx.child_span(format!("LocalTskvTagScanStream ({vnode_id})")),
+                    Span::from_context(
+                        format!("LocalTskvTagScanStream ({vnode_id})"),
+                        span_ctx.as_ref(),
                     ),
-                );
+                )
+                .map_err(|e| TskvSnafu.into_error(e));
                 Ok(Box::pin(stream) as SendableCoordinatorRecordBatchStream)
             } else {
                 // 路由到远程的引擎
@@ -84,29 +77,32 @@ impl VnodeOpener for TemporaryTagScanOpener {
                     let vnode_ids = vec![vnode_id];
                     let req = option
                         .to_query_record_batch_request(vnode_ids)
-                        .map_err(CoordinatorError::from)?;
+                        .context(ModelsSnafu)?;
                     tonic::Request::new(req)
                 };
 
-                append_trace_context(span_ctx, request.metadata_mut()).map_err(|_| {
-                    CoordinatorError::CommonError {
-                        msg: "Parse trace_id, this maybe a bug".to_string(),
-                    }
-                })?;
+                grpc_append_trace_context(span_ctx.as_ref(), request.metadata_mut()).map_err(
+                    |_| {
+                        CommonSnafu {
+                            msg: "Parse trace_id, this maybe a bug".to_string(),
+                        }
+                        .build()
+                    },
+                )?;
 
                 let resp_stream = {
-                    let channel = admin_meta
-                        .get_node_conn(node_id)
-                        .await
-                        .map_err(|_| CoordinatorError::FailoverNode { id: node_id })?;
-                    let timeout_channel =
-                        Timeout::new(channel, Duration::from_millis(config.read_timeout_ms));
-                    let mut client = TskvServiceClient::<Timeout<Channel>>::new(timeout_channel);
-                    client
-                        .tag_scan(request)
-                        .await
-                        .map_err(|_| CoordinatorError::FailoverNode { id: node_id })?
-                        .into_inner()
+                    let channel = admin_meta.get_node_conn(node_id).await.map_err(|error| {
+                        CoordinatorError::PreExecution {
+                            error: error.to_string(),
+                        }
+                    })?;
+                    let mut client = tskv_service_time_out_client(
+                        channel,
+                        config.read_timeout,
+                        DEFAULT_GRPC_SERVER_MESSAGE_LEN,
+                        grpc_enable_gzip,
+                    );
+                    client.tag_scan(request).await?.into_inner()
                 };
 
                 Ok(Box::pin(TonicRecordBatchDecoder::new(resp_stream))

@@ -1,10 +1,9 @@
 use std::fmt::Display;
 
 use models::auth::user::User;
-use models::oid::{uuid_u64, Identifier};
+use models::oid::uuid_u64;
 use models::schema::{DEFAULT_CATALOG, DEFAULT_DATABASE, DEFAULT_PRECISION};
 use serde::{Deserialize, Serialize};
-use trace::{SpanRecorder, SpanRecorderExt};
 
 use crate::query::config::StreamTriggerInterval;
 use crate::query::execution::Output;
@@ -67,7 +66,7 @@ pub struct Context {
     // user info
     // security certification info
     // ...
-    user_info: User,
+    user: User,
     tenant: String,
     database: String,
     precision: String,
@@ -88,8 +87,8 @@ impl Context {
         &self.precision
     }
 
-    pub fn user_info(&self) -> &User {
-        &self.user_info
+    pub fn user(&self) -> &User {
+        &self.user
     }
 
     pub fn session_config(&self) -> &CnosSessionConfig {
@@ -100,19 +99,8 @@ impl Context {
     }
 }
 
-impl SpanRecorderExt for Context {
-    fn record(&self, span_recorder: &mut SpanRecorder) {
-        if span_recorder.span().is_some() {
-            span_recorder.set_metadata("user", self.user_info().desc().name());
-            span_recorder.set_metadata("tenant", self.tenant());
-            span_recorder.set_metadata("database", self.database());
-            span_recorder.set_metadata("chunked", self.chunked());
-        }
-    }
-}
-
 pub struct ContextBuilder {
-    user_info: User,
+    user: User,
     tenant: String,
     database: String,
     precision: String,
@@ -121,9 +109,9 @@ pub struct ContextBuilder {
 }
 
 impl ContextBuilder {
-    pub fn new(user_info: User) -> Self {
+    pub fn new(user: User) -> Self {
         Self {
-            user_info,
+            user,
             precision: DEFAULT_PRECISION.to_string(),
             tenant: DEFAULT_CATALOG.to_string(),
             database: DEFAULT_DATABASE.to_string(),
@@ -178,7 +166,7 @@ impl ContextBuilder {
 
     pub fn build(self) -> Context {
         Context {
-            user_info: self.user_info,
+            user: self.user,
             tenant: self.tenant,
             database: self.database,
             precision: self.precision,
@@ -206,14 +194,6 @@ impl Query {
 
     pub fn content(&self) -> &str {
         self.content.as_str()
-    }
-}
-
-impl SpanRecorderExt for Query {
-    fn record(&self, span_recorder: &mut SpanRecorder) {
-        if span_recorder.span().is_some() {
-            self.context().record(span_recorder);
-        }
     }
 }
 

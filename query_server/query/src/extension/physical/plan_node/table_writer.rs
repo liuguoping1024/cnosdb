@@ -55,6 +55,10 @@ impl TableWriterExec {
             schema,
         }
     }
+
+    pub fn sink_schema(&self) -> SchemaRef {
+        self.record_batch_sink_provider.schema()
+    }
 }
 
 impl Debug for TableWriterExec {
@@ -142,6 +146,20 @@ impl ExecutionPlan for TableWriterExec {
         match t {
             DisplayFormatType::Default => {
                 write!(f, "TableWriterExec: [{}]", self.table,)
+            }
+            DisplayFormatType::Verbose => {
+                let schemas = self
+                    .schema
+                    .fields()
+                    .iter()
+                    .map(|e| e.name().to_string())
+                    .collect::<Vec<_>>();
+                write!(
+                    f,
+                    "TableWriterExec: [{}], output=[{}]",
+                    self.table,
+                    schemas.join(",")
+                )
             }
         }
     }

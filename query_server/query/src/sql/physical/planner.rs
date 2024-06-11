@@ -13,19 +13,24 @@ use datafusion::physical_optimizer::repartition::Repartition;
 use datafusion::physical_optimizer::sort_enforcement::EnforceSorting;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
-use datafusion::physical_plan::planner::{
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_planner::{
     DefaultPhysicalPlanner as DFDefaultPhysicalPlanner, ExtensionPlanner,
+    PhysicalPlanner as DFPhysicalPlanner,
 };
-use datafusion::physical_plan::{ExecutionPlan, PhysicalPlanner as DFPhysicalPlanner};
 use spi::query::physical_planner::PhysicalPlanner;
 use spi::query::session::SessionCtx;
-use spi::Result;
+use spi::QueryResult;
 
 use super::optimizer::PhysicalOptimizer;
+use crate::extension::physical::optimizer_rule::add_assert::AddAssertExec;
+use crate::extension::physical::optimizer_rule::add_sort::AddSortExec;
 use crate::extension::physical::transform_rule::expand::ExpandPlanner;
 use crate::extension::physical::transform_rule::gapfill::GapFillPlanner;
 use crate::extension::physical::transform_rule::table_writer::TableWriterPlanner;
 use crate::extension::physical::transform_rule::tag_scan::TagScanPlanner;
+use crate::extension::physical::transform_rule::ts_gen_func::TsGenFuncPlanner;
+use crate::extension::physical::transform_rule::update_tag::UpdateTagValuePlanner;
 
 pub struct DefaultPhysicalPlanner {
     ext_physical_transform_rules: Vec<Arc<dyn ExtensionPlanner + Send + Sync>>,
@@ -59,9 +64,11 @@ impl Default for DefaultPhysicalPlanner {
     fn default() -> Self {
         let ext_physical_transform_rules: Vec<Arc<dyn ExtensionPlanner + Send + Sync>> = vec![
             Arc::new(TableWriterPlanner {}),
+            Arc::new(UpdateTagValuePlanner {}),
             Arc::new(TagScanPlanner {}),
             Arc::new(ExpandPlanner::new()),
             Arc::new(GapFillPlanner::new()),
+            Arc::new(TsGenFuncPlanner),
         ];
 
         // We need to take care of the rule ordering. They may influence each other.
@@ -109,6 +116,9 @@ impl Default for DefaultPhysicalPlanner {
             // diagnostic error message when this happens. It makes no changes to the
             // given query plan; i.e. it only acts as a final gatekeeping rule.
             Arc::new(PipelineChecker::new()),
+            // CnosDB
+            Arc::new(AddAssertExec::new()),
+            Arc::new(AddSortExec::new()),
         ];
 
         Self {
@@ -124,11 +134,11 @@ impl PhysicalPlanner for DefaultPhysicalPlanner {
         &self,
         logical_plan: &LogicalPlan,
         session: &SessionCtx,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
+    ) -> QueryResult<Arc<dyn ExecutionPlan>> {
         // 将扩展的物理计划优化规则注入df 的 session state
         let new_state = session
             .inner()
-            .state()
+            .clone()
             .with_physical_optimizer_rules(self.ext_physical_optimizer_rules.clone());
 
         // 通过扩展的物理计划转换规则构造df 的 Physical Planner
@@ -153,7 +163,7 @@ impl PhysicalOptimizer for DefaultPhysicalPlanner {
         &self,
         plan: Arc<dyn ExecutionPlan>,
         _session: &SessionCtx,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
+    ) -> QueryResult<Arc<dyn ExecutionPlan>> {
         let partition_count = plan.output_partitioning().partition_count();
 
         let merged_plan = if partition_count > 1 {

@@ -1,235 +1,112 @@
-use std::collections::BTreeMap;
+use std::cmp::{max, min};
+use std::collections::{BTreeMap, HashMap};
 use std::io::IoSlice;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use models::{FieldId, Timestamp};
-use snafu::{ResultExt, Snafu};
+use models::predicate::domain::TimeRange;
+use models::schema::TskvTableSchemaRef;
+use models::{SeriesId, SeriesKey};
+use snafu::{OptionExt, ResultExt};
 use utils::BloomFilter;
 
-use super::EncodedDataBlock;
-use crate::error::{self, Error, Result};
-use crate::file_system::file::cursor::FileCursor;
-use crate::file_system::file::IFile;
-use crate::file_system::file_manager;
-use crate::file_utils;
-use crate::tsm::{
-    BlockEntry, BlockMeta, DataBlock, IndexEntry, BLOCK_META_SIZE, BLOOM_FILTER_BITS,
-    INDEX_META_SIZE,
-};
+use crate::compaction::CompactingBlock;
+use crate::error::{CommonSnafu, IOSnafu};
+use crate::file_system::async_filesystem::{LocalFileSystem, LocalFileType};
+use crate::file_system::file::stream_writer::FileStreamWriter;
+use crate::file_system::FileSystem;
+use crate::file_utils::{make_delta_file, make_tsm_file};
+use crate::tsm::chunk::{Chunk, ChunkStatics, ChunkWriteSpec};
+use crate::tsm::chunk_group::{ChunkGroup, ChunkGroupMeta, ChunkGroupWriteSpec};
+use crate::tsm::column_group::ColumnGroup;
+use crate::tsm::data_block::DataBlock;
+use crate::tsm::footer::{Footer, SeriesMeta, TableMeta, TsmVersion};
+use crate::tsm::page::{Page, PageWriteSpec};
+use crate::tsm::{ColumnGroupID, TsmWriteData, BLOOM_FILTER_BITS};
+use crate::{TskvError, TskvResult};
 
-// A TSM file is composed for four sections: header, blocks, index and the footer.
-//
-// ┌────────┬────────────────────────────────────┬─────────────┬──────────────┐
-// │ Header │               Blocks               │    Index    │    Footer    │
-// │5 bytes │              N bytes               │   N bytes   │   8 bytes    │
-// └────────┴────────────────────────────────────┴─────────────┴──────────────┘
-//
-// ┌───────────────────┐
-// │      Header       │
-// ├─────────┬─────────┤
-// │  Magic  │ Version │
-// │ 4 bytes │ 1 byte  │
-// └─────────┴─────────┘
-//
-// ┌───────────────────────────────────────┐
-// │               Blocks                  │
-// ├───────────────────┬───────────────────┤
-// │                Block                  │
-// ├─────────┬─────────┼─────────┬─────────┼
-// │  CRC    │ ts      │  CRC    │  value  │
-// │ 4 bytes │ N bytes │ 4 bytes │ N bytes │
-// └─────────┴─────────┴─────────┴─────────┴
-//
-// ┌───────────────────────────────────────────────────────────────────────────────┐
-// │                               Index                                           │
-// ├─────────┬──────┬───────┬─────────┬─────────┬────────┬────────┬────────┬───────┤
-// │ fieldId │ Type │ Count │Min Time │Max Time │ count  │ Offset │  Size  │Valoff │
-// │ 8 bytes │1 byte│2 bytes│ 8 bytes │ 8 bytes │4 bytes │8 bytes │8 bytes │8 bytes│
-// └─────────┴──────┴───────┴─────────┴─────────┴────────┴────────┴────────┴───────┘
-//
-// ┌─────────────────────────┐
-// │ Footer                  │
-// ├───────────────┬─────────┤
-// │ Bloom Filter  │Index Ofs│
-// │ 8 bytes       │ 8 bytes │
-// └───────────────┴─────────┘
-
-const HEADER_LEN: u64 = 5;
-const TSM_MAGIC: [u8; 4] = 0x01346613_u32.to_be_bytes();
-const VERSION: [u8; 1] = [1];
-
-pub type WriteTsmResult<T, E = WriteTsmError> = std::result::Result<T, E>;
-
-#[derive(Snafu, Debug)]
-#[snafu(visibility(pub))]
-pub enum WriteTsmError {
-    #[snafu(display("IO error: {source}"))]
-    IO { source: std::io::Error },
-
-    #[snafu(display("Encode error: {source}"))]
-    Encode {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display(
-        "File size ({cur_size} B) exceed max_file_size ({max_size} B) after write {write_size} B"
-    ))]
-    MaxFileSizeExceed {
-        cur_size: u64,
-        max_size: u64,
-        write_size: usize,
-    },
-
-    #[snafu(display("Writing to finished tsm writer '{}'", path.display()))]
-    Finished { path: PathBuf },
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum State {
+    Initialised,
+    Started,
+    Finished,
 }
 
-impl From<WriteTsmError> for Error {
-    fn from(wtr: WriteTsmError) -> Self {
-        Error::WriteTsm { source: wtr }
-    }
-}
-
-struct IndexBuf {
-    index_offset: u64,
-    buf: BTreeMap<FieldId, IndexEntry>,
-    bloom_filter: BloomFilter,
-}
-
-impl IndexBuf {
-    pub fn new() -> Self {
-        Self {
-            index_offset: 0,
-            buf: BTreeMap::new(),
-            bloom_filter: BloomFilter::new(BLOOM_FILTER_BITS),
-        }
-    }
-
-    pub fn set_index_offset(&mut self, index_offset: u64) {
-        self.index_offset = index_offset;
-    }
-
-    pub fn insert_block_meta(&mut self, ie: IndexEntry, be: BlockEntry) {
-        let fid = ie.field_id;
-        let idx = self.buf.entry(fid).or_insert(ie);
-        idx.blocks.push(be);
-        self.bloom_filter.insert(&fid.to_be_bytes()[..]);
-    }
-
-    pub async fn write_to(&self, writer: &mut FileCursor) -> WriteTsmResult<usize> {
-        let mut size = 0_usize;
-
-        let mut buf = vec![0_u8; BLOCK_META_SIZE];
-        for (_, idx) in self.buf.iter() {
-            idx.encode(&mut buf[..INDEX_META_SIZE])?;
-            writer
-                .write(&buf[..INDEX_META_SIZE])
-                .await
-                .context(IOSnafu)?;
-            size += INDEX_META_SIZE;
-            for blk in idx.blocks.iter() {
-                blk.encode(&mut buf);
-                writer.write(&buf[..]).await.context(IOSnafu)?;
-                size += BLOCK_META_SIZE;
-            }
-        }
-
-        Ok(size)
-    }
-}
-
-/// TSM file writer.
-///
-/// # Examples
-/// ```ignore
-/// let path = "/tmp/tsm_writer/test_write.tsm";
-/// let file = file_manager::create_file(path);
-/// // Create a new TSM file, write header.
-/// let mut writer = TsmWriter::open(file).unwrap();
-/// // Write blocks.
-/// writer.write_block(1, &DataBlock::I64{ ts: vec![1], val: vec![1] }).unwrap();
-/// // Write index and footer.
-/// writer.write_index().unwrap();
-/// // Sync to disk.
-/// writer.flush().unwrap();
-/// ```
+const TSM_MAGIC: [u8; 4] = 0x12CDA16_u32.to_be_bytes();
+const TSM_BUFFER_SIZE: usize = 16 * 1024 * 1024;
 pub struct TsmWriter {
-    tmp_path: PathBuf,
-    final_path: PathBuf,
-    finished: bool,
-
-    writer: FileCursor,
-    /// Store tsm sequence for debug
-    sequence: u64,
-    /// Store is_delta for debug
-    is_delta: bool,
-    /// Store min_ts for version edit
-    min_ts: Timestamp,
-    /// Store max_ts for version edit
-    max_ts: Timestamp,
+    file_id: u64,
+    min_ts: i64,
+    max_ts: i64,
     size: u64,
     max_size: u64,
-    index_buf: IndexBuf,
+    path: PathBuf,
+
+    series_bloom_filter: BloomFilter,
+    // todo: table object id bloom filter
+    // table_bloom_filter: BloomFilter,
+    writer: Box<FileStreamWriter>,
+    table_schemas: HashMap<String, TskvTableSchemaRef>,
+
+    /// <table < series, Chunk>>
+    page_specs: BTreeMap<String, BTreeMap<SeriesId, Chunk>>,
+    /// <table, ChunkGroup>
+    chunk_specs: BTreeMap<String, ChunkGroup>,
+    /// [ChunkGroupWriteSpec]
+    chunk_group_specs: ChunkGroupMeta,
+    footer: Footer,
+    state: State,
 }
 
+//MutableRecordBatch
 impl TsmWriter {
     pub async fn open(
-        path: impl AsRef<Path>,
-        sequence: u64,
-        is_delta: bool,
+        path_buf: &impl AsRef<Path>,
+        file_id: u64,
         max_size: u64,
-    ) -> Result<Self> {
-        let final_path: PathBuf = path.as_ref().into();
-        let mut tmp_path_str = final_path.as_os_str().to_os_string();
-        tmp_path_str.push(".tmp");
-        let tmp_path = PathBuf::from(tmp_path_str);
-
-        let writer = file_manager::create_file(&tmp_path).await?.into();
-        let mut w = Self {
-            tmp_path,
-            final_path,
-            finished: false,
-            writer,
-            sequence,
-            is_delta,
-            min_ts: Timestamp::MAX,
-            max_ts: Timestamp::MIN,
+        is_delta: bool,
+    ) -> TskvResult<Self> {
+        let file_path = if is_delta {
+            make_delta_file(path_buf, file_id)
+        } else {
+            make_tsm_file(path_buf, file_id)
+        };
+        let file_system = LocalFileSystem::new(LocalFileType::ThreadPool);
+        let file = file_system
+            .open_file_writer(&file_path, TSM_BUFFER_SIZE)
+            .await
+            .map_err(|e| TskvError::FileSystemError { source: e })?;
+        let writer = Self::new(file_path, file, file_id, max_size);
+        Ok(writer)
+    }
+    fn new(path: PathBuf, writer: Box<FileStreamWriter>, file_id: u64, max_size: u64) -> Self {
+        Self {
+            file_id,
+            max_ts: i64::MIN,
+            min_ts: i64::MAX,
             size: 0,
             max_size,
-            index_buf: IndexBuf::new(),
-        };
-        write_header_to(&mut w.writer)
-            .await
-            .context(error::WriteTsmSnafu)
-            .map(|s| w.size = s as u64)?;
-        Ok(w)
-    }
-
-    pub fn finished(&self) -> bool {
-        self.finished
-    }
-
-    pub fn path(&self) -> PathBuf {
-        if self.finished {
-            self.final_path.clone()
-        } else {
-            self.tmp_path.clone()
+            path,
+            series_bloom_filter: BloomFilter::new(BLOOM_FILTER_BITS),
+            writer,
+            table_schemas: Default::default(),
+            page_specs: Default::default(),
+            chunk_specs: Default::default(),
+            chunk_group_specs: Default::default(),
+            footer: Footer::empty(TsmVersion::V1),
+            state: State::Initialised,
         }
     }
 
-    pub fn sequence(&self) -> u64 {
-        self.sequence
+    pub fn file_id(&self) -> u64 {
+        self.file_id
     }
 
-    pub fn is_delta(&self) -> bool {
-        self.is_delta
-    }
-
-    pub fn min_ts(&self) -> Timestamp {
+    pub fn min_ts(&self) -> i64 {
         self.min_ts
     }
 
-    pub fn max_ts(&self) -> Timestamp {
+    pub fn max_ts(&self) -> i64 {
         self.max_ts
     }
 
@@ -237,379 +114,535 @@ impl TsmWriter {
         self.size
     }
 
-    /// Write a DataBlock to tsm file. If the max_size is greater than 0,
-    /// then check if the current size exceeded, if so return Err(MaxFileSizeExceed).
-    pub async fn write_block(
-        &mut self,
-        field_id: FieldId,
-        block: &DataBlock,
-    ) -> WriteTsmResult<usize> {
-        if self.finished {
-            return Err(WriteTsmError::Finished {
-                path: self.final_path.clone(),
-            });
-        }
-        if let Some((min_ts, max_ts)) = block.time_range() {
-            self.min_ts = self.min_ts.min(min_ts);
-            self.max_ts = self.max_ts.max(max_ts);
-        }
+    pub fn path(&self) -> &Path {
+        self.path.as_path()
+    }
 
-        let size = write_block_to(&mut self.writer, &mut self.index_buf, field_id, block).await?;
+    pub fn series_bloom_filter(&self) -> &BloomFilter {
+        &self.series_bloom_filter
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.state == State::Finished
+    }
+
+    pub async fn write_header(&mut self) -> TskvResult<usize> {
+        let size = self
+            .writer
+            .write_vec([IoSlice::new(TSM_MAGIC.as_slice())].as_mut_slice())
+            .await
+            .context(IOSnafu)?;
+        self.state = State::Started;
         self.size += size as u64;
-        if self.max_size > 0 && self.size >= self.max_size {
-            Err(WriteTsmError::MaxFileSizeExceed {
-                max_size: self.max_size,
-                cur_size: self.size,
-                write_size: size,
-            })
-        } else {
-            Ok(size)
-        }
+        Ok(size)
     }
 
-    /// Write a EncodedDataBlock to tsm file. If the max_size is greater than 0,
-    /// then check if the current size exceeded, if so return Err(MaxFileSizeExceed).
-    pub async fn write_encoded_block(
-        &mut self,
-        field_id: FieldId,
-        block: &EncodedDataBlock,
-    ) -> WriteTsmResult<usize> {
-        if self.finished {
-            return Err(WriteTsmError::Finished {
-                path: self.final_path.clone(),
-            });
-        }
-        if let Some(time_range) = block.time_range {
-            self.min_ts = self.min_ts.min(time_range.min_ts);
-            self.max_ts = self.max_ts.max(time_range.max_ts);
-        }
-
-        let size =
-            write_encoded_block_to(&mut self.writer, &mut self.index_buf, field_id, block).await?;
+    /// todo: write footer
+    pub async fn write_footer(&mut self) -> TskvResult<usize> {
+        let buf = self.footer.serialize()?;
+        let size = self.writer.write(&buf).await.context(IOSnafu)?;
         self.size += size as u64;
-        if self.max_size > 0 && self.size >= self.max_size {
-            Err(WriteTsmError::MaxFileSizeExceed {
-                max_size: self.max_size,
-                cur_size: self.size,
-                write_size: size,
-            })
-        } else {
-            Ok(size)
-        }
+        Ok(size)
     }
 
-    /// Write a u8 slice to tsm file. If the max_size is greater than 0,
-    /// then check if the current size exceeded, if so return Err(MaxFileSizeExceed).
-    pub async fn write_raw(
-        &mut self,
-        block_meta: &BlockMeta,
-        block: &[u8],
-    ) -> WriteTsmResult<usize> {
-        if self.finished {
-            return Err(WriteTsmError::Finished {
-                path: self.final_path.clone(),
-            });
+    pub async fn write_chunk_group(&mut self) -> TskvResult<()> {
+        for (table, group) in &self.chunk_specs {
+            let chunk_group_offset = self.writer.len() as u64;
+            let buf = group.serialize()?;
+            let chunk_group_size = self.writer.write(&buf).await.context(IOSnafu)? as u64;
+            self.size += chunk_group_size;
+            let chunk_group_spec = ChunkGroupWriteSpec {
+                table_schema: self.table_schemas.get(table).unwrap().clone(),
+                chunk_group_offset,
+                chunk_group_size,
+                time_range: group.time_range(),
+                // The number of chunks in the group.
+                count: 0,
+            };
+            self.chunk_group_specs.push(chunk_group_spec);
         }
-        self.min_ts = self.min_ts.min(block_meta.min_ts());
-        self.max_ts = self.max_ts.max(block_meta.max_ts());
-
-        let size =
-            write_raw_data_to(&mut self.writer, &mut self.index_buf, block_meta, block).await?;
-        self.size += size as u64;
-        if self.max_size > 0 && self.size >= self.max_size {
-            Err(WriteTsmError::MaxFileSizeExceed {
-                max_size: self.max_size,
-                cur_size: self.size,
-                write_size: size,
-            })
-        } else {
-            Ok(size)
-        }
-    }
-
-    pub async fn write_index(&mut self) -> WriteTsmResult<usize> {
-        if self.finished {
-            return Err(WriteTsmError::Finished {
-                path: self.final_path.clone(),
-            });
-        }
-
-        self.index_buf.set_index_offset(self.writer.pos());
-        let len1 = self.index_buf.write_to(&mut self.writer).await?;
-        let len2 = write_footer_to(
-            &mut self.writer,
-            &self.index_buf.bloom_filter,
-            self.index_buf.index_offset,
-        )
-        .await?;
-
-        Ok(len1 + len2)
-    }
-
-    pub async fn finish(&mut self) -> WriteTsmResult<()> {
-        if self.finished {
-            return Err(WriteTsmError::Finished {
-                path: self.final_path.clone(),
-            });
-        }
-        self.writer.sync_data().await.context(IOSnafu)?;
-        std::fs::rename(&self.tmp_path, &self.final_path).context(IOSnafu)?;
-        self.finished = true;
         Ok(())
     }
 
-    /// Get a cloned `BloomFilter` from currently buffered index data.
-    pub fn bloom_filter_cloned(&self) -> BloomFilter {
-        self.index_buf.bloom_filter.clone()
-    }
-}
-
-pub async fn new_tsm_writer(
-    dir: impl AsRef<Path>,
-    tsm_sequence: u64,
-    is_delta: bool,
-    max_size: u64,
-) -> Result<TsmWriter> {
-    let tsm_path = if is_delta {
-        file_utils::make_delta_file_name(dir, tsm_sequence)
-    } else {
-        file_utils::make_tsm_file_name(dir, tsm_sequence)
-    };
-    TsmWriter::open(tsm_path, tsm_sequence, is_delta, max_size).await
-}
-
-pub async fn write_header_to(writer: &mut FileCursor) -> WriteTsmResult<usize> {
-    let size = writer
-        .write_vec(
-            [
-                IoSlice::new(TSM_MAGIC.as_slice()),
-                IoSlice::new(VERSION.as_slice()),
-            ]
-            .as_mut_slice(),
-        )
-        .await
-        .context(IOSnafu)?;
-
-    Ok(size)
-}
-
-async fn write_raw_data_to(
-    writer: &mut FileCursor,
-    index_buf: &mut IndexBuf,
-    block_meta: &BlockMeta,
-    block: &[u8],
-) -> WriteTsmResult<usize> {
-    let mut size = 0_usize;
-    let offset = writer.pos();
-    writer
-        .write(block)
-        .await
-        .map(|s| {
-            size += s;
-        })
-        .context(IOSnafu)?;
-
-    index_buf.insert_block_meta(
-        IndexEntry {
-            field_id: block_meta.field_id(),
-            field_type: block_meta.field_type(),
-            blocks: vec![],
-        },
-        BlockEntry::with_block_meta(block_meta, offset, block.len() as u64),
-    );
-
-    Ok(size)
-}
-
-async fn write_block_to(
-    writer: &mut FileCursor,
-    index_buf: &mut IndexBuf,
-    field_id: FieldId,
-    block: &DataBlock,
-) -> WriteTsmResult<usize> {
-    if block.is_empty() {
-        return Ok(0);
+    pub async fn write_chunk_group_specs(&mut self, series: SeriesMeta) -> TskvResult<()> {
+        let chunk_group_specs_offset = self.writer.len() as u64;
+        let buf = self.chunk_group_specs.serialize()?;
+        let chunk_group_specs_size = self.writer.write(&buf).await.context(IOSnafu)?;
+        self.size += chunk_group_specs_size as u64;
+        let time_range = self.chunk_group_specs.time_range();
+        self.footer.set_time_range(time_range);
+        self.footer.set_table_meta(TableMeta::new(
+            chunk_group_specs_offset,
+            chunk_group_specs_size as u64,
+        ));
+        self.footer.set_series(series);
+        Ok(())
     }
 
-    let offset = writer.pos();
-
-    // TODO Make encoding result streamable
-    let (ts_buf, data_buf) = block
-        .encode(0, block.len(), block.encodings())
-        .context(EncodeSnafu)?;
-
-    let size = writer
-        .write_vec(
-            [
-                IoSlice::new(crc32fast::hash(&ts_buf).to_be_bytes().as_slice()),
-                IoSlice::new(&ts_buf),
-                IoSlice::new(crc32fast::hash(&data_buf).to_be_bytes().as_slice()),
-                IoSlice::new(&data_buf),
-            ]
-            .as_mut_slice(),
-        )
-        .await
-        .context(IOSnafu)?;
-
-    index_buf.insert_block_meta(
-        IndexEntry {
-            field_id,
-            field_type: block.field_type(),
-            blocks: vec![],
-        },
-        BlockEntry::with_block(block, offset, size as u64, ts_buf.len() as u64)
-            .expect("data_block is not empty"),
-    );
-
-    Ok(size)
-}
-
-async fn write_encoded_block_to(
-    writer: &mut FileCursor,
-    index_buf: &mut IndexBuf,
-    field_id: FieldId,
-    block: &EncodedDataBlock,
-) -> WriteTsmResult<usize> {
-    if block.count == 0 || block.ts.is_empty() {
-        return Ok(0);
+    pub async fn write_chunk(&mut self) -> TskvResult<SeriesMeta> {
+        let chunk_offset = self.writer.len() as u64;
+        for (table, group) in &self.page_specs {
+            for (series, chunk) in group {
+                let chunk_offset = self.writer.len() as u64;
+                let buf = chunk.serialize()?;
+                let chunk_size = self.writer.write(&buf).await.context(IOSnafu)? as u64;
+                self.size += chunk_size;
+                let time_range = chunk.time_range();
+                self.min_ts = min(self.min_ts, time_range.min_ts);
+                self.max_ts = max(self.max_ts, time_range.max_ts);
+                let chunk_spec = ChunkWriteSpec::new(
+                    *series,
+                    chunk_offset,
+                    chunk_size,
+                    ChunkStatics::new(*time_range),
+                );
+                self.chunk_specs
+                    .entry(table.clone())
+                    .or_default()
+                    .push(chunk_spec);
+                self.series_bloom_filter.insert(&series.to_be_bytes());
+            }
+        }
+        let chunk_size = self.writer.len() as u64 - chunk_offset;
+        let series = SeriesMeta::new(
+            self.series_bloom_filter.bytes().to_vec(),
+            chunk_offset,
+            chunk_size,
+        );
+        Ok(series)
+    }
+    pub async fn write_data(&mut self, groups: TsmWriteData) -> TskvResult<()> {
+        // write page data
+        for (_, group) in groups {
+            for (series, (series_buf, datablock)) in group {
+                self.write_datablock(series, series_buf, datablock).await?;
+            }
+        }
+        Ok(())
     }
 
-    let offset = writer.pos();
-    let size = writer
-        .write_vec(
-            [
-                IoSlice::new(crc32fast::hash(&block.ts).to_be_bytes().as_slice()),
-                IoSlice::new(&block.ts),
-                IoSlice::new(crc32fast::hash(&block.val).to_be_bytes().as_slice()),
-                IoSlice::new(&block.val),
-            ]
-            .as_mut_slice(),
-        )
-        .await
-        .context(IOSnafu)?;
+    fn create_column_group(
+        &mut self,
+        schema: TskvTableSchemaRef,
+        series_id: SeriesId,
+        series_key: &SeriesKey,
+    ) -> ColumnGroup {
+        let chunks = self.page_specs.entry(schema.name.clone()).or_default();
+        let chunk = chunks.entry(series_id).or_insert(Chunk::new(
+            schema.name.clone(),
+            series_id,
+            series_key.clone(),
+        ));
 
-    let time_range = block.time_range.expect("EncodedDataBlock is not empty");
+        ColumnGroup::new(chunk.next_column_group_id())
+    }
 
-    index_buf.insert_block_meta(
-        IndexEntry {
-            field_id,
-            field_type: block.field_type,
-            blocks: vec![],
-        },
-        BlockEntry {
-            min_ts: time_range.min_ts,
-            max_ts: time_range.max_ts,
-            count: block.count,
-            offset,
-            size: size as u64,
-            // Encoded timestamps block need a 4-byte crc checksum together.
-            val_offset: offset + block.ts.len() as u64 + 4,
-        },
-    );
+    pub async fn write_datablock(
+        &mut self,
+        series_id: SeriesId,
+        series_key: SeriesKey,
+        datablock: DataBlock,
+    ) -> TskvResult<()> {
+        if self.state == State::Finished {
+            return Err(CommonSnafu {
+                reason: "TsmWriter has been finished".to_string(),
+            }
+            .build());
+        }
 
-    Ok(size)
-}
+        let time_range = datablock.time_range()?;
+        let schema = datablock.schema().clone();
+        let pages = datablock.block_to_page()?;
 
-async fn write_footer_to(
-    writer: &mut FileCursor,
-    bloom_filter: &BloomFilter,
-    index_offset: u64,
-) -> WriteTsmResult<usize> {
-    let size = writer
-        .write_vec(
-            [
-                IoSlice::new(bloom_filter.bytes()),
-                IoSlice::new(index_offset.to_be_bytes().as_slice()),
-            ]
-            .as_mut_slice(),
-        )
-        .await
-        .context(IOSnafu)?;
-    Ok(size)
+        self.write_pages(schema, series_id, series_key, pages, time_range)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn write_pages(
+        &mut self,
+        schema: TskvTableSchemaRef,
+        series_id: SeriesId,
+        series_key: SeriesKey,
+        pages: Vec<Page>,
+        time_range: TimeRange,
+    ) -> TskvResult<()> {
+        if self.state == State::Initialised {
+            self.write_header().await?;
+        }
+
+        let mut column_group = self.create_column_group(schema.clone(), series_id, &series_key);
+
+        let table = schema.name.clone();
+        for page in pages {
+            let offset = self.writer.len() as u64;
+            let size = self.writer.write(&page.bytes).await.context(IOSnafu)?;
+            self.size += size as u64;
+            let spec = PageWriteSpec {
+                offset,
+                size: size as u64,
+                meta: page.meta,
+            };
+            column_group.push(spec);
+            self.table_schemas.insert(table.clone(), schema.clone());
+        }
+        column_group.time_range_merge(&time_range);
+        self.page_specs
+            .entry(table.clone())
+            .or_default()
+            .entry(series_id)
+            .or_insert(Chunk::new(schema.name.clone(), series_id, series_key))
+            .push(column_group.into())?;
+        Ok(())
+    }
+
+    pub async fn write_raw(
+        &mut self,
+        schema: TskvTableSchemaRef,
+        meta: Arc<Chunk>,
+        column_group_id: ColumnGroupID,
+        raw: Vec<u8>,
+    ) -> TskvResult<()> {
+        if self.state == State::Initialised {
+            self.write_header().await?;
+        }
+
+        let mut new_column_group =
+            self.create_column_group(schema.clone(), meta.series_id(), meta.series_key());
+
+        let mut offset = self.writer.len() as u64;
+        let size = self.writer.write(&raw).await.context(IOSnafu)?;
+        self.size += size as u64;
+
+        let table = schema.name.to_string();
+        let column_group = meta
+            .column_group()
+            .get(&column_group_id)
+            .context(CommonSnafu {
+                reason: format!("column group not found: {}", column_group_id),
+            })?;
+        for spec in column_group.pages() {
+            let spec = PageWriteSpec {
+                offset,
+                size: spec.size,
+                meta: spec.meta.clone(),
+            };
+            offset += spec.size;
+            new_column_group.push(spec);
+            self.table_schemas.insert(table.clone(), schema.clone());
+        }
+        new_column_group.time_range_merge(column_group.time_range());
+        let series_id = meta.series_id();
+        let series_key = meta.series_key().clone();
+        self.page_specs
+            .entry(table.clone())
+            .or_default()
+            .entry(series_id)
+            .or_insert(Chunk::new(table, series_id, series_key))
+            .push(new_column_group.into())?;
+
+        Ok(())
+    }
+
+    pub async fn write_compacting_block(
+        &mut self,
+        compacting_block: CompactingBlock,
+    ) -> TskvResult<()> {
+        match compacting_block {
+            CompactingBlock::Decoded {
+                data_block,
+                series_id,
+                series_key,
+                ..
+            } => {
+                self.write_datablock(series_id, series_key, data_block)
+                    .await?
+            }
+            CompactingBlock::Encoded {
+                table_schema,
+                series_id,
+                series_key,
+                time_range,
+                data_block,
+                ..
+            } => {
+                self.write_pages(table_schema, series_id, series_key, data_block, time_range)
+                    .await?
+            }
+            CompactingBlock::Raw {
+                table_schema,
+                meta,
+                column_group_id,
+                raw,
+                ..
+            } => {
+                self.write_raw(table_schema, meta, column_group_id, raw)
+                    .await?
+            }
+        }
+
+        if self.max_size != 0 && self.size > self.max_size {
+            self.finish().await?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn finish(&mut self) -> TskvResult<()> {
+        let series_meta = self.write_chunk().await?;
+        self.write_chunk_group().await?;
+        self.write_chunk_group_specs(series_meta).await?;
+        self.write_footer().await?;
+        self.writer.flush().await.context(IOSnafu)?;
+        self.state = State::Finished;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
-pub mod tsm_writer_tests {
-    use std::collections::HashMap;
-    use std::path::Path;
+mod test {
+    use std::path::PathBuf;
+    use std::sync::Arc;
 
-    use models::FieldId;
-    use snafu::ResultExt;
+    use arrow::datatypes::TimeUnit;
+    use models::codec::Encoding;
+    use models::field_value::FieldVal;
+    use models::predicate::domain::TimeRange;
+    use models::schema::{ColumnType, TableColumn, TskvTableSchema};
+    use models::{SeriesKey, ValueType};
 
-    use crate::error::{self, Result};
-    use crate::file_system::file_manager::{self};
-    use crate::file_utils::{self, make_tsm_file_name};
-    use crate::tsm::codec::DataBlockEncoding;
-    use crate::tsm::tsm_reader_tests::read_and_check;
-    use crate::tsm::{DataBlock, TsmReader, TsmWriter};
+    use crate::tsm::data_block::MutableColumn;
+    use crate::tsm::reader::{decode_pages, TsmReader};
+    use crate::tsm::writer::{DataBlock, TsmWriter};
 
-    const TEST_PATH: &str = "/tmp/test/tsm_writer";
-
-    pub async fn write_to_tsm(
-        path: impl AsRef<Path>,
-        data: &HashMap<FieldId, Vec<DataBlock>>,
-    ) -> Result<()> {
-        let tsm_seq = file_utils::get_tsm_file_id_by_path(&path)?;
-        let path = path.as_ref();
-        let dir = path.parent().unwrap();
-        if !file_manager::try_exists(dir) {
-            std::fs::create_dir_all(dir).context(super::IOSnafu)?;
+    fn i64_column(data: Vec<i64>) -> MutableColumn {
+        let mut col = MutableColumn::empty(TableColumn::new(
+            1,
+            "f1".to_string(),
+            ColumnType::Field(ValueType::Integer),
+            Encoding::default(),
+        ))
+        .unwrap();
+        for datum in data {
+            col.push(Some(FieldVal::Integer(datum))).unwrap()
         }
-        let mut writer = TsmWriter::open(path, tsm_seq, false, 0).await?;
-        for (fid, blks) in data.iter() {
-            for blk in blks.iter() {
-                writer
-                    .write_block(*fid, blk)
-                    .await
-                    .context(error::WriteTsmSnafu)?;
-            }
+        col
+    }
+
+    fn ts_column(data: Vec<i64>) -> MutableColumn {
+        let mut col = MutableColumn::empty(TableColumn::new(
+            0,
+            "time".to_string(),
+            ColumnType::Time(TimeUnit::Nanosecond),
+            Encoding::default(),
+        ))
+        .unwrap();
+        for datum in data {
+            col.push(Some(FieldVal::Integer(datum))).unwrap()
         }
-        writer.write_index().await.context(error::WriteTsmSnafu)?;
-        writer.finish().await.context(error::WriteTsmSnafu)
+        col
     }
 
     #[tokio::test]
-    async fn test_tsm_write_fast() {
-        #[rustfmt::skip]
-        let data: HashMap<FieldId, Vec<DataBlock>> = HashMap::from([
-            (1, vec![DataBlock::U64 { ts: vec![2, 3, 4], val: vec![12, 13, 15], enc: DataBlockEncoding::default() }]),
-            (2, vec![DataBlock::U64 { ts: vec![2, 3, 4], val: vec![101, 102, 103], enc: DataBlockEncoding::default() }]),
-        ]);
+    async fn test_write_and_read() {
+        let schema = TskvTableSchema::new(
+            "cnosdb".to_string(),
+            "public".to_string(),
+            "test0".to_string(),
+            vec![
+                TableColumn::new(
+                    0,
+                    "time".to_string(),
+                    ColumnType::Time(TimeUnit::Nanosecond),
+                    Encoding::default(),
+                ),
+                TableColumn::new(
+                    1,
+                    "f1".to_string(),
+                    ColumnType::Field(ValueType::Integer),
+                    Encoding::default(),
+                ),
+                TableColumn::new(
+                    2,
+                    "f2".to_string(),
+                    ColumnType::Field(ValueType::Integer),
+                    Encoding::default(),
+                ),
+                TableColumn::new(
+                    3,
+                    "f3".to_string(),
+                    ColumnType::Field(ValueType::Integer),
+                    Encoding::default(),
+                ),
+            ],
+        );
+        let schema = Arc::new(schema);
+        let data1 = DataBlock::new(
+            schema.clone(),
+            ts_column(vec![1, 2, 3]),
+            vec![
+                i64_column(vec![1, 2, 3]),
+                i64_column(vec![1, 2, 3]),
+                i64_column(vec![1, 2, 3]),
+            ],
+        );
 
-        let tsm_file = make_tsm_file_name(TEST_PATH, 0);
-        write_to_tsm(&tsm_file, &data).await.unwrap();
-
-        let reader = TsmReader::open(tsm_file).await.unwrap();
-        read_and_check(&reader, &data).await.unwrap();
+        let path = "/tmp/test/tsm";
+        let mut tsm_writer = TsmWriter::open(&PathBuf::from(path), 1, 0, false)
+            .await
+            .unwrap();
+        let time_range = data1.time_range().unwrap();
+        let schema = data1.schema();
+        let pages1 = data1.block_to_page().unwrap();
+        tsm_writer
+            .write_pages(schema, 1, SeriesKey::default(), pages1, time_range)
+            .await
+            .unwrap();
+        tsm_writer.finish().await.unwrap();
+        let tsm_reader = TsmReader::open(tsm_writer.path).await.unwrap();
+        let pages2 = tsm_reader.read_series_pages(1, 0).await.unwrap();
+        let data2 = decode_pages(pages2, data1.schema()).unwrap();
+        assert_eq!(data1, data2);
+        let time_range = data2.time_range().unwrap();
+        assert_eq!(time_range, TimeRange::new(1, 3));
     }
 
     #[tokio::test]
-    async fn test_tsm_write_1() {
-        let mut ts_1: Vec<i64> = Vec::new();
-        let mut val_1: Vec<i64> = Vec::new();
-        for i in 1..1001 {
-            ts_1.push(i as i64);
-            val_1.push(i as i64);
+    async fn test_write_and_read_2() {
+        let schema = TskvTableSchema::new(
+            "cnosdb".to_string(),
+            "public".to_string(),
+            "test0".to_string(),
+            vec![
+                TableColumn::new(
+                    0,
+                    "time".to_string(),
+                    ColumnType::Time(TimeUnit::Nanosecond),
+                    Encoding::default(),
+                ),
+                TableColumn::new(
+                    1,
+                    "f1".to_string(),
+                    ColumnType::Field(ValueType::Integer),
+                    Encoding::default(),
+                ),
+                TableColumn::new(
+                    2,
+                    "f2".to_string(),
+                    ColumnType::Field(ValueType::Integer),
+                    Encoding::default(),
+                ),
+                TableColumn::new(
+                    3,
+                    "f3".to_string(),
+                    ColumnType::Field(ValueType::Integer),
+                    Encoding::default(),
+                ),
+            ],
+        );
+        let schema = Arc::new(schema);
+        let data1 = DataBlock::new(
+            schema.clone(),
+            ts_column(vec![1, 2, 3]),
+            vec![
+                i64_column(vec![1, 2, 3]),
+                i64_column(vec![1, 2, 3]),
+                i64_column(vec![1, 2, 3]),
+            ],
+        );
+
+        let path = "/tmp/test/tsm2";
+        let mut tsm_writer = TsmWriter::open(&PathBuf::from(path), 1, 0, false)
+            .await
+            .unwrap();
+        let time_range = data1.time_range().unwrap();
+        let schema = data1.schema();
+        let pages1 = data1.block_to_page().unwrap();
+        tsm_writer
+            .write_pages(schema, 1, SeriesKey::default(), pages1, time_range)
+            .await
+            .unwrap();
+        tsm_writer.finish().await.unwrap();
+        let tsm_reader = TsmReader::open(tsm_writer.path).await.unwrap();
+        let pages2 = tsm_reader.read_series_pages(1, 0).await.unwrap();
+        let data2 = decode_pages(pages2, data1.schema()).unwrap();
+        assert_eq!(data1, data2);
+        let time_range = data2.time_range().unwrap();
+        assert_eq!(time_range, TimeRange::new(1, 3));
+    }
+
+    #[tokio::test]
+    async fn test_write_and_read_3() {
+        let schema = TskvTableSchema::new(
+            "cnosdb".to_string(),
+            "public".to_string(),
+            "test0".to_string(),
+            vec![
+                TableColumn::new(
+                    0,
+                    "time".to_string(),
+                    ColumnType::Time(TimeUnit::Nanosecond),
+                    Encoding::default(),
+                ),
+                TableColumn::new(
+                    1,
+                    "f1".to_string(),
+                    ColumnType::Field(ValueType::Integer),
+                    Encoding::default(),
+                ),
+                TableColumn::new(
+                    2,
+                    "f2".to_string(),
+                    ColumnType::Field(ValueType::Integer),
+                    Encoding::default(),
+                ),
+                TableColumn::new(
+                    3,
+                    "f3".to_string(),
+                    ColumnType::Field(ValueType::Integer),
+                    Encoding::default(),
+                ),
+            ],
+        );
+        let schema = Arc::new(schema);
+        let data1 = DataBlock::new(
+            schema.clone(),
+            ts_column(vec![1, 2, 3]),
+            vec![
+                i64_column(vec![1, 2, 3]),
+                i64_column(vec![1, 2, 3]),
+                i64_column(vec![1, 2, 3]),
+            ],
+        );
+
+        let path = "/tmp/test/tsm3";
+        let mut tsm_writer = TsmWriter::open(&PathBuf::from(path), 1, 0, false)
+            .await
+            .unwrap();
+        tsm_writer
+            .write_datablock(1, SeriesKey::default(), data1.clone())
+            .await
+            .unwrap();
+        tsm_writer.finish().await.unwrap();
+        let tsm_reader = TsmReader::open(tsm_writer.path).await.unwrap();
+        let raw2 = tsm_reader.read_datablock_raw(1, 0).await.unwrap();
+        let chunk = tsm_reader.chunk();
+        //println!("{:?}", chunk);
+        if let Some(meta) = chunk.get(&(1_u32)) {
+            let path2 = "/tmp/test/tsm4";
+            let mut tsm_writer2 = TsmWriter::open(&PathBuf::from(path2), 1, 0, false)
+                .await
+                .unwrap();
+            tsm_writer2
+                .write_raw(schema, meta.clone(), 0, raw2.clone())
+                .await
+                .unwrap();
+            tsm_writer2.finish().await.unwrap();
+            let tsm_reader2 = TsmReader::open(tsm_writer2.path).await.unwrap();
+            let raw3 = tsm_reader2.read_datablock_raw(1, 0).await.unwrap();
+            assert_eq!(raw2, raw3);
+        } else {
+            panic!("meta not found");
         }
-        let mut ts_2: Vec<i64> = Vec::new();
-        let mut val_2: Vec<i64> = Vec::new();
-        for i in 1001..2001 {
-            ts_2.push(i as i64);
-            val_2.push(i as i64);
-        }
-
-        #[rustfmt::skip]
-        let data = HashMap::from([
-            (1, vec![
-                DataBlock::I64 { ts: ts_1, val: val_1, enc: DataBlockEncoding::default() },
-                DataBlock::I64 { ts: ts_2, val: val_2, enc: DataBlockEncoding::default() },
-            ]),
-        ]);
-
-        let tsm_file = make_tsm_file_name(TEST_PATH, 1);
-        write_to_tsm(&tsm_file, &data).await.unwrap();
-
-        let reader = TsmReader::open(tsm_file).await.unwrap();
-        read_and_check(&reader, &data).await.unwrap();
     }
 }

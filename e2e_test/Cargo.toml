@@ -6,18 +6,31 @@ edition.workspace = true
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-actix-rt = { workspace = true }
+config = { path = "../config" }
+http_protocol = { path = "../common/http_protocol", features = ["http_client"] }
+meta = { path = "../meta" }
+models = { path = "../common/models" }
 protos = { path = "../common/protos", features = ["test"] }
 
-[dev-dependencies]
-http_protocol = { path = "../common/http_protocol", features = ["http_client"] }
-models = { path = "../common/models" }
-
+arrow-flight = { workspace = true, features = ["flight-sql-experimental"] }
+arrow-schema = { workspace = true, optional = false }
+chrono = { workspace = true }
+datafusion = { workspace = true }
+diff = { workspace = true }
 flatbuffers = { workspace = true }
-tonic = { workspace = true, features = ["tls", "transport"] }
+futures = { workspace = true, default-features = false, features = ["alloc"] }
+prost = { workspace = true }
+rand = { workspace = true }
+regex = { workspace = true }
+reqwest = { workspace = true, features = ["rustls-tls", "json", "blocking"], default-features = false }
+serial_test = { workspace = true }
+sysinfo = { workspace = true, optional = false }
 tokio = { workspace = true, features = ["full"] }
 tokio-stream = { workspace = true }
-datafusion = { workspace = true }
-arrow-flight = { workspace = true, features = ["flight-sql-experimental"] }
-futures = { workspace = true, default-features = false, features = ["alloc"] }
-protobuf = { workspace = true }
+tonic = { workspace = true, features = ["tls", "transport"] }
+walkdir = { workspace = true }
+
+[features]
+default = []
+coordinator_e2e_test = []
+not_passed = []

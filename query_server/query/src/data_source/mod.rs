@@ -1,17 +1,20 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::Result as DFResult;
 use datafusion::execution::context::{SessionState, TaskContext};
 use datafusion::logical_expr::TableSource;
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
 use futures::StreamExt;
-use spi::{QueryError, Result};
+use spi::{QueryError, QueryResult};
 
 use self::table_source::TableSourceAdapter;
 use crate::extension::physical::plan_node::table_writer::TableWriterExec;
+use crate::extension::physical::plan_node::update_tag::UpdateTagExec;
 use crate::extension::DropEmptyRecordBatchStream;
 
 pub mod batch;
@@ -31,10 +34,19 @@ pub trait WriteExecExt: Send + Sync {
 }
 
 #[async_trait]
-pub trait RecordBatchSink: Send + Sync {
-    async fn append(&self, record_batch: RecordBatch) -> Result<SinkMetadata>;
+pub trait UpdateExecExt: Send + Sync {
+    async fn update(
+        &self,
+        assigns: Vec<(String, Arc<dyn PhysicalExpr>)>,
+        scan: Arc<dyn ExecutionPlan>,
+    ) -> DFResult<Arc<UpdateTagExec>>;
+}
 
-    async fn stream_write(&self, stream: SendableRecordBatchStream) -> Result<SinkMetadata> {
+#[async_trait]
+pub trait RecordBatchSink: Send + Sync {
+    async fn append(&self, record_batch: RecordBatch) -> QueryResult<SinkMetadata>;
+
+    async fn stream_write(&self, stream: SendableRecordBatchStream) -> QueryResult<SinkMetadata> {
         let mut meta = SinkMetadata::default();
         let mut stream = DropEmptyRecordBatchStream::new(stream);
 
@@ -48,6 +60,7 @@ pub trait RecordBatchSink: Send + Sync {
 }
 
 pub trait RecordBatchSinkProvider: Send + Sync {
+    fn schema(&self) -> SchemaRef;
     fn create_batch_sink(
         &self,
         context: Arc<TaskContext>,
@@ -96,7 +109,7 @@ impl SinkMetadata {
 /// TableProvider. \
 /// Then attempt to downcast a TableProvider to TableProviderAdapter and access the
 /// TableProviderAdapter.
-pub fn source_downcast_adapter(source: &Arc<dyn TableSource>) -> Result<&TableSourceAdapter> {
+pub fn source_downcast_adapter(source: &Arc<dyn TableSource>) -> QueryResult<&TableSourceAdapter> {
     match source.as_any().downcast_ref::<TableSourceAdapter>() {
         Some(adapter) => Ok(adapter),
         _ => Err(QueryError::Internal {

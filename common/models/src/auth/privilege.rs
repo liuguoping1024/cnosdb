@@ -9,7 +9,7 @@ pub trait PrivilegeChecker {
     fn check_privilege(&self, other: &Self) -> bool;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub enum Privilege<T> {
     Global(GlobalPrivilege<T>),
     // Some(T): tenantId
@@ -51,7 +51,7 @@ impl<T: Id> PrivilegeChecker for Privilege<T> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub enum GlobalPrivilege<T> {
     System,
     // Some(T): Administrative rights for the specify user, `T` represents the unique identifier of the user
@@ -106,14 +106,16 @@ where
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub enum TenantObjectPrivilege {
     // All operation permissions related to system
     // e.g. kill querys of tenant
     System,
     // All operation permissions related to members
+    // e.g. alter tenant add user, alter tenant set user, alter tenant remove user
     MemberFull,
     // All operation permissions related to roles
+    // e.g. create role, drop role, grant/revoke on role
     RoleFull,
     // T: database_name
     // None: all databases in this tenant

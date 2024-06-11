@@ -1,8 +1,8 @@
 use arrow::array::ArrayRef;
-use arrow::datatypes::{DataType, Field, SchemaRef};
+use arrow::datatypes::{DataType, Fields, SchemaRef};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
-use arrow::util::display;
+use arrow::util::display::{ArrayFormatter, FormatOptions};
 
 use crate::instance::CnosDBColumnType;
 
@@ -24,7 +24,8 @@ pub fn convert_batches(batches: Vec<RecordBatch>) -> Result<Vec<Vec<String>>, Ar
                 )));
             }
 
-            rows.extend(convert_batch(batch)?);
+            let new_rows = convert_batch(batch)?.into_iter().flat_map(expand_row);
+            rows.extend(new_rows);
         }
         Ok(rows)
     }
@@ -36,18 +37,73 @@ fn convert_batch(batch: RecordBatch) -> Result<Vec<Vec<String>>, ArrowError> {
             batch
                 .columns()
                 .iter()
-                .map(|col| value_to_string(col, row))
+                .map(|col| {
+                    let options = FormatOptions::default().with_null(NULL);
+                    let formatter = ArrayFormatter::try_new(col, &options)?;
+                    value_to_string(col, row, formatter)
+                })
                 .collect::<Result<Vec<String>, ArrowError>>()
         })
         .collect()
 }
 
-pub fn value_to_string(col: &ArrayRef, row: usize) -> Result<String, ArrowError> {
-    if !col.is_valid(row) {
-        Ok(NULL.to_string())
+/// special case rows that have newlines in them (like explain plans)
+//
+/// Transform inputs into one cell per line
+fn expand_row(mut row: Vec<String>) -> Vec<Vec<String>> {
+    use std::iter::once;
+
+    // check last cell
+    if let Some(cell) = row.pop() {
+        let lines: Vec<_> = cell.split('\n').filter(|l| !l.is_empty()).collect();
+
+        // no newlines in last cell
+        if lines.len() < 2 {
+            row.push(cell);
+            return vec![row];
+        }
+
+        // form new rows with each additional line
+        let new_lines: Vec<_> = lines
+            .into_iter()
+            .map(|l| {
+                // replace any leading spaces with '-' as
+                // `sqllogictest` ignores whitespace differences
+                let content = l.trim_start();
+                let new_prefix = "-".repeat(l.len() - content.len());
+                vec![format!("{new_prefix}{content}")]
+            })
+            .collect();
+
+        once(row).chain(new_lines).collect::<Vec<_>>()
     } else {
-        display::array_value_to_string(col, row)
+        vec![row]
     }
+}
+
+pub fn value_to_string(
+    col: &ArrayRef,
+    row: usize,
+    formatter: ArrayFormatter,
+) -> Result<String, ArrowError> {
+    let mut res = formatter.value(row).try_to_string()?;
+    if col.data_type().equals_datatype(&DataType::Utf8) {
+        res = escape_string(&res);
+    }
+    Ok(res)
+}
+
+fn escape_string(s: &str) -> String {
+    let mut res = String::with_capacity(s.len() + 2);
+    res.push('"');
+    for c in s.chars() {
+        if c == '"' {
+            res.push('\\');
+        }
+        res.push(c);
+    }
+    res.push('"');
+    res
 }
 
 /// Check two schemas for being equal for field names/types
@@ -63,7 +119,7 @@ fn equivalent_names_and_types(schema: &SchemaRef, other: SchemaRef) -> bool {
 }
 
 /// Converts columns to a result as expected by sqllogicteset.
-pub fn convert_schema_to_types(columns: &[Field]) -> Vec<CnosDBColumnType> {
+pub fn convert_schema_to_types(columns: &Fields) -> Vec<CnosDBColumnType> {
     columns
         .iter()
         .map(|f| f.data_type())

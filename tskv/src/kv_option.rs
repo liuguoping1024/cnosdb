@@ -4,16 +4,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use config::Config;
+use config::tskv::Config;
+use models::meta_data::{NodeId, VnodeId};
 
 use crate::TseriesFamilyId;
 
 const SUMMARY_PATH: &str = "summary";
 pub const INDEX_PATH: &str = "index";
-const DATA_PATH: &str = "data";
+pub const DATA_PATH: &str = "data";
 pub const TSM_PATH: &str = "tsm";
 pub const DELTA_PATH: &str = "delta";
-pub const MOVE_PATH: &str = "move";
 
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -37,6 +37,7 @@ impl From<&Config> for Options {
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct StorageOptions {
     pub path: PathBuf,
+    pub node_id: NodeId,
     pub max_summary_size: u64,
     pub base_file_size: u64,
     pub flush_req_channel_cap: usize,
@@ -47,6 +48,8 @@ pub struct StorageOptions {
     pub max_compact_size: u64,
     pub max_concurrent_compaction: u16,
     pub strict_write: bool,
+    pub snapshot_holding_time: i64,
+    pub max_datablock_size: u64,
 }
 
 // database/data/ts_family_id/tsm
@@ -56,6 +59,10 @@ impl StorageOptions {
     pub fn level_max_file_size(&self, lvl: u32) -> u64 {
         // TODO(zipper): size of lvl-0 is zero?
         self.base_file_size * lvl as u64 * self.compact_trigger_file_num as u64
+    }
+
+    pub fn path(&self) -> PathBuf {
+        self.path.clone()
     }
 
     pub fn summary_dir(&self) -> PathBuf {
@@ -71,37 +78,22 @@ impl StorageOptions {
     }
 
     pub fn index_dir(&self, database: &str, ts_family_id: TseriesFamilyId) -> PathBuf {
-        self.database_dir(database)
-            .join(ts_family_id.to_string())
-            .join(INDEX_PATH)
+        self.ts_family_dir(database, ts_family_id).join(INDEX_PATH)
     }
 
     pub fn tsm_dir(&self, database: &str, ts_family_id: TseriesFamilyId) -> PathBuf {
-        self.database_dir(database)
-            .join(ts_family_id.to_string())
-            .join(TSM_PATH)
-    }
-
-    pub fn move_dir(&self, database: &str, ts_family_id: TseriesFamilyId) -> PathBuf {
-        self.database_dir(database)
-            .join(ts_family_id.to_string())
-            .join(MOVE_PATH)
+        self.ts_family_dir(database, ts_family_id).join(TSM_PATH)
     }
 
     pub fn delta_dir(&self, database: &str, ts_family_id: TseriesFamilyId) -> PathBuf {
-        self.database_dir(database)
-            .join(ts_family_id.to_string())
-            .join(DELTA_PATH)
-    }
-
-    pub fn tsfamily_dir(&self, database: &str, ts_family_id: TseriesFamilyId) -> PathBuf {
-        self.database_dir(database).join(ts_family_id.to_string())
+        self.ts_family_dir(database, ts_family_id).join(DELTA_PATH)
     }
 }
 
 impl From<&Config> for StorageOptions {
     fn from(config: &Config) -> Self {
         Self {
+            node_id: config.global.node_id,
             path: PathBuf::from(config.storage.path.clone()),
             max_summary_size: config.storage.max_summary_size,
             base_file_size: config.storage.base_file_size,
@@ -113,6 +105,8 @@ impl From<&Config> for StorageOptions {
             max_compact_size: config.storage.max_compact_size,
             max_concurrent_compaction: config.storage.max_concurrent_compaction,
             strict_write: config.storage.strict_write,
+            snapshot_holding_time: config.cluster.snapshot_holding_time.as_secs() as i64,
+            max_datablock_size: config.storage.max_datablock_size,
         }
     }
 }
@@ -121,6 +115,12 @@ impl From<&Config> for StorageOptions {
 pub struct QueryOptions {
     pub max_server_connections: u32,
     pub auth_enabled: bool,
+    pub query_sql_limit: u64,
+    pub write_sql_limit: u64,
+    pub read_timeout: Duration,
+    pub write_timeout: Duration,
+    pub stream_trigger_cpu: usize,
+    pub stream_executor_cpu: usize,
 }
 
 impl From<&Config> for QueryOptions {
@@ -128,6 +128,12 @@ impl From<&Config> for QueryOptions {
         Self {
             max_server_connections: config.query.max_server_connections,
             auth_enabled: config.query.auth_enabled,
+            query_sql_limit: config.query.query_sql_limit,
+            write_sql_limit: config.query.write_sql_limit,
+            read_timeout: config.query.read_timeout,
+            write_timeout: config.query.write_timeout,
+            stream_trigger_cpu: config.query.stream_trigger_cpu,
+            stream_executor_cpu: config.query.stream_executor_cpu,
         }
     }
 }
@@ -157,17 +163,24 @@ impl From<&Config> for WalOptions {
     }
 }
 
+/// database/data/ts_family_id/
+impl WalOptions {
+    pub fn wal_dir(&self, owner: &str, vnode_id: VnodeId) -> PathBuf {
+        self.path.join(owner).join(vnode_id.to_string())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CacheOptions {
     pub max_buffer_size: u64,
-    pub max_immutable_number: u16,
+    pub partition: usize,
 }
 
 impl From<&Config> for CacheOptions {
     fn from(config: &Config) -> Self {
         Self {
             max_buffer_size: config.cache.max_buffer_size,
-            max_immutable_number: config.cache.max_immutable_number,
+            partition: config.cache.partition,
         }
     }
 }

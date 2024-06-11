@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use datafusion::logical_expr::{AggregateUDF, ScalarUDF};
+use datafusion::logical_expr::{AggregateUDF, ScalarUDF, WindowUDF};
 use spi::query::function::*;
-use spi::{QueryError, Result};
+use spi::{QueryError, QueryResult};
 
 pub type SimpleFunctionMetadataManagerRef = Arc<SimpleFunctionMetadataManager>;
 
@@ -13,22 +13,30 @@ pub struct SimpleFunctionMetadataManager {
     pub scalar_functions: HashMap<String, Arc<ScalarUDF>>,
     /// Aggregate functions registered in the context
     pub aggregate_functions: HashMap<String, Arc<AggregateUDF>>,
+    /// Window functions registered in the context
+    pub window_functions: HashMap<String, Arc<WindowUDF>>,
 }
 
 impl FunctionMetadataManager for SimpleFunctionMetadataManager {
-    fn register_udf(&mut self, f: ScalarUDF) -> Result<()> {
+    fn register_udf(&mut self, f: ScalarUDF) -> QueryResult<()> {
         self.scalar_functions
             .insert(f.name.to_uppercase(), Arc::new(f));
         Ok(())
     }
 
-    fn register_udaf(&mut self, f: AggregateUDF) -> Result<()> {
+    fn register_udaf(&mut self, f: AggregateUDF) -> QueryResult<()> {
         self.aggregate_functions
             .insert(f.name.to_uppercase(), Arc::new(f));
         Ok(())
     }
 
-    fn udf(&self, name: &str) -> Result<Arc<ScalarUDF>> {
+    fn register_udwf(&mut self, f: WindowUDF) -> QueryResult<()> {
+        self.window_functions
+            .insert(f.name.to_uppercase(), Arc::new(f));
+        Ok(())
+    }
+
+    fn udf(&self, name: &str) -> QueryResult<Arc<ScalarUDF>> {
         let result = self.scalar_functions.get(&name.to_uppercase());
 
         result.cloned().ok_or_else(|| QueryError::FunctionExists {
@@ -36,8 +44,18 @@ impl FunctionMetadataManager for SimpleFunctionMetadataManager {
         })
     }
 
-    fn udaf(&self, name: &str) -> Result<Arc<AggregateUDF>> {
+    fn udaf(&self, name: &str) -> QueryResult<Arc<AggregateUDF>> {
         let result = self.aggregate_functions.get(&name.to_uppercase());
+
+        result
+            .cloned()
+            .ok_or_else(|| QueryError::FunctionNotExists {
+                name: name.to_string(),
+            })
+    }
+
+    fn udwf(&self, name: &str) -> QueryResult<Arc<WindowUDF>> {
+        let result = self.window_functions.get(&name.to_uppercase());
 
         result
             .cloned()

@@ -5,11 +5,15 @@ use datafusion::arrow::error::Result as ArrowResult;
 use datafusion::arrow::json::{ArrayWriter, LineDelimitedWriter};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::util::pretty::pretty_format_batches;
+use http_protocol::encoding::Encoding;
 use http_protocol::header::{
     APPLICATION_CSV, APPLICATION_JSON, APPLICATION_NDJSON, APPLICATION_PREFIX, APPLICATION_STAR,
     APPLICATION_TABLE, APPLICATION_TSV, CONTENT_TYPE, STAR_STAR,
 };
 use http_protocol::status_code::OK;
+use metrics::count::U64Counter;
+use reqwest::header::CONTENT_ENCODING;
+use trace::error;
 use warp::reply::Response;
 use warp::{reject, Rejection};
 
@@ -22,7 +26,9 @@ macro_rules! batches_to_json {
         let mut bytes = vec![];
         {
             let mut writer = $WRITER::new(&mut bytes);
-            writer.write_batches($batches)?;
+            for batch in $batches {
+                writer.write(batch)?;
+            }
             writer.finish()?;
         }
         Ok(bytes)
@@ -91,16 +97,26 @@ impl ResultFormat {
         &self,
         batches: &[RecordBatch],
         has_headers: bool,
+        http_query_data_out: U64Counter,
+        result_encoding: Option<Encoding>,
     ) -> Result<Response, HttpError> {
-        let result =
+        let mut result =
             self.format_batches(batches, has_headers)
                 .map_err(|e| HttpError::FetchResult {
                     reason: format!("{}", e),
                 })?;
 
-        let resp = ResponseBuilder::new(OK)
-            .insert_header((CONTENT_TYPE, self.get_http_content_type()))
-            .build(result);
+        let mut builder =
+            ResponseBuilder::new(OK).insert_header((CONTENT_TYPE, self.get_http_content_type()));
+        if let Some(encoding) = result_encoding {
+            builder = builder.insert_header((CONTENT_ENCODING, encoding.to_header_value()));
+            result = encoding
+                .encode(result)
+                .map_err(|e| HttpError::EncodeResponse { source: e })?;
+        }
+        http_query_data_out.inc(result.len() as u64);
+
+        let resp = builder.build(result);
 
         Ok(resp)
     }
@@ -134,7 +150,13 @@ impl FromStr for ResultFormat {
 }
 
 pub fn get_result_format_from_header(header: &Header) -> Result<ResultFormat, Rejection> {
-    ResultFormat::try_from(header.get_accept()).map_err(reject::custom)
+    ResultFormat::try_from(header.get_accept()).map_err(|e| {
+        let e = HttpError::InvalidHeader {
+            reason: format!("{}", e),
+        };
+        error!("get_result_format_from_header: {:?}", e);
+        reject::custom(e)
+    })
 }
 
 #[cfg(test)]
@@ -143,7 +165,6 @@ mod tests {
 
     use datafusion::arrow::array::Int32Array;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::from_slice::FromSlice;
 
     use super::*;
 
@@ -164,9 +185,9 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema,
             vec![
-                Arc::new(Int32Array::from_slice([1, 2, 3])),
-                Arc::new(Int32Array::from_slice([4, 5, 6])),
-                Arc::new(Int32Array::from_slice([7, 8, 9])),
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(Int32Array::from(vec![4, 5, 6])),
+                Arc::new(Int32Array::from(vec![7, 8, 9])),
             ],
         )
         .unwrap();
@@ -194,9 +215,9 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema,
             vec![
-                Arc::new(Int32Array::from_slice([1, 2, 3])),
-                Arc::new(Int32Array::from_slice([4, 5, 6])),
-                Arc::new(Int32Array::from_slice([7, 8, 9])),
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(Int32Array::from(vec![4, 5, 6])),
+                Arc::new(Int32Array::from(vec![7, 8, 9])),
             ],
         )
         .unwrap();

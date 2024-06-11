@@ -1,26 +1,25 @@
-pub mod query_executor;
-pub mod replica_selection;
-pub mod status_listener;
+pub mod deserialize;
 pub mod table_scan;
 pub mod tag_scan;
 
+use std::mem;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::physical_plan::common::AbortOnDropMany;
 use futures::future::BoxFuture;
 use futures::{ready, FutureExt, Stream, StreamExt, TryFutureExt};
-use models::meta_data::VnodeInfo;
-pub use query_executor::*;
-use tokio::runtime::Runtime;
-use tokio::sync::mpsc;
-use tracing::{info, warn};
-use tskv::query_iterator::QueryOption;
+use meta::model::MetaRef;
+use metrics::count::U64Counter;
+use models::meta_data::{VnodeId, VnodeInfo, VnodeStatus};
+use snafu::ResultExt;
+use tracing::warn;
+use tskv::reader::QueryOption;
 
-use crate::errors::{CoordinatorError, CoordinatorResult};
-use crate::{CoordinatorRecordBatchStream, SendableCoordinatorRecordBatchStream};
+use crate::errors::{CommonSnafu, CoordinatorError, CoordinatorResult, MetaSnafu};
+use crate::service::CoordServiceMetrics;
+use crate::SendableCoordinatorRecordBatchStream;
 
 /// A fallible future that reads to a stream of [`RecordBatch`]
 pub type VnodeOpenFuture =
@@ -36,18 +35,36 @@ pub trait VnodeOpener: Unpin {
 
 pub struct CheckedCoordinatorRecordBatchStream<O: VnodeOpener> {
     opener: O,
+    meta: MetaRef,
+    tenant: Arc<String>,
     vnode: VnodeInfo,
     option: QueryOption,
     state: StreamState,
+
+    coord_data_out: U64Counter,
 }
 
 impl<O: VnodeOpener> CheckedCoordinatorRecordBatchStream<O> {
-    pub fn new(option: QueryOption, opener: O, checker: CheckFuture) -> Self {
+    pub fn new(
+        option: QueryOption,
+        opener: O,
+        meta: MetaRef,
+        checker: CheckFuture,
+        metrics: &CoordServiceMetrics,
+    ) -> Self {
+        let tenant: Arc<String> = option.table_schema.tenant.clone().into();
+        let db = option.table_schema.db.as_str();
+
+        let coord_data_out = metrics.coord_data_out(tenant.as_str(), db);
+        metrics.coord_queries(tenant.as_str(), db).inc_one();
         Self {
             option,
             opener,
+            meta,
+            tenant,
             vnode: VnodeInfo::default(),
             state: StreamState::Check(checker),
+            coord_data_out,
         }
     }
 
@@ -58,11 +75,11 @@ impl<O: VnodeOpener> CheckedCoordinatorRecordBatchStream<O> {
                     // TODO record time used
                     match ready!(checker.try_poll_unpin(cx)) {
                         Ok(_) => {
-                            self.vnode = self.option.split.pop_front().ok_or(
+                            self.vnode = self.option.split.pop_front().ok_or_else(|| {
                                 CoordinatorError::NoValidReplica {
                                     id: self.option.split.replica_id(),
-                                },
-                            )?;
+                                }
+                            })?;
 
                             self.state = StreamState::Idle;
                         }
@@ -82,12 +99,12 @@ impl<O: VnodeOpener> CheckedCoordinatorRecordBatchStream<O> {
                     // TODO record time used
                     match ready!(future.poll_unpin(cx)) {
                         Ok(stream) => {
-                            self.state = StreamState::Scan(stream);
+                            self.state = StreamState::Scan(stream, ScanState::Scan);
                         }
                         Err(err) => {
-                            if let CoordinatorError::FailoverNode { id: _ } = err {
+                            if let CoordinatorError::PreExecution { ref error } = err {
                                 if let Some(vnode) = self.option.split.pop_front() {
-                                    info!("failover reader try to read another vnode: {:?}", vnode);
+                                    warn!("failover reader try to read another vnode: {:?}, error: {}", vnode, error);
                                     self.vnode = vnode;
                                     self.state = StreamState::Idle;
                                 } else {
@@ -99,7 +116,69 @@ impl<O: VnodeOpener> CheckedCoordinatorRecordBatchStream<O> {
                         }
                     };
                 }
-                StreamState::Scan(stream) => return stream.poll_next_unpin(cx),
+                StreamState::Scan(stream, state) => match state {
+                    ScanState::Scan => match ready!(stream.poll_next_unpin(cx)) {
+                        None => return Poll::Ready(None),
+                        Some(res) => match res {
+                            Ok(batch) => {
+                                let batch_memory = batch.get_array_memory_size();
+                                let meta = self.meta.clone();
+                                let tenant_name = self.tenant.clone();
+                                let future = async move {
+                                    meta.limiter(&tenant_name)
+                                        .await
+                                        .context(MetaSnafu)?
+                                        .check_coord_data_out(batch_memory)
+                                        .await
+                                        .context(MetaSnafu)
+                                };
+                                let _ = mem::replace(
+                                    state,
+                                    ScanState::CheckLimiter(batch, Box::pin(future)),
+                                );
+                            }
+                            Err(err) => {
+                                if tskv::TskvError::vnode_broken_code(err.error_code().code()) {
+                                    let id = self.vnode.id;
+                                    let meta = self.meta.clone();
+                                    let tenant = self.option.tenant_name();
+
+                                    trace::warn!("updated vnode {} status broken", id);
+                                    meta.try_change_local_vnode_status(
+                                        tenant,
+                                        id,
+                                        VnodeStatus::Broken,
+                                    );
+                                    let future = change_vnode_to_broken(tenant.into(), id, meta);
+                                    self.state =
+                                        StreamState::UpdateVNodeBroken(Box::pin(future), err);
+                                } else {
+                                    return Poll::Ready(Some(Err(err)));
+                                }
+                            }
+                        },
+                    },
+                    ScanState::CheckLimiter(b, c) => {
+                        return match ready!(c.try_poll_unpin(cx)) {
+                            Ok(_) => {
+                                let batch = b.clone();
+                                let _ = mem::replace(state, ScanState::Scan);
+                                Poll::Ready(Some(Ok(batch)))
+                            }
+                            Err(e) => Poll::Ready(Some(Err(e))),
+                        }
+                    }
+                },
+                StreamState::UpdateVNodeBroken(c, err) => {
+                    let _ = ready!(c.try_poll_unpin(cx));
+                    return Poll::Ready(Some(Err(mem::replace(
+                        err,
+                        CommonSnafu {
+                            msg: "default err to mem::replace".to_string(),
+                        }
+                        .build(),
+                    ))));
+                }
             }
         }
     }
@@ -109,135 +188,58 @@ impl<O: VnodeOpener> Stream for CheckedCoordinatorRecordBatchStream<O> {
     type Item = Result<RecordBatch, CoordinatorError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.poll_inner(cx)
+        let poll = self.poll_inner(cx);
+        if let Poll::Ready(Some(Ok(batch))) = &poll {
+            self.coord_data_out
+                .inc(batch.get_array_memory_size() as u64)
+        }
+        poll
     }
 }
 
-impl<O: VnodeOpener> CoordinatorRecordBatchStream for CheckedCoordinatorRecordBatchStream<O> {}
+pub async fn change_vnode_to_broken(
+    tenant: String,
+    vnode_id: VnodeId,
+    meta: MetaRef,
+) -> CoordinatorResult<()> {
+    let meta_client = meta.tenant_meta(&tenant).await;
+
+    if let Some(meta_client) = meta_client {
+        if let Some(mut all_info) = meta_client.get_vnode_all_info(vnode_id) {
+            all_info.set_status(VnodeStatus::Broken);
+            meta_client
+                .update_vnode(&all_info)
+                .await
+                .context(MetaSnafu)?;
+
+            return Ok(());
+        }
+
+        warn!(
+            "Vnode not found: {}, when changing vnode state to broken.",
+            vnode_id
+        );
+
+        return Ok(());
+    }
+
+    warn!(
+        "Tenant not found: {}, when changing vnode state to broken.",
+        tenant
+    );
+
+    Ok(())
+}
 
 enum StreamState {
     Check(CheckFuture),
     Idle,
     Open(VnodeOpenFuture),
-    Scan(SendableCoordinatorRecordBatchStream),
+    Scan(SendableCoordinatorRecordBatchStream, ScanState),
+    UpdateVNodeBroken(CheckFuture, CoordinatorError),
 }
 
-pub struct ParallelMergeStream {
-    /// Stream entries
-    receiver: mpsc::Receiver<CoordinatorResult<RecordBatch>>,
-    #[allow(unused)]
-    drop_helper: AbortOnDropMany<()>,
-}
-
-impl ParallelMergeStream {
-    pub fn new(
-        runtime: Option<Arc<Runtime>>,
-        streams: Vec<SendableCoordinatorRecordBatchStream>,
-    ) -> Self {
-        let mut join_handles = Vec::with_capacity(streams.len());
-        let (sender, receiver) = mpsc::channel::<CoordinatorResult<RecordBatch>>(streams.len());
-
-        for mut stream in streams {
-            let sender = sender.clone();
-            let task = async move {
-                while let Some(item) = stream.next().await {
-                    // If send fails, stream being torn down,
-                    // there is no place to send the error.
-                    if sender.send(item).await.is_err() {
-                        warn!("Stopping execution: output is gone, ParallelMergeStream cancelling");
-                        return;
-                    }
-                }
-            };
-
-            let join_handle = if let Some(rt) = &runtime {
-                rt.spawn(task)
-            } else {
-                tokio::spawn(task)
-            };
-
-            join_handles.push(join_handle);
-        }
-
-        Self {
-            receiver,
-            drop_helper: AbortOnDropMany(join_handles),
-        }
-    }
-}
-
-impl Stream for ParallelMergeStream {
-    type Item = CoordinatorResult<RecordBatch>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.receiver.poll_recv(cx)
-    }
-}
-
-impl CoordinatorRecordBatchStream for ParallelMergeStream {}
-
-/// Iterator over batches
-pub struct MemoryRecordBatchStream {
-    /// Vector of record batches
-    data: Vec<RecordBatch>,
-    /// Index into the data
-    index: usize,
-}
-
-impl MemoryRecordBatchStream {
-    /// Create an iterator for a vector of record batches
-    pub fn new(data: Vec<RecordBatch>) -> Self {
-        Self { data, index: 0 }
-    }
-}
-
-impl Stream for MemoryRecordBatchStream {
-    type Item = CoordinatorResult<RecordBatch>;
-
-    fn poll_next(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Poll::Ready(if self.index < self.data.len() {
-            self.index += 1;
-            let batch = &self.data[self.index - 1];
-            Some(Ok(batch.to_owned()))
-        } else {
-            None
-        })
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.data.len(), Some(self.data.len()))
-    }
-}
-
-impl CoordinatorRecordBatchStream for MemoryRecordBatchStream {}
-
-#[cfg(test)]
-mod tests {
-    use datafusion::arrow::datatypes::Schema;
-    use futures::TryStreamExt;
-
-    use super::*;
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn test_parallel_merge_stream() {
-        let schema = Arc::new(Schema::empty());
-
-        let batches = vec![
-            RecordBatch::new_empty(schema.clone()),
-            RecordBatch::new_empty(schema.clone()),
-            RecordBatch::new_empty(schema),
-        ];
-
-        let streams: Vec<SendableCoordinatorRecordBatchStream> = vec![
-            Box::pin(MemoryRecordBatchStream::new(batches.clone())),
-            Box::pin(MemoryRecordBatchStream::new(batches.clone())),
-            Box::pin(MemoryRecordBatchStream::new(batches)),
-        ];
-
-        let parallel_merge_stream = ParallelMergeStream::new(None, streams);
-
-        let result_batches = parallel_merge_stream.try_collect::<Vec<_>>().await.unwrap();
-
-        assert_eq!(result_batches.len(), 9);
-    }
+enum ScanState {
+    Scan,
+    CheckLimiter(RecordBatch, CheckFuture),
 }

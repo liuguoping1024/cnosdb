@@ -5,16 +5,20 @@ edition.workspace = true
 
 [dependencies]
 config = { path = "../config" }
+cache = { path = "../common/cache"}
 error_code = { path = "../common/error_code" }
-lru_cache = { path = "../common/lru_cache" }
 memory_pool = { path = "../common/memory_pool" }
 meta = { path = "../meta" }
 metrics = { path = "../common/metrics" }
 models = { path = "../common/models" }
 protos = { path = "../common/protos", features = ["test"] }
+replication = { path = "../replication" }
 trace = { path = "../common/trace" }
 utils = { path = "../common/utils" }
+http_protocol = { path = "../common/http_protocol" }
 
+arrow = { workspace = true, features = ["test_utils"] }
+arrow-array = { workspace = true }
 async-backtrace = { workspace = true, optional = true }
 async-recursion = { workspace = true }
 async-trait = { workspace = true }
@@ -27,37 +31,49 @@ crc32fast = { workspace = true }
 crossbeam-channel = { workspace = true }
 dashmap = { workspace = true }
 datafusion = { workspace = true }
+dircpy = { workspace = true }
+datafusion-proto = { workspace = true }
 flatbuffers = { workspace = true }
 flate2 = { workspace = true }
 futures = { workspace = true, features = ["std", "thread-pool"] }
 integer-encoding = { workspace = true }
 lazy_static = { workspace = true }
 libc = { workspace = true }
+memmap2 = { workspace = true }
 minivec = { workspace = true }
 mio = { workspace = true }
 num-traits = { workspace = true }
 num_cpus = { workspace = true }
 num_enum = { workspace = true }
 once_cell = { workspace = true }
+openraft = { workspace = true, features = ["serde"] }
 parking_lot = { workspace = true, features = ["nightly", "send_guard"] }
-q_compress = { workspace = true }
+pco = {workspace = true}
 radixdb = { workspace = true, features = ["custom-store"] }
 rand = { workspace = true }
 regex = { workspace = true }
 roaring = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+skiplist = { workspace = true }
 sled = { workspace = true }
 snafu = { workspace = true }
 snap = { workspace = true }
 static_assertions = { workspace = true }
-tokio = { workspace = true, features = ["full"] }
+sysinfo = { workspace = true, optional = false }
+tokio = { workspace = true, features = ["full", "tracing"] }
 tokio-util = { workspace = true }
 walkdir = { workspace = true }
 zstd = { workspace = true }
+tonic = { workspace = true }
+stable-vec = { workspace = true }
+arrow-schema = { workspace = true }
+md-5 = { workspace = true }
+hex = { workspace = true }
+maplit = { workspace = true }
 
-[target.'cfg(linux)'.dependencies]
-rio = { version = "0.9", optional = true }
+[target.'cfg(target_os = "linux")'.dependencies]
+rio = { version = "0.9.4", optional = true }
 tokio-uring = { version = "0.4", optional = true }
 
 [target.'cfg(windows)'.dependencies]
@@ -75,7 +91,12 @@ criterion = { workspace = true, features = ["async_tokio"] }
 parking_lot = { workspace = true, features = ["nightly"] }
 rand = { workspace = true }
 tempfile = { workspace = true }
+arrow = { workspace = true, features = ["test_utils"] }
 
 [[bench]]
 harness = false
 name = "kvcore_bench"
+
+[[bench]]
+harness = false
+name = "data_merge"

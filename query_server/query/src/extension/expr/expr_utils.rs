@@ -1,9 +1,49 @@
+use datafusion::arrow::datatypes::DataType;
+use datafusion::common::Result as DFResult;
+use datafusion::error::DataFusionError;
 use datafusion::logical_expr::utils::find_exprs_in_expr;
-use datafusion::logical_expr::{BinaryExpr, Operator};
+use datafusion::logical_expr::{expr, BinaryExpr, Operator};
 use datafusion::prelude::Expr;
 use models::schema::TIME_FIELD_NAME;
+use spi::AnalyzerSnafu;
 
 use super::selector_function::{BOTTOM, TOPK};
+
+pub fn check_args(func_name: &str, expects: usize, input: &[DataType]) -> DFResult<()> {
+    if input.len() != expects {
+        return Err(DataFusionError::External(Box::new(
+            AnalyzerSnafu {
+                err: format!(
+                    "The function {:?} expects {} arguments, but {} were provided",
+                    func_name,
+                    expects,
+                    input.len()
+                ),
+            }
+            .build(),
+        )));
+    }
+
+    Ok(())
+}
+
+pub fn check_args_eq_any(func_name: &str, expects: &[usize], input: &[DataType]) -> DFResult<()> {
+    let len = input.len();
+    if !expects.iter().any(|e| e.eq(&len)) {
+        return Err(DataFusionError::External(Box::new(
+            AnalyzerSnafu {
+                err: format!(
+                    "The function {:?} expects {:?} arguments, but {} were provided",
+                    func_name,
+                    expects,
+                    input.len()
+                ),
+            }
+            .build(),
+        )));
+    }
+    Ok(())
+}
 
 pub fn is_time_filter(expr: &Expr) -> bool {
     match expr {
@@ -46,10 +86,10 @@ pub fn find_selector_function_exprs(exprs: &[Expr]) -> Vec<Expr> {
     find_exprs_in_exprs(exprs, &|nested_expr| {
         matches!(
             nested_expr,
-            Expr::ScalarUDF {
+            Expr::ScalarUDF(expr::ScalarUDF {
                 fun,
                 ..
-            } if fun.name.eq_ignore_ascii_case(BOTTOM)
+            }) if fun.name.eq_ignore_ascii_case(BOTTOM)
             || fun.name.eq_ignore_ascii_case(TOPK)
         )
     })
@@ -77,10 +117,10 @@ pub fn find_selector_function_exprs_deeply_nested(exprs: &[Expr]) -> Vec<Expr> {
     find_exprs_in_exprs(exprs, &|nested_expr| {
         matches!(
             nested_expr,
-            Expr::ScalarUDF {
+            Expr::ScalarUDF(expr::ScalarUDF {
                 fun,
                 ..
-            } if fun.name.eq_ignore_ascii_case(BOTTOM)
+            }) if fun.name.eq_ignore_ascii_case(BOTTOM)
             || fun.name.eq_ignore_ascii_case(TOPK)
         )
     })

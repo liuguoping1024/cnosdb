@@ -1,15 +1,20 @@
+use std::io::BufRead;
 use std::path::Path;
 
 use anyhow::anyhow;
+use base64::prelude::{Engine, BASE64_STANDARD};
 use datafusion::arrow::record_batch::RecordBatch;
+use http_protocol::encoding::Encoding;
 use http_protocol::header::{ACCEPT, PRIVATE_KEY};
 use http_protocol::http_client::HttpClient;
-use http_protocol::parameter::{SqlParam, WriteParam};
+use http_protocol::parameter::{DumpParam, SqlParam, WriteParam};
 use http_protocol::status_code::OK;
+use reqwest::header::{ACCEPT_ENCODING, CONTENT_ENCODING};
+use tokio::sync::mpsc;
 
 use crate::config::ConfigOptions;
 use crate::print_format::PrintFormat;
-use crate::{ExitCode, Result};
+use crate::{progress_bar, ExitCode, Result};
 
 pub const DEFAULT_USER: &str = "cnosdb";
 pub const DEFAULT_PASSWORD: &str = "";
@@ -17,9 +22,13 @@ pub const DEFAULT_DATABASE: &str = "public";
 pub const DEFAULT_PRECISION: &str = "NS";
 pub const DEFAULT_USE_SSL: bool = false;
 pub const DEFAULT_USE_UNSAFE_SSL: bool = false;
+pub const DEFAULT_CHUNKED: bool = false;
+pub const DEFAULT_PROCESS_CLI_COMMAND: bool = false;
+pub const DEFAULT_ERROR_STOP: bool = false;
 
 pub const API_V1_SQL_PATH: &str = "/api/v1/sql";
 pub const API_V1_WRITE_PATH: &str = "/api/v1/write";
+pub const API_V1_DUMP_SQL_DDL_PATH: &str = "/api/v1/dump/sql/ddl";
 
 pub struct SessionConfig {
     pub user_info: UserInfo,
@@ -29,10 +38,15 @@ pub struct SessionConfig {
     pub precision: String,
     pub target_partitions: Option<usize>,
     pub stream_trigger_interval: Option<String>,
+    pub accept_encoding: Option<Encoding>,
+    pub content_encoding: Option<Encoding>,
     pub fmt: PrintFormat,
     pub config_options: ConfigOptions,
     pub use_ssl: bool,
     pub use_unsafe_ssl: bool,
+    pub chunked: bool,
+    pub process_cli_command: bool,
+    pub error_stop: bool,
 }
 
 impl SessionConfig {
@@ -48,10 +62,15 @@ impl SessionConfig {
             precision: DEFAULT_PRECISION.to_string(),
             target_partitions: None,
             stream_trigger_interval: None,
+            accept_encoding: None,
+            content_encoding: None,
             config_options,
             fmt: PrintFormat::Csv,
             use_ssl: DEFAULT_USE_SSL,
             use_unsafe_ssl: DEFAULT_USE_UNSAFE_SSL,
+            chunked: DEFAULT_CHUNKED,
+            process_cli_command: DEFAULT_PROCESS_CLI_COMMAND,
+            error_stop: DEFAULT_ERROR_STOP,
         }
     }
 
@@ -91,6 +110,16 @@ impl SessionConfig {
 
     pub fn with_stream_trigger_interval(mut self, stream_trigger_interval: Option<String>) -> Self {
         self.stream_trigger_interval = stream_trigger_interval;
+        self
+    }
+
+    pub fn with_accept_encoding(mut self, accept_encoding: Option<Encoding>) -> Self {
+        self.accept_encoding = accept_encoding;
+        self
+    }
+
+    pub fn with_content_encoding(mut self, content_encoding: Option<Encoding>) -> Self {
+        self.content_encoding = content_encoding;
         self
     }
 
@@ -134,6 +163,24 @@ impl SessionConfig {
 
     pub fn with_unsafe_ssl(mut self, use_unsafe_ssl: bool) -> Self {
         self.use_unsafe_ssl = use_unsafe_ssl;
+
+        self
+    }
+
+    pub fn with_chunked(mut self, chunked: bool) -> Self {
+        self.chunked = chunked;
+
+        self
+    }
+
+    pub fn with_process_cli_command(mut self, process_cli_command: bool) -> Self {
+        self.process_cli_command = process_cli_command;
+
+        self
+    }
+
+    pub fn with_error_stop(mut self, error_stop: bool) -> Self {
+        self.error_stop = error_stop;
 
         self
     }
@@ -194,21 +241,35 @@ impl SessionContext {
         self.session_config.database = name.to_string();
     }
 
+    pub fn set_tenant(&mut self, tenant: String) {
+        self.session_config.tenant = tenant
+    }
+
     pub fn get_database(&self) -> &str {
         self.session_config.database.as_str()
     }
 
+    pub fn get_session_config(&self) -> &SessionConfig {
+        &self.session_config
+    }
+
+    pub fn get_mut_session_config(&mut self) -> &mut SessionConfig {
+        &mut self.session_config
+    }
+
     pub async fn sql(&self, sql: String) -> Result<ResultSet> {
+        let mut sql = sql.into_bytes();
         let user_info = &self.session_config.user_info;
 
         let tenant = self.session_config.tenant.clone();
         let db = self.session_config.database.clone();
         let target_partitions = self.session_config.target_partitions;
         let stream_trigger_interval = self.session_config.stream_trigger_interval.clone();
+        let chunked = self.session_config.chunked;
         let param = SqlParam {
             tenant: Some(tenant),
             db: Some(db),
-            chunked: None,
+            chunked: Some(chunked),
             target_partitions,
             stream_trigger_interval,
         };
@@ -220,8 +281,17 @@ impl SessionContext {
             .basic_auth::<&str, &str>(&user_info.user, user_info.password.as_deref())
             .header(ACCEPT, self.session_config.fmt.get_http_content_type());
 
+        if let Some(encoding) = self.session_config.accept_encoding {
+            builder = builder.header(ACCEPT_ENCODING, encoding.to_header_value());
+        }
+
+        if let Some(encoding) = self.session_config.content_encoding {
+            builder = builder.header(CONTENT_ENCODING, encoding.to_header_value());
+            sql = encoding.encode(sql)?;
+        }
+
         builder = if let Some(key) = &user_info.private_key {
-            let key = base64::encode(key);
+            let key = BASE64_STANDARD.encode(key);
             builder.header(PRIVATE_KEY, key)
         } else {
             builder
@@ -231,9 +301,19 @@ impl SessionContext {
 
         match resp.status() {
             OK => {
-                let body = resp.bytes().await?;
+                let body = if let Some(content_encoding) = resp.headers().get(CONTENT_ENCODING) {
+                    let encoding_str = content_encoding.to_str()?;
+                    let encoding = match Encoding::from_str_opt(encoding_str) {
+                        Some(encoding) => Ok(encoding),
+                        None => Err(anyhow!("encoding not support: {}", encoding_str)),
+                    }?;
+                    encoding.decode(resp.bytes().await?)?
+                } else {
+                    resp.bytes().await?
+                }
+                .to_vec();
 
-                Ok(ResultSet::Bytes((body.to_vec(), 0)))
+                Ok(ResultSet::Bytes((body, 0)))
             }
             _ => {
                 let status = resp.status().to_string();
@@ -245,8 +325,50 @@ impl SessionContext {
     }
 
     pub async fn write_line_protocol_file(&self, path: impl AsRef<Path>) -> Result<ResultSet> {
-        let body = tokio::fs::read(path).await?;
+        let file = std::fs::File::open(path)?;
+        let size = file.metadata()?.len();
+        let mut reader = std::io::BufReader::new(file);
+        let pb = progress_bar::new_with_size(size);
 
+        let (tx, mut rx) = mpsc::channel::<String>(10);
+
+        let producer = tokio::spawn(async move {
+            let mut buffer = String::new();
+            let mut line_count = 0;
+            while let Ok(size) = reader.read_line(&mut buffer) {
+                if size == 0 {
+                    break;
+                }
+                line_count += 1;
+                if line_count % 10000 == 0 && !buffer.is_empty() {
+                    tx.send(buffer.clone()).await.unwrap();
+                    buffer.clear();
+                }
+            }
+
+            if !buffer.is_empty() {
+                tx.send(buffer).await.unwrap();
+            }
+            anyhow::Ok(())
+        });
+
+        let consumer = async move {
+            while let Some(data) = rx.recv().await {
+                let data = data.into_bytes();
+                pb.inc(data.len() as u64);
+                self.write_line_protocol(data).await?;
+            }
+            anyhow::Ok(())
+        };
+
+        let (producer_results, consumer_results) = tokio::join!(producer, consumer);
+        let _ = producer_results?;
+        consumer_results?;
+
+        Ok(ResultSet::Bytes(("".into(), 0)))
+    }
+
+    pub async fn write_line_protocol(&self, mut body: Vec<u8>) -> Result<ResultSet> {
         let user_info = &self.session_config.user_info;
 
         let tenant = self.session_config.tenant.clone();
@@ -259,14 +381,18 @@ impl SessionContext {
             db: Some(db),
         };
 
-        let resp = self
+        let mut builder = self
             .http_client
             .post(API_V1_WRITE_PATH)
             .basic_auth::<&str, &str>(&user_info.user, user_info.password.as_deref())
-            .query(&param)
-            .body(body)
-            .send()
-            .await?;
+            .query(&param);
+
+        if let Some(encoding) = self.session_config.content_encoding {
+            builder = builder.header(CONTENT_ENCODING, encoding.to_header_value());
+            body = encoding.encode(body)?;
+        }
+
+        let resp = builder.body(body).send().await?;
 
         match resp.status() {
             OK => {
@@ -274,10 +400,9 @@ impl SessionContext {
 
                 Ok(ResultSet::Bytes((body.to_vec(), 0)))
             }
-            _ => {
+            code => {
                 let body = resp.text().await?;
-
-                Ok(ResultSet::Bytes((body.into(), 0)))
+                Err(anyhow!("{}, body: {}", code, body))
             }
         }
     }
@@ -297,6 +422,37 @@ impl SessionContext {
             self.write_line_protocol_file(dir_entry.path()).await?;
         }
         Ok(())
+    }
+
+    pub async fn dump(&self, tenants: Vec<Option<String>>) -> Result<String> {
+        let user_info = &self.session_config.user_info;
+
+        let mut res = String::new();
+        let tenants = if tenants.is_empty() {
+            vec![None]
+        } else {
+            tenants
+        };
+
+        for tenant in tenants {
+            let param = DumpParam { tenant };
+            let mut builder = self
+                .http_client
+                .get(API_V1_DUMP_SQL_DDL_PATH)
+                .basic_auth::<&str, &str>(&user_info.user, user_info.password.as_deref());
+            builder = if let Some(key) = &user_info.private_key {
+                let key = BASE64_STANDARD.encode(key);
+                builder.header(PRIVATE_KEY, key)
+            } else {
+                builder
+            }
+            .query(&param);
+
+            let resp = builder.send().await?;
+
+            res += &resp.text().await?;
+        }
+        Ok(res)
     }
 }
 

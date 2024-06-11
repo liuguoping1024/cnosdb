@@ -1,4 +1,5 @@
 use http_protocol::header::{self, PRIVATE_KEY};
+use models::schema::DEFAULT_CATALOG;
 use spi::server::dbms::DBMSRef;
 use tonic::metadata::MetadataMap;
 use tonic::Status;
@@ -30,7 +31,7 @@ impl CallHeaderAuthenticator for BasicCallHeaderAuthenticator {
             .ok_or_else(|| Status::unauthenticated("authorization field not present"))?;
         let private_key = utils::get_value_from_header(req_headers, PRIVATE_KEY, "");
 
-        let user_info = Header::with_private_key(None, authorization, private_key)
+        let user_info = Header::with_private_key(None, None, None, authorization, private_key)
             .try_get_basic_auth()
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
@@ -38,7 +39,7 @@ impl CallHeaderAuthenticator for BasicCallHeaderAuthenticator {
 
         let user = self
             .instance
-            .authenticate(&user_info, tenant.as_deref())
+            .authenticate(&user_info, tenant.as_deref().unwrap_or(DEFAULT_CATALOG))
             .await
             .map_err(|e| Status::unauthenticated(e.to_string()))?;
 

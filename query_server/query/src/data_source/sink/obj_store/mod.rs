@@ -13,7 +13,8 @@ use futures::{pin_mut, TryStreamExt};
 use object_store::path::Path;
 use object_store::DynObjectStore;
 use spi::query::datasource::WriteContext;
-use spi::{QueryError, Result};
+use spi::query::session::SqlExecInfo;
+use spi::{ObjectStoreSnafu, QueryError, QueryResult};
 use trace::debug;
 
 use super::DynRecordBatchSerializer;
@@ -25,29 +26,21 @@ pub struct ObjectStoreSink {
     object_store: Arc<DynObjectStore>,
 }
 
-// 128MB
-const MAX_FILE_SIZXE: usize = 128 * 1024 * 1024;
-
 #[async_trait]
 impl RecordBatchSink for ObjectStoreSink {
-    async fn append(&self, _: RecordBatch) -> Result<SinkMetadata> {
+    async fn append(&self, _: RecordBatch) -> QueryResult<SinkMetadata> {
         Err(QueryError::Unimplement {
             msg: "ObjectStoreRecordBatchSink::append".to_string(),
         })
     }
 
-    async fn stream_write(&self, stream: SendableRecordBatchStream) -> Result<SinkMetadata> {
+    async fn stream_write(&self, stream: SendableRecordBatchStream) -> QueryResult<SinkMetadata> {
         debug!("Process ObjectStoreRecordBatchSink::stream_write");
 
         pin_mut!(stream);
 
-        let mut writer = BufferedWriter::new(
-            &self.ctx,
-            &self.s,
-            &self.object_store,
-            stream.schema(),
-            MAX_FILE_SIZXE,
-        );
+        let mut writer =
+            BufferedWriter::new(&self.ctx, &self.s, &self.object_store, stream.schema());
 
         while let Some(batch) = stream.try_next().await? {
             writer.write(batch).await?;
@@ -62,6 +55,7 @@ pub struct ObjectStoreSinkProvider {
     object_store: Arc<DynObjectStore>,
     serializer: Arc<DynRecordBatchSerializer>,
     file_extension: String,
+    schema: SchemaRef,
 }
 
 impl ObjectStoreSinkProvider {
@@ -70,17 +64,23 @@ impl ObjectStoreSinkProvider {
         object_store: Arc<DynObjectStore>,
         serializer: Arc<DynRecordBatchSerializer>,
         file_extension: String,
+        schema: SchemaRef,
     ) -> Self {
         Self {
             location,
             object_store,
             serializer,
             file_extension,
+            schema,
         }
     }
 }
 
 impl RecordBatchSinkProvider for ObjectStoreSinkProvider {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+
     fn create_batch_sink(
         &self,
         context: Arc<TaskContext>,
@@ -88,10 +88,18 @@ impl RecordBatchSinkProvider for ObjectStoreSinkProvider {
         partition: usize,
     ) -> Box<dyn RecordBatchSink> {
         let ctx = WriteContext::new(
+            context.session_id(),
             self.location.clone(),
             context.task_id(),
             partition,
             self.file_extension.clone(),
+            context
+                .session_config()
+                .options()
+                .extensions
+                .get::<SqlExecInfo>()
+                .unwrap()
+                .clone(),
         );
 
         Box::new(ObjectStoreSink {
@@ -131,14 +139,13 @@ impl<'a> BufferedWriter<'a> {
         s: &'a Arc<DynRecordBatchSerializer>,
         object_store: &'a Arc<DynObjectStore>,
         schema: SchemaRef,
-        max_file_sizxe: usize,
     ) -> Self {
         Self {
             ctx,
             s,
             object_store,
             schema,
-            max_file_size: max_file_sizxe,
+            max_file_size: ctx.sql_exec_info().copyinto_trigger_flush_size as usize,
             buffer: Default::default(),
             buffered_size: Default::default(),
             rows_writed: Default::default(),
@@ -147,14 +154,14 @@ impl<'a> BufferedWriter<'a> {
         }
     }
 
-    pub async fn write(&mut self, batch: RecordBatch) -> Result<()> {
+    pub async fn write(&mut self, batch: RecordBatch) -> QueryResult<()> {
         self.buffered_size += batch.get_array_memory_size();
         self.buffer.push(batch);
         self.try_flush().await?;
         Ok(())
     }
 
-    pub async fn try_flush(&mut self) -> Result<()> {
+    pub async fn try_flush(&mut self) -> QueryResult<()> {
         if self.buffered_size >= self.max_file_size {
             self.flush().await?;
         }
@@ -162,7 +169,7 @@ impl<'a> BufferedWriter<'a> {
         Ok(())
     }
 
-    async fn flush(&mut self) -> Result<()> {
+    async fn flush(&mut self) -> QueryResult<()> {
         if self.buffered_size == 0 {
             return Ok(());
         }
@@ -185,14 +192,18 @@ impl<'a> BufferedWriter<'a> {
 
         if bytes_writed > 0 {
             let path = self.ctx.location().child(format!(
-                "part-{}-{}-{}{}",
+                "queryId-{}-part-{}-{}-{}{}",
+                self.ctx.query_id(),
                 self.ctx.task_id(),
                 self.ctx.partition(),
                 self.file_number.fetch_add(1, Ordering::Relaxed),
                 self.ctx.file_extension()
             ));
 
-            self.object_store.put(&path, data).await?;
+            self.object_store
+                .put(&path, data)
+                .await
+                .map_err(|e| ObjectStoreSnafu { msg: e.to_string() }.build())?;
 
             debug!("Generated file: {}, size: {} bytes.", path, bytes_writed);
 
@@ -203,7 +214,7 @@ impl<'a> BufferedWriter<'a> {
         Ok(())
     }
 
-    pub async fn close(mut self) -> Result<SinkMetadata> {
+    pub async fn close(mut self) -> QueryResult<SinkMetadata> {
         self.flush().await?;
 
         Ok(SinkMetadata::new(self.rows_writed, self.bytes_writed))

@@ -7,7 +7,7 @@ use spi::query::execution::{
     QueryStateMachineRef,
 };
 use spi::query::logical_planner::CreateRole;
-use spi::{QueryError, Result};
+use spi::{MetaSnafu, QueryError, QueryResult};
 use trace::debug;
 
 use crate::execution::ddl::DDLDefinitionTask;
@@ -24,7 +24,7 @@ impl CreateRoleTask {
 
 #[async_trait]
 impl DDLDefinitionTask for CreateRoleTask {
-    async fn execute(&self, query_state_machine: QueryStateMachineRef) -> Result<Output> {
+    async fn execute(&self, query_state_machine: QueryStateMachineRef) -> QueryResult<Output> {
         let CreateRole {
             ref tenant_name,
             ref name,
@@ -38,9 +38,8 @@ impl DDLDefinitionTask for CreateRoleTask {
         //     role_name: &str,
         //     tenant_id: &Oid,
         // ) -> Result<Option<CustomTenantRole<Oid>>>;
-        let tenant_manager = query_state_machine.meta.tenant_manager();
-
-        let meta = tenant_manager
+        let meta = query_state_machine
+            .meta
             .tenant_meta(tenant_name)
             .await
             .ok_or_else(|| QueryError::Meta {
@@ -49,7 +48,7 @@ impl DDLDefinitionTask for CreateRoleTask {
                 },
             })?;
 
-        let role = meta.custom_role(name).await?;
+        let role = meta.custom_role(name).await.context(MetaSnafu)?;
         // .context(MetaSnafu)?;
 
         match (if_not_exists, role) {
@@ -71,7 +70,7 @@ impl DDLDefinitionTask for CreateRoleTask {
                 //     tenant_id: &Oid,
                 //     role_name: String,
                 //     system_role: SystemTenantRole,
-                //     additiona_privileges: HashMap<String, DatabasePrivilege>,
+                //     additional_privileges: HashMap<String, DatabasePrivilege>,
                 // ) -> Result<()>;
                 debug!(
                     "Create role {} of tenant {} inherit {:?}",
@@ -83,8 +82,8 @@ impl DDLDefinitionTask for CreateRoleTask {
                     inherit_tenant_role.clone(),
                     Default::default(),
                 )
-                .await?;
-                // .context(MetaSnafu)?;
+                .await
+                .context(MetaSnafu)?;
 
                 Ok(Output::Nil(()))
             }

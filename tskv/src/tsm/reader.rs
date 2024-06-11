@@ -1,994 +1,439 @@
-use std::fmt::Debug;
+use std::collections::BTreeMap;
+use std::fmt::{Debug, Formatter};
 use std::path::Path;
 use std::sync::Arc;
 
-use models::predicate::domain::{TimeRange, TimeRanges};
-use models::{FieldId, ValueType};
-use parking_lot::RwLock;
-use snafu::{ResultExt, Snafu};
-use utils::BloomFilter;
+use bytes::Bytes;
+use models::predicate::domain::TimeRange;
+use models::schema::{TskvTableSchemaRef, TIME_FIELD};
+use models::SeriesId;
+use snafu::OptionExt;
 
-use crate::byte_utils::{self, decode_be_i64, decode_be_u16, decode_be_u64};
-use crate::error::{self, Error, Result};
-use crate::file_system::file::async_file::AsyncFile;
-use crate::file_system::file::IFile;
-use crate::file_system::file_manager;
-use crate::file_utils;
-use crate::tsm::codec::{
-    get_bool_codec, get_encoding, get_f64_codec, get_i64_codec, get_str_codec, get_ts_codec,
-    get_u64_codec, DataBlockEncoding,
-};
-use crate::tsm::tombstone::TsmTombstone;
-use crate::tsm::{
-    get_data_block_meta_unchecked, get_index_meta_unchecked, BlockEntry, BlockMeta, DataBlock,
-    Index, IndexEntry, IndexMeta, BLOCK_META_SIZE, BLOOM_FILTER_SIZE, FOOTER_SIZE, INDEX_META_SIZE,
-    MAX_BLOCK_VALUES,
-};
+use crate::error::{CommonSnafu, ReadTsmSnafu, TskvResult};
+use crate::file_system::async_filesystem::{LocalFileSystem, LocalFileType};
+use crate::file_system::file::stream_reader::FileStreamReader;
+use crate::file_system::FileSystem;
+use crate::tsm::chunk::Chunk;
+use crate::tsm::chunk_group::{ChunkGroup, ChunkGroupMeta};
+use crate::tsm::data_block::{DataBlock, MutableColumn};
+use crate::tsm::footer::Footer;
+use crate::tsm::page::{Page, PageMeta, PageWriteSpec};
+use crate::tsm::{ColumnGroupID, TsmTombstone, FOOTER_SIZE};
+use crate::{file_utils, TskvError};
 
-pub type ReadTsmResult<T, E = ReadTsmError> = std::result::Result<T, E>;
-
-#[derive(Snafu, Debug)]
-#[snafu(visibility(pub))]
-pub enum ReadTsmError {
-    #[snafu(display("IO error: {}", source))]
-    IO { source: std::io::Error },
-
-    #[snafu(display("Decode error: {}", source))]
-    Decode {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display("Datablock crc32 check failed"))]
-    CrcCheck,
-
-    #[snafu(display("TSM file is lost: {}", reason))]
-    FileNotFound { reason: String },
-
-    #[snafu(display("TSM file is invalid: {}", reason))]
-    Invalid { reason: String },
+pub struct TsmMetaData {
+    footer: Arc<Footer>,
+    chunk_group_meta: Arc<ChunkGroupMeta>,
+    chunk_group: BTreeMap<String, Arc<ChunkGroup>>,
+    chunk: BTreeMap<SeriesId, Arc<Chunk>>,
 }
 
-impl From<ReadTsmError> for Error {
-    fn from(rte: ReadTsmError) -> Self {
-        Error::ReadTsm { source: rte }
-    }
-}
-
-/// Disk-based index reader
-pub struct IndexFile {
-    reader: Arc<AsyncFile>,
-    bloom_filter: BloomFilter,
-    idx_meta_buf: [u8; INDEX_META_SIZE],
-    blk_meta_buf: [u8; BLOCK_META_SIZE],
-
-    index_offset: u64,
-    pos: u64,
-    end_pos: u64,
-    index_block_idx: usize,
-    index_block_count: usize,
-}
-
-impl IndexFile {
-    pub(crate) async fn open(reader: Arc<AsyncFile>) -> ReadTsmResult<Self> {
-        let file_len = reader.len();
-        let mut footer = [0_u8; FOOTER_SIZE];
-        reader
-            .read_at(file_len - FOOTER_SIZE as u64, &mut footer)
-            .await
-            .context(IOSnafu)?;
-        let bloom_filter = BloomFilter::with_data(&footer[..BLOOM_FILTER_SIZE]);
-        let index_offset = decode_be_u64(&footer[BLOOM_FILTER_SIZE..]);
-        Ok(Self {
-            reader,
-            bloom_filter,
-            idx_meta_buf: [0_u8; INDEX_META_SIZE],
-            blk_meta_buf: [0_u8; BLOCK_META_SIZE],
-            index_offset,
-            pos: index_offset,
-            end_pos: file_len - FOOTER_SIZE as u64,
-            index_block_idx: 0,
-            index_block_count: 0,
-        })
-    }
-
-    // TODO: not implemented
-    pub(crate) async fn next_index_entry(&mut self) -> ReadTsmResult<Option<IndexEntry>> {
-        if self.pos >= self.end_pos {
-            return Ok(None);
-        }
-        self.reader
-            .read_at(self.pos, &mut self.idx_meta_buf[..])
-            .await
-            .context(IOSnafu)?;
-        self.pos += INDEX_META_SIZE as u64;
-        let (entry, blk_count) = IndexEntry::decode(&self.idx_meta_buf);
-        self.index_block_idx = 0;
-        self.index_block_count = blk_count as usize;
-
-        Ok(Some(entry))
-    }
-
-    // TODO: not implemented
-    pub(crate) async fn next_block_entry(&mut self) -> ReadTsmResult<Option<BlockEntry>> {
-        if self.index_block_idx >= self.index_block_count {
-            return Ok(None);
-        }
-        self.reader
-            .read_at(self.pos, &mut self.blk_meta_buf[..])
-            .await
-            .context(IOSnafu)?;
-        self.pos += BLOCK_META_SIZE as u64;
-        let entry = BlockEntry::decode(&self.blk_meta_buf);
-        self.index_block_idx += 1;
-
-        Ok(Some(entry))
-    }
-}
-
-pub async fn print_tsm_statistics(path: impl AsRef<Path>, show_tombstone: bool) {
-    let reader = TsmReader::open(path).await.unwrap();
-    let mut points_cnt = 0_usize;
-    println!("============================================================");
-    for idx in reader.index_iterator() {
-        let tr = idx.time_range();
-        let mut buffer = String::with_capacity(1024);
-        let mut idx_points_cnt = 0_usize;
-        for blk in idx.block_iterator() {
-            buffer.push_str(
-                format!(
-                    "\tBlock | FieldId: {}, MinTime: {}, MaxTime: {}, Count: {}, Offset: {}, Size: {}, ValOffset: {}\n",
-                    blk.field_id(), blk.min_ts(), blk.max_ts(), blk.count(), blk.offset(), blk.size(), blk.val_off()
-                ).as_str()
-            );
-            points_cnt += blk.count() as usize;
-            idx_points_cnt += blk.count() as usize;
-        }
-        if !buffer.is_empty() {
-            buffer.truncate(buffer.len() - 1);
-        }
-        println!("============================================================");
-        println!("Offset: {} | Field | FieldId: {}, FieldType: {:?}, BlockCount: {}, MinTime: {}, MaxTime: {}, PointsCount: {}",
-                 idx.offset(),
-                 idx.field_id(),
-                 idx.field_type(),
-                 idx.block_count(),
-                 tr.0,
-                 tr.1,
-                 idx_points_cnt);
-        println!("------------------------------------------------------------");
-        println!("{}", buffer);
-        if show_tombstone {
-            println!("------------------------------------------------------------");
-            print!("Tombstone | ");
-            if let Some(time_ranges) = reader.get_cloned_tombstone_time_ranges(idx.field_id()) {
-                if time_ranges.is_empty() {
-                    println!("None");
-                } else {
-                    for (i, tr) in time_ranges.iter().enumerate() {
-                        if i == time_ranges.len() - 1 {
-                            println!("({}, {})", tr.min_ts, tr.max_ts);
-                        } else {
-                            print!("({}, {}), ", tr.min_ts, tr.max_ts);
-                        }
-                    }
-                }
-            } else {
-                println!("None");
-            }
-        }
-    }
-    println!("============================================================");
-    println!("============================================================");
-    println!("PointsCount: {}", points_cnt);
-}
-
-pub async fn load_index(tsm_id: u64, reader: Arc<AsyncFile>) -> ReadTsmResult<Index> {
-    let len = reader.len();
-    if len < FOOTER_SIZE as u64 {
-        return Err(ReadTsmError::Invalid {
-            reason: format!(
-                "TSM file ({}) size less than FOOTER_SIZE({})",
-                tsm_id, FOOTER_SIZE
-            ),
-        });
-    }
-    let mut buf = [0u8; FOOTER_SIZE];
-
-    // Read index data offset
-    reader
-        .read_at(len - FOOTER_SIZE as u64, &mut buf)
-        .await
-        .context(IOSnafu)?;
-    let bloom_filter = BloomFilter::with_data(&buf[..BLOOM_FILTER_SIZE]);
-    let offset = decode_be_u64(&buf[BLOOM_FILTER_SIZE..]);
-    if offset > len - FOOTER_SIZE as u64 {
-        return Err(ReadTsmError::Invalid {
-            reason: format!(
-                "TSM file ({}) size less than index offset({})",
-                tsm_id, offset
-            ),
-        });
-    }
-    let data_len = (len - offset - FOOTER_SIZE as u64) as usize;
-    // TODO if data_len is too big, read data part in parts and do not store it.
-    let mut data = vec![0_u8; data_len];
-    // Read index data
-    reader.read_at(offset, &mut data).await.context(IOSnafu)?;
-
-    // Decode index data
-    let assumed_field_count = (data_len / (INDEX_META_SIZE + BLOCK_META_SIZE)) + 1;
-    let mut field_id_offs: Vec<(FieldId, usize)> = Vec::with_capacity(assumed_field_count);
-    let mut pos = 0_usize;
-    while pos < data_len {
-        field_id_offs.push((decode_be_u64(&data[pos..pos + 8]), pos));
-        pos += INDEX_META_SIZE + BLOCK_META_SIZE * decode_be_u16(&data[pos + 9..pos + 11]) as usize;
-    }
-
-    // Sort by field id
-    // NOTICE that there must be no two equal field_ids.
-    field_id_offs.sort_unstable_by_key(|e| e.0);
-
-    Ok(Index::new(
-        tsm_id,
-        Arc::new(bloom_filter),
-        data,
-        field_id_offs,
-    ))
-}
-
-/// Memory-based index reader
-pub struct IndexReader {
-    index_ref: Arc<Index>,
-}
-
-impl IndexReader {
-    pub async fn open(tsm_id: u64, reader: Arc<AsyncFile>) -> Result<Self> {
-        let idx = load_index(tsm_id, reader)
-            .await
-            .context(error::ReadTsmSnafu)?;
-
-        Ok(Self {
-            index_ref: Arc::new(idx),
-        })
-    }
-
-    pub fn iter(&self) -> IndexIterator {
-        IndexIterator::new(
-            self.index_ref.clone(),
-            self.index_ref.field_id_offs().len(),
-            0,
-        )
-    }
-
-    /// Create `IndexIterator` by filter options
-    pub fn iter_opt(&self, field_id: FieldId) -> IndexIterator {
-        if let Ok(idx) = self
-            .index_ref
-            .field_id_offs()
-            .binary_search_by_key(&field_id, |f| f.0)
-        {
-            IndexIterator::new(self.index_ref.clone(), 1, idx)
-        } else {
-            IndexIterator::new(self.index_ref.clone(), 0, 0)
-        }
-    }
-}
-
-pub struct IndexIterator {
-    index_ref: Arc<Index>,
-    /// Array index in `Index::offsets`.
-    index_idx: usize,
-    block_count: usize,
-    block_type: ValueType,
-
-    /// The max number of iterations
-    index_meta_limit: usize,
-    /// The current iteration number.
-    index_meta_idx: usize,
-}
-
-impl IndexIterator {
-    pub fn new(index: Arc<Index>, total: usize, from_idx: usize) -> Self {
-        Self {
-            index_ref: index,
-            index_idx: from_idx,
-            block_count: 0,
-            block_type: ValueType::Unknown,
-            index_meta_limit: total,
-            index_meta_idx: 0,
-        }
-    }
-}
-
-impl Iterator for IndexIterator {
-    type Item = IndexMeta;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.index_meta_idx >= self.index_meta_limit {
-            return None;
-        }
-        self.index_meta_idx += 1;
-
-        let ret = Some(get_index_meta_unchecked(
-            self.index_ref.clone(),
-            self.index_idx,
-        ));
-        self.index_idx += 1;
-        ret
-    }
-}
-
-/// Iterates `BlockMeta`s in Index of a file.
-pub struct BlockMetaIterator {
-    index_ref: Arc<Index>,
-    /// Array index in `Index::offsets`
-    index_offset: usize,
-    field_id: FieldId,
-    field_type: ValueType,
-    /// Array index in `Index::data` which current `BlockMeta` starts.
-    block_offset: usize,
-    /// Number of `BlockMeta` in current `IndexMeta`
-    block_count: u16,
-    time_ranges: Option<Arc<TimeRanges>>,
-
-    /// The current iteration number.
-    block_meta_idx: usize,
-    /// The max number of iterations
-    block_meta_idx_end: usize,
-}
-
-impl BlockMetaIterator {
+impl TsmMetaData {
     pub fn new(
-        index: Arc<Index>,
-        index_offset: usize,
-        field_id: FieldId,
-        field_type: ValueType,
-        block_count: u16,
+        footer: Arc<Footer>,
+        chunk_group_meta: Arc<ChunkGroupMeta>,
+        chunk_group: BTreeMap<String, Arc<ChunkGroup>>,
+        chunk: BTreeMap<SeriesId, Arc<Chunk>>,
     ) -> Self {
         Self {
-            index_ref: index,
-            index_offset,
-            field_id,
-            field_type,
-            block_offset: index_offset + INDEX_META_SIZE,
-            block_count,
-            time_ranges: None,
-            block_meta_idx_end: block_count as usize,
-            block_meta_idx: 0,
+            footer,
+            chunk_group_meta,
+            chunk_group,
+            chunk,
         }
     }
 
-    /// Set iterator start & end position by time range
-    pub(crate) fn filter_time_range(&mut self, time_ranges: Arc<TimeRanges>) {
-        if time_ranges.is_boundless() {
-            self.time_ranges = Some(time_ranges);
-            return;
-        }
-        let min_ts = time_ranges.min_ts();
-        let max_ts = time_ranges.max_ts();
-        if min_ts > max_ts {
-            // This condition will match no results.
+    pub fn footer(&self) -> Arc<Footer> {
+        self.footer.clone()
+    }
 
-            // TODO: Drop this iterator and return a new type of
-            // iterator that always returns none.
-            self.time_ranges = Some(time_ranges);
-            return;
-        }
-        self.time_ranges = Some(time_ranges);
-        let base = self.index_offset + INDEX_META_SIZE;
-        let sli = &self.index_ref.data()[base..base + self.block_count as usize * BLOCK_META_SIZE];
-        let mut pos = 0_usize;
-        let mut idx = 0_usize;
-        // Find `idx` of index blocks that time_range.min_ts <= block.max_ts .
-        while pos < sli.len() {
-            if min_ts > decode_be_i64(&sli[pos + 8..pos + 16]) {
-                // If time_range.min_ts > block.max_ts, go on to check next block.
-                pos += BLOCK_META_SIZE;
-                idx += 1;
-            } else {
-                // If time_range.min_ts <= block.max_ts, This block may be the start block.
-                self.block_offset = pos;
-                break;
+    pub fn chunk_group_meta(&self) -> Arc<ChunkGroupMeta> {
+        self.chunk_group_meta.clone()
+    }
+
+    pub fn chunk_group(&self) -> &BTreeMap<String, Arc<ChunkGroup>> {
+        &self.chunk_group
+    }
+
+    pub fn chunk(&self) -> &BTreeMap<SeriesId, Arc<Chunk>> {
+        &self.chunk
+    }
+
+    pub fn table_schema(&self, table_name: &str) -> Option<TskvTableSchemaRef> {
+        self.chunk_group_meta.table_schema(table_name)
+    }
+
+    pub fn table_schema_by_sid(&self, series_id: SeriesId) -> Option<TskvTableSchemaRef> {
+        let table_name = self.table_name(series_id)?;
+        self.table_schema(table_name)
+    }
+
+    pub fn table_name(&self, series_id: SeriesId) -> Option<&str> {
+        for (table_name, series_map) in self.chunk_group.iter() {
+            if series_map
+                .chunks()
+                .iter()
+                .any(|c| c.series_id() == series_id)
+            {
+                return Some(table_name.as_ref());
             }
-        }
-        self.block_meta_idx = idx;
-        self.block_meta_idx_end = idx;
-        if idx >= self.block_count as usize {
-            // If there are no blocks that time_range.min_ts <= block.max_ts .
-            return;
-        }
-
-        // Find idx of index blocks that block.min_ts <= time_range.max_ts >= block.max_ts .
-        while pos < sli.len() {
-            if max_ts < decode_be_i64(&sli[pos..pos + 8]) {
-                // If time_range.max_ts < block.min_ts, previous block is the end block.
-                return;
-            } else if max_ts < decode_be_i64(&sli[pos + 8..pos + 16]) {
-                // If time_range.max_ts < block.max_ts, this block is the end block.
-                self.block_meta_idx_end += 1;
-                return;
-            } else {
-                // If time_range.max_ts >= block.max_ts, go on to check next block.
-                self.block_meta_idx_end += 1;
-                pos += BLOCK_META_SIZE;
-            }
-        }
-    }
-}
-
-impl Iterator for BlockMetaIterator {
-    type Item = BlockMeta;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.block_meta_idx >= self.block_meta_idx_end {
-            return None;
-        }
-        let mut ret = None;
-        if let Some(time_ranges) = self.time_ranges.as_ref() {
-            for _ in self.block_meta_idx..self.block_meta_idx_end {
-                let block_meta = get_data_block_meta_unchecked(
-                    self.index_ref.clone(),
-                    self.index_offset,
-                    self.block_meta_idx,
-                    self.field_id,
-                    self.field_type,
-                );
-                self.block_meta_idx += 1;
-                self.block_offset += BLOCK_META_SIZE;
-                if time_ranges.overlaps(&(block_meta.min_ts(), block_meta.max_ts()).into()) {
-                    ret = Some(block_meta);
-                    break;
-                }
-            }
-        } else {
-            let block_meta = get_data_block_meta_unchecked(
-                self.index_ref.clone(),
-                self.index_offset,
-                self.block_meta_idx,
-                self.field_id,
-                self.field_type,
-            );
-            self.block_meta_idx += 1;
-            self.block_offset += BLOCK_META_SIZE;
-            ret = Some(block_meta);
-        }
-
-        ret
-    }
-}
-
-#[derive(Clone)]
-pub struct TsmReader {
-    file_id: u64,
-    reader: Arc<AsyncFile>,
-    index_reader: Arc<IndexReader>,
-    tombstone: Arc<RwLock<TsmTombstone>>,
-}
-
-impl TsmReader {
-    pub async fn open(tsm_path: impl AsRef<Path>) -> Result<Self> {
-        let path = tsm_path.as_ref().to_path_buf();
-        let file_id = file_utils::get_tsm_file_id_by_path(&path)?;
-        let tsm = Arc::new(file_manager::open_file(tsm_path).await?);
-        let tsm_idx = IndexReader::open(file_id, tsm.clone()).await?;
-        let tombstone_path = path.parent().unwrap_or_else(|| Path::new("/"));
-        let tombstone = TsmTombstone::open(tombstone_path, file_id).await?;
-        Ok(Self {
-            file_id,
-            reader: tsm,
-            index_reader: Arc::new(tsm_idx),
-            tombstone: Arc::new(RwLock::new(tombstone)),
-        })
-    }
-
-    pub fn index_iterator(&self) -> IndexIterator {
-        self.index_reader.iter()
-    }
-
-    pub fn index_iterator_opt(&self, field_id: FieldId) -> IndexIterator {
-        self.index_reader.iter_opt(field_id)
-    }
-
-    /// Returns a DataBlock without tombstone
-    pub async fn get_data_block(&self, block_meta: &BlockMeta) -> ReadTsmResult<DataBlock> {
-        let _blk_range = (block_meta.min_ts(), block_meta.max_ts());
-        let mut buf = vec![0_u8; block_meta.size() as usize];
-        let mut blk = read_data_block(
-            self.reader.clone(),
-            &mut buf,
-            block_meta.field_type(),
-            block_meta.offset(),
-            block_meta.val_off(),
-        )
-        .await?;
-        self.tombstone
-            .read()
-            .data_block_exclude_tombstones(block_meta.field_id(), &mut blk);
-        Ok(blk)
-    }
-
-    // Reads raw data from file and returns the read data size.
-    pub async fn get_raw_data(
-        &self,
-        block_meta: &BlockMeta,
-        dst: &mut Vec<u8>,
-    ) -> ReadTsmResult<usize> {
-        let data_len = block_meta.size() as usize;
-        if dst.len() < data_len {
-            dst.resize(data_len, 0);
-        }
-        self.reader
-            .read_at(block_meta.offset(), &mut dst[..data_len])
-            .await
-            .context(IOSnafu)?;
-        Ok(data_len)
-    }
-
-    pub fn has_tombstone(&self) -> bool {
-        !self.tombstone.read().is_empty()
-    }
-
-    /// Returns all tombstone `TimeRange`s for a `BlockMeta`.
-    /// Returns None if there is nothing to return, or `TimeRange`s is empty.
-    pub fn get_block_tombstone_time_ranges(
-        &self,
-        block_meta: &BlockMeta,
-    ) -> Option<Vec<TimeRange>> {
-        return self.tombstone.read().get_overlapped_time_ranges(
-            block_meta.field_id(),
-            &TimeRange::from((block_meta.min_ts(), block_meta.max_ts())),
-        );
-    }
-
-    /// Returns all TimeRanges for a FieldId cloned from TsmTombstone.
-    pub(crate) fn get_cloned_tombstone_time_ranges(
-        &self,
-        field_id: FieldId,
-    ) -> Option<Vec<TimeRange>> {
-        self.tombstone.read().get_cloned_time_ranges(field_id)
-    }
-
-    pub(crate) fn file_id(&self) -> u64 {
-        self.file_id
-    }
-
-    pub(crate) fn bloom_filter(&self) -> Arc<BloomFilter> {
-        self.index_reader.index_ref.bloom_filter()
-    }
-}
-
-impl Debug for TsmReader {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TsmReader")
-            .field("id", &self.file_id)
-            .field("fd", &self.reader.fd())
-            .finish()
-    }
-}
-
-pub struct ColumnReader {
-    reader: Arc<AsyncFile>,
-    inner: BlockMetaIterator,
-    buf: Vec<u8>,
-}
-
-impl ColumnReader {
-    pub fn new(reader: Arc<AsyncFile>, inner: BlockMetaIterator) -> Self {
-        Self {
-            reader,
-            inner,
-            buf: vec![],
-        }
-    }
-
-    async fn decode(&mut self, block_meta: &BlockMeta) -> ReadTsmResult<DataBlock> {
-        let (_offset, size) = (block_meta.offset(), block_meta.size());
-        self.buf.resize(size as usize, 0);
-        read_data_block(
-            self.reader.clone(),
-            &mut self.buf,
-            block_meta.field_type(),
-            block_meta.offset(),
-            block_meta.val_off(),
-        )
-        .await
-    }
-}
-
-impl ColumnReader {
-    pub async fn next(&mut self) -> Option<Result<DataBlock>> {
-        if let Some(dbm) = self.inner.next() {
-            let res = self.decode(&dbm).await.context(error::ReadTsmSnafu);
-            return Some(res);
         }
         None
     }
 }
 
-async fn read_data_block(
-    reader: Arc<AsyncFile>,
-    buf: &mut [u8],
-    field_type: ValueType,
-    offset: u64,
-    val_off: u64,
-) -> ReadTsmResult<DataBlock> {
-    reader.read_at(offset, buf).await.context(IOSnafu)?;
-    decode_data_block(buf, field_type, val_off - offset)
+pub struct TsmReader {
+    file_id: u64,
+    reader: Box<FileStreamReader>,
+    tsm_meta: Arc<TsmMetaData>,
+    tombstone: Arc<TsmTombstone>,
 }
 
-pub fn decode_data_block(
-    buf: &[u8],
-    field_type: ValueType,
-    val_off: u64,
-) -> ReadTsmResult<DataBlock> {
-    debug_assert!(buf.len() >= 8);
-    if buf.len() < 8 {
-        return Err(ReadTsmError::Decode {
-            source: "buffer too short".into(),
-        });
-    }
+impl TsmReader {
+    pub async fn open(tsm_path: impl AsRef<Path>) -> TskvResult<Self> {
+        let path = tsm_path.as_ref().to_path_buf();
+        let file_system = LocalFileSystem::new(LocalFileType::ThreadPool);
+        let reader = file_system
+            .open_file_reader(&path)
+            .await
+            .map_err(|e| TskvError::FileSystemError { source: e })?;
 
-    if byte_utils::decode_be_u32(&buf[..4]) != crc32fast::hash(&buf[4..val_off as usize]) {
-        return Err(ReadTsmError::CrcCheck);
-    }
-    let mut ts = Vec::with_capacity(MAX_BLOCK_VALUES as usize);
-    let ts_encoding = get_encoding(&buf[4..val_off as usize]);
-    let ts_codec = get_ts_codec(ts_encoding);
-    ts_codec
-        .decode(&buf[4..val_off as usize], &mut ts)
-        .context(DecodeSnafu)?;
+        let file_id = file_utils::get_tsm_file_id_by_path(&path)?;
 
-    if byte_utils::decode_be_u32(&buf[val_off as usize..])
-        != crc32fast::hash(&buf[(val_off + 4) as usize..])
-    {
-        return Err(ReadTsmError::CrcCheck);
-    }
-    let data = &buf[(val_off + 4) as usize..];
-    match field_type {
-        ValueType::Float => {
-            // values will be same length as time-stamps.
-            let mut val = Vec::with_capacity(ts.len());
-            let val_encoding = get_encoding(data);
-            let val_codec = get_f64_codec(val_encoding);
-            val_codec.decode(data, &mut val).context(DecodeSnafu)?;
-            Ok(DataBlock::F64 {
-                ts,
-                val,
-                enc: DataBlockEncoding::new(ts_encoding, val_encoding),
-            })
-        }
-        ValueType::Integer => {
-            // values will be same length as time-stamps.
-            let mut val = Vec::with_capacity(ts.len());
-            let val_encoding = get_encoding(data);
-            let val_codec = get_i64_codec(val_encoding);
-            val_codec.decode(data, &mut val).context(DecodeSnafu)?;
-            Ok(DataBlock::I64 {
-                ts,
-                val,
-                enc: DataBlockEncoding::new(ts_encoding, val_encoding),
-            })
-        }
-        ValueType::Boolean => {
-            // values will be same length as time-stamps.
-            let mut val = Vec::with_capacity(ts.len());
-            let val_encoding = get_encoding(data);
-            let val_codec = get_bool_codec(val_encoding);
-            val_codec.decode(data, &mut val).context(DecodeSnafu)?;
-            Ok(DataBlock::Bool {
-                ts,
-                val,
-                enc: DataBlockEncoding::new(ts_encoding, val_encoding),
-            })
-        }
-        ValueType::String => {
-            // values will be same length as time-stamps.
-            let mut val = Vec::with_capacity(ts.len());
-            let val_encoding = get_encoding(data);
-            let val_codec = get_str_codec(val_encoding);
-            val_codec.decode(data, &mut val).context(DecodeSnafu)?;
-            Ok(DataBlock::Str {
-                ts,
-                val,
-                enc: DataBlockEncoding::new(ts_encoding, val_encoding),
-            })
-        }
-        ValueType::Unsigned => {
-            // values will be same length as time-stamps.
-            let mut val = Vec::with_capacity(ts.len());
-            let val_encoding = get_encoding(data);
-            let val_codec = get_u64_codec(val_encoding);
-            val_codec.decode(data, &mut val).context(DecodeSnafu)?;
-            Ok(DataBlock::U64 {
-                ts,
-                val,
-                enc: DataBlockEncoding::new(ts_encoding, val_encoding),
-            })
-        }
-        _ => Err(ReadTsmError::Decode {
-            source: From::from(format!(
-                "cannot decode block {:?} with no unknown value type",
-                field_type
-            )),
-        }),
-    }
-}
+        let footer = Arc::new(read_footer(&reader).await?);
+        let chunk_group_meta = Arc::new(read_chunk_group_meta(&reader, &footer).await?);
+        let chunk_group = read_chunk_groups(&reader, &chunk_group_meta).await?;
+        let chunk = read_chunk(&reader, &chunk_group).await?;
 
-#[cfg(test)]
-pub mod tsm_reader_tests {
-    use core::panic;
-    use std::collections::HashMap;
-    use std::path::{Path, PathBuf};
-    use std::sync::Arc;
+        let tombstone_path = path.parent().unwrap_or_else(|| Path::new("/"));
+        let tombstone = Arc::new(TsmTombstone::open(tombstone_path, file_id).await?);
 
-    use models::predicate::domain::{TimeRange, TimeRanges};
-    use models::{FieldId, Timestamp};
-    use snafu::ResultExt;
-
-    use crate::error::{self, Error, Result};
-    use crate::file_system::file_manager::{self};
-    use crate::file_utils;
-    use crate::tsm::codec::DataBlockEncoding;
-    use crate::tsm::tsm_writer_tests::write_to_tsm;
-    use crate::tsm::{BlockEntry, DataBlock, IndexEntry, IndexFile, TsmReader, TsmTombstone};
-
-    async fn prepare(dir: impl AsRef<Path>) -> Result<(PathBuf, PathBuf)> {
-        if file_manager::try_exists(&dir) {
-            let _ = std::fs::remove_dir_all(&dir);
-        }
-        std::fs::create_dir_all(&dir).context(error::IOSnafu)?;
-
-        let tsm_file = file_utils::make_tsm_file_name(&dir, 1);
-        let tombstone_file = file_utils::make_tsm_tombstone_file_name(&dir, 1);
-        println!(
-            "Writing file: {}, {}",
-            tsm_file.display(),
-            tombstone_file.display(),
-        );
-
-        #[rustfmt::skip]
-        let ori_data: HashMap<FieldId, Vec<DataBlock>> = HashMap::from([
-            (1, vec![DataBlock::U64 { ts: vec![1, 2, 3, 4], val: vec![11, 12, 13, 15], enc: DataBlockEncoding::default() }]
-            ),
-            (2, vec![
-                DataBlock::U64 { ts: vec![1, 2, 3, 4], val: vec![101, 102, 103, 104], enc: DataBlockEncoding::default() },
-                DataBlock::U64 { ts: vec![5, 6, 7, 8], val: vec![105, 106, 107, 108], enc: DataBlockEncoding::default() },
-                DataBlock::U64 { ts: vec![9, 10, 11, 12], val: vec![109, 110, 111, 112], enc: DataBlockEncoding::default() },
-            ]),
-            (3, vec![
-                DataBlock::U64 { ts: vec![5], val: vec![105], enc: DataBlockEncoding::default() },
-                DataBlock::U64 { ts: vec![9], val: vec![109], enc: DataBlockEncoding::default() },
-            ]),
-        ]);
-
-        write_to_tsm(&tsm_file, &ori_data).await?;
-        let mut tombstone = TsmTombstone::with_path(&tombstone_file).await?;
-        tombstone.add_range(&[1], &TimeRange::new(2, 4)).await?;
-        tombstone.flush().await?;
-
-        Ok((tsm_file, tombstone_file))
-    }
-
-    pub(crate) async fn read_and_check(
-        reader: &TsmReader,
-        expected_data: &HashMap<FieldId, Vec<DataBlock>>,
-    ) -> Result<()> {
-        let mut read_data: HashMap<FieldId, Vec<DataBlock>> = HashMap::new();
-        for idx in reader.index_iterator() {
-            for blk in idx.block_iterator() {
-                let data_blk = reader
-                    .get_data_block(&blk)
-                    .await
-                    .context(error::ReadTsmSnafu)?;
-                read_data.entry(idx.field_id()).or_default().push(data_blk);
-            }
-        }
-        match std::panic::catch_unwind(|| {
-            assert_eq!(expected_data.len(), read_data.len());
-            for (field_id, data_blks) in read_data.iter() {
-                let expected_data_blks = expected_data.get(field_id);
-                if expected_data_blks.is_none() {
-                    panic!("Expected DataBlocks for field_id: '{}' is None", field_id);
-                }
-                assert_eq!(data_blks, expected_data_blks.unwrap());
-            }
-        }) {
-            Ok(_) => Ok(()),
-            Err(e) => Err(Error::CommonError {
-                reason: format!("{:?}", e),
-            }),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_tsm_reader_1() {
-        let (tsm_file, tombstone_file) = prepare("/tmp/test/tsm_reader/1").await.unwrap();
-        println!(
-            "Reading file: {}, {}",
-            tsm_file.to_str().unwrap(),
-            tombstone_file.to_str().unwrap()
-        );
-        let reader = TsmReader::open(&tsm_file).await.unwrap();
-
-        #[rustfmt::skip]
-        let expected_data: HashMap<FieldId, Vec<DataBlock>> = HashMap::from([
-            (1, vec![DataBlock::U64 { ts: vec![1], val: vec![11], enc: DataBlockEncoding::default() }]
-            ),
-            (2, vec![
-                DataBlock::U64 { ts: vec![1, 2, 3, 4], val: vec![101, 102, 103, 104], enc: DataBlockEncoding::default() },
-                DataBlock::U64 { ts: vec![5, 6, 7, 8], val: vec![105, 106, 107, 108], enc: DataBlockEncoding::default() },
-                DataBlock::U64 { ts: vec![9, 10, 11, 12], val: vec![109, 110, 111, 112], enc: DataBlockEncoding::default() },
-            ]),
-            (3, vec![
-                DataBlock::U64 { ts: vec![5], val: vec![105], enc: DataBlockEncoding::default() },
-                DataBlock::U64 { ts: vec![9], val: vec![109], enc: DataBlockEncoding::default() },
-            ]),
-        ]);
-        read_and_check(&reader, &expected_data).await.unwrap();
-    }
-
-    pub(crate) async fn read_opt_and_check(
-        reader: &TsmReader,
-        field_id: FieldId,
-        time_range: (Timestamp, Timestamp),
-        expected_data: &HashMap<FieldId, Vec<DataBlock>>,
-    ) {
-        let time_ranges = Arc::new(TimeRanges::with_inclusive_bounds(
-            time_range.0,
-            time_range.1,
+        let tsm_meta = Arc::new(TsmMetaData::new(
+            footer,
+            chunk_group_meta,
+            chunk_group,
+            chunk,
         ));
-        let mut read_data: HashMap<FieldId, Vec<DataBlock>> = HashMap::new();
-        for idx in reader.index_iterator_opt(field_id) {
-            for blk in idx.block_iterator_opt(time_ranges.clone()) {
-                let data_blk = reader.get_data_block(&blk).await.unwrap();
-                read_data.entry(idx.field_id()).or_default().push(data_blk);
-            }
-        }
-        assert_eq!(expected_data.len(), read_data.len());
-        for (field_id, data_blks) in read_data.iter() {
-            let expected_data_blks = expected_data.get(field_id).unwrap();
-            assert_eq!(data_blks, expected_data_blks);
-        }
+
+        Ok(Self {
+            // file_location: path,
+            file_id,
+            reader,
+            tsm_meta,
+            tombstone,
+        })
     }
 
-    #[tokio::test]
-    async fn test_tsm_reader_2() {
-        let (tsm_file, tombstone_file) = prepare("/tmp/test/tsm_reader/2").await.unwrap();
-        println!(
-            "Reading file: {}, {}",
-            tsm_file.to_str().unwrap(),
-            tombstone_file.to_str().unwrap()
-        );
-        let reader = TsmReader::open(&tsm_file).await.unwrap();
-
-        {
-            #[rustfmt::skip]
-            let expected_data = HashMap::from([
-                (2, vec![
-                    DataBlock::U64 { ts: vec![1, 2, 3, 4], val: vec![101, 102, 103, 104], enc: DataBlockEncoding::default() },
-                ])
-            ]);
-            read_opt_and_check(&reader, 2, (0, 4), &expected_data).await;
-            read_opt_and_check(&reader, 2, (1, 1), &expected_data).await;
-            read_opt_and_check(&reader, 2, (1, 4), &expected_data).await;
-            read_opt_and_check(&reader, 2, (2, 3), &expected_data).await;
-            read_opt_and_check(&reader, 2, (2, 2), &expected_data).await;
-            read_opt_and_check(&reader, 2, (4, 4), &expected_data).await;
-        }
-
-        {
-            #[rustfmt::skip]
-            let expected_data = HashMap::from([
-                (2, vec![
-                    DataBlock::U64 { ts: vec![5, 6, 7, 8], val: vec![105, 106, 107, 108], enc: DataBlockEncoding::default() },
-                ])
-            ]);
-            read_opt_and_check(&reader, 2, (5, 5), &expected_data).await;
-            read_opt_and_check(&reader, 2, (5, 8), &expected_data).await;
-            read_opt_and_check(&reader, 2, (8, 8), &expected_data).await;
-        }
-
-        {
-            #[rustfmt::skip]
-            let expected_data = HashMap::from([
-                (2, vec![
-                    DataBlock::U64 { ts: vec![5, 6, 7, 8], val: vec![105, 106, 107, 108], enc: DataBlockEncoding::default() },
-                    DataBlock::U64 { ts: vec![9, 10, 11, 12], val: vec![109, 110, 111, 112], enc: DataBlockEncoding::default() },
-                ])
-            ]);
-            read_opt_and_check(&reader, 2, (5, 9), &expected_data).await;
-            read_opt_and_check(&reader, 2, (5, 12), &expected_data).await;
-            read_opt_and_check(&reader, 2, (5, 13), &expected_data).await;
-            read_opt_and_check(&reader, 2, (6, 10), &expected_data).await;
-            read_opt_and_check(&reader, 2, (8, 9), &expected_data).await;
-            read_opt_and_check(&reader, 2, (8, 12), &expected_data).await;
-            read_opt_and_check(&reader, 2, (8, 13), &expected_data).await;
-        }
-
-        {
-            let expected_data = HashMap::new();
-            read_opt_and_check(&reader, 3, (1, 1), &expected_data).await;
-            read_opt_and_check(&reader, 3, (1, 4), &expected_data).await;
-            read_opt_and_check(&reader, 3, (3, 4), &expected_data).await;
-            read_opt_and_check(&reader, 3, (4, 4), &expected_data).await;
-            read_opt_and_check(&reader, 3, (6, 8), &expected_data).await;
-            read_opt_and_check(&reader, 3, (8, 8), &expected_data).await;
-            read_opt_and_check(&reader, 3, (10, 10), &expected_data).await;
-            read_opt_and_check(&reader, 3, (10, 11), &expected_data).await;
-        }
-
-        {
-            #[rustfmt::skip]
-            let expected_data = HashMap::from([
-                (3, vec![DataBlock::U64 { ts: vec![5], val: vec![105], enc: DataBlockEncoding::default() }])
-            ]);
-            read_opt_and_check(&reader, 3, (4, 6), &expected_data).await;
-            read_opt_and_check(&reader, 3, (4, 5), &expected_data).await;
-            read_opt_and_check(&reader, 3, (5, 5), &expected_data).await;
-            read_opt_and_check(&reader, 3, (5, 6), &expected_data).await;
-        }
-
-        {
-            #[rustfmt::skip]
-            let expected_data = HashMap::from([
-                (3, vec![
-                    DataBlock::U64 { ts: vec![5], val: vec![105], enc: DataBlockEncoding::default() },
-                    DataBlock::U64 { ts: vec![9], val: vec![109], enc: DataBlockEncoding::default() },
-                ])
-            ]);
-            read_opt_and_check(&reader, 3, (4, 10), &expected_data).await;
-            read_opt_and_check(&reader, 3, (5, 9), &expected_data).await;
-            read_opt_and_check(&reader, 3, (5, 10), &expected_data).await;
-        }
+    pub fn file_id(&self) -> u64 {
+        self.file_id
     }
 
-    #[tokio::test]
-    async fn test_index_file() {
-        let (tsm_file, tombstone_file) = prepare("/tmp/test/tsm_reader/3").await.unwrap();
-        println!(
-            "Reading file: {}, {}",
-            tsm_file.to_str().unwrap(),
-            tombstone_file.to_str().unwrap()
-        );
+    pub fn footer(&self) -> &Footer {
+        &self.tsm_meta.footer
+    }
 
-        let file = Arc::new(file_manager::open_file(&tsm_file).await.unwrap());
-        let mut idx_file = IndexFile::open(file).await.unwrap();
-        let mut idx_metas: Vec<IndexEntry> = Vec::new();
-        let mut blk_metas: Vec<BlockEntry> = Vec::new();
+    pub fn has_tombstone(&self) -> bool {
+        !self.tombstone.is_empty()
+    }
 
-        loop {
-            match idx_file.next_index_entry().await {
-                Ok(None) => break,
-                Ok(Some(idx_entry)) => {
-                    idx_metas.push(idx_entry);
-                    loop {
-                        match idx_file.next_block_entry().await {
-                            Ok(None) => break,
-                            Ok(Some(blk_entry)) => {
-                                blk_metas.push(blk_entry);
+    pub fn chunk_group_meta(&self) -> &ChunkGroupMeta {
+        &self.tsm_meta.chunk_group_meta
+    }
+
+    pub fn chunk_group(&self) -> &BTreeMap<String, Arc<ChunkGroup>> {
+        &self.tsm_meta.chunk_group
+    }
+
+    pub fn chunk(&self) -> &BTreeMap<SeriesId, Arc<Chunk>> {
+        &self.tsm_meta.chunk
+    }
+
+    pub fn tsm_meta_data(&self) -> Arc<TsmMetaData> {
+        self.tsm_meta.clone()
+    }
+
+    pub fn tombstone(&self) -> Arc<TsmTombstone> {
+        self.tombstone.clone()
+    }
+
+    pub async fn statistics(
+        &self,
+        series_ids: &[SeriesId],
+        time_range: TimeRange,
+    ) -> TskvResult<BTreeMap<SeriesId, Vec<(ColumnGroupID, Vec<PageMeta>)>>> {
+        let meta = self.tsm_meta.clone();
+        let mut map = BTreeMap::new();
+        for series_id in series_ids {
+            let mut column_groups = vec![];
+            if meta.footer().maybe_series_exist(series_id) {
+                if let Some(chunk) = meta.chunk().get(series_id) {
+                    for (id, column_group) in chunk.column_group() {
+                        let page_time_range = column_group.time_range();
+                        let mut pages = vec![];
+                        for page in column_group.pages() {
+                            if page_time_range.overlaps(&time_range) {
+                                pages.push(page.meta().clone());
                             }
-                            Err(e) => panic!("Error reading block entry: {:?}", e),
+                        }
+                        if !pages.is_empty() {
+                            column_groups.push((*id, pages));
                         }
                     }
                 }
-                Err(e) => panic!("Error reading index entry: {:?}", e),
+            }
+            map.insert(*series_id, column_groups);
+        }
+        Ok(map)
+    }
+
+    pub async fn read_page(&self, page_spec: &PageWriteSpec) -> TskvResult<Page> {
+        read_page(&self.reader, page_spec).await
+    }
+
+    pub async fn read_series_pages(
+        &self,
+        series_id: SeriesId,
+        column_group_id: ColumnGroupID,
+    ) -> TskvResult<Vec<Page>> {
+        let chunk = self.chunk();
+        let reader = &self.reader;
+        if let Some(chunk) = chunk.get(&series_id) {
+            for (id, column_group) in chunk.column_group() {
+                if *id != column_group_id {
+                    continue;
+                }
+                let mut res_page = Vec::with_capacity(column_group.pages().len());
+                for page in column_group.pages() {
+                    let page = read_page(reader, page).await?;
+                    res_page.push(page);
+                }
+                return Ok(res_page);
             }
         }
-
-        assert_eq!(idx_metas[0].field_id, 1);
-        assert_eq!(idx_metas[1].field_id, 2);
-
-        assert_eq!(blk_metas[0].min_ts, 1);
-        assert_eq!(blk_metas[0].max_ts, 4);
-        assert_eq!(blk_metas[0].count, 4);
-        assert_eq!(blk_metas[1].min_ts, 1);
-        assert_eq!(blk_metas[1].max_ts, 4);
-        assert_eq!(blk_metas[1].count, 4);
-        assert_eq!(blk_metas[2].min_ts, 5);
-        assert_eq!(blk_metas[2].max_ts, 8);
-        assert_eq!(blk_metas[2].count, 4);
-        assert_eq!(blk_metas[3].min_ts, 9);
-        assert_eq!(blk_metas[3].max_ts, 12);
-        assert_eq!(blk_metas[3].count, 4);
+        Ok(vec![])
     }
+
+    pub async fn read_datablock_raw(
+        &self,
+        series_id: SeriesId,
+        column_group_id: ColumnGroupID,
+    ) -> TskvResult<Vec<u8>> {
+        let chunk = self.chunk();
+        if let Some(chunk) = chunk.get(&series_id) {
+            for (id, column_group) in chunk.column_group() {
+                if *id != column_group_id {
+                    continue;
+                }
+                let mut res_column_group = vec![0u8; column_group.size() as usize];
+                self.reader
+                    .read_at(column_group.pages_offset() as usize, &mut res_column_group)
+                    .await
+                    .map_err(|e| {
+                        ReadTsmSnafu {
+                            reason: e.to_string(),
+                        }
+                        .build()
+                    })?;
+                return Ok(res_column_group);
+            }
+        }
+        Ok(vec![])
+    }
+
+    pub async fn read_datablock(
+        &self,
+        series_id: SeriesId,
+        column_group_id: ColumnGroupID,
+    ) -> TskvResult<DataBlock> {
+        let column_group = self.read_series_pages(series_id, column_group_id).await?;
+        let schema = self
+            .tsm_meta
+            .table_schema_by_sid(series_id)
+            .context(CommonSnafu {
+                reason: format!("table schema for series id : {} not found", series_id),
+            })?;
+        let data_block = decode_pages(column_group, schema)?;
+
+        Ok(data_block)
+    }
+
+    pub fn table_schema(&self, table_name: &str) -> Option<TskvTableSchemaRef> {
+        self.tsm_meta.chunk_group_meta.table_schema(table_name)
+    }
+}
+
+pub fn decode_buf_to_pages(
+    chunk: Arc<Chunk>,
+    column_group_id: ColumnGroupID,
+    pages_buf: &[u8],
+) -> TskvResult<Vec<Page>> {
+    let column_group = chunk
+        .column_group()
+        .get(&column_group_id)
+        .context(CommonSnafu {
+            reason: format!(
+                "column group for column group id : {} not found",
+                column_group_id
+            ),
+        })?;
+    let mut pages = Vec::with_capacity(column_group.pages().len());
+
+    for page in column_group.pages() {
+        let offset = (page.offset() - column_group.pages_offset()) as usize;
+        let end = offset + page.size as usize;
+        let page_buf = pages_buf.get(offset..end).context(CommonSnafu {
+            reason: "page_buf get error".to_string(),
+        })?;
+        let page = Page {
+            meta: page.meta.clone(),
+            bytes: Bytes::from(page_buf.to_vec()),
+        };
+        let page_result = page.crc_validation()?;
+        pages.push(page_result);
+    }
+    Ok(pages)
+}
+
+impl Debug for TsmReader {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TsmReader")
+            .field("file_id", &self.file_id)
+            .field("footer", &self.tsm_meta.footer)
+            .field("chunk_group_meta", &self.tsm_meta.chunk_group_meta)
+            .field("chunk_group", &self.tsm_meta.chunk_group)
+            .field("chunk", &self.tsm_meta.chunk)
+            .finish()
+    }
+}
+
+pub async fn read_footer(reader: &FileStreamReader) -> TskvResult<Footer> {
+    if reader.len() < FOOTER_SIZE {
+        return Err(ReadTsmSnafu {
+            reason: "file is too small".to_string(),
+        }
+        .build());
+    };
+    let pos = reader.len() - FOOTER_SIZE;
+    let mut buffer = vec![0u8; FOOTER_SIZE];
+    reader.read_at(pos, &mut buffer).await.map_err(|e| {
+        ReadTsmSnafu {
+            reason: e.to_string(),
+        }
+        .build()
+    })?;
+    Footer::deserialize(&buffer)
+}
+
+pub async fn read_chunk_group_meta(
+    reader: &FileStreamReader,
+    footer: &Footer,
+) -> TskvResult<ChunkGroupMeta> {
+    let pos = footer.table().chunk_group_offset();
+    let mut buffer = vec![0u8; footer.table().chunk_group_size() as usize];
+    reader
+        .read_at(pos as usize, &mut buffer)
+        .await
+        .map_err(|e| {
+            ReadTsmSnafu {
+                reason: e.to_string(),
+            }
+            .build()
+        })?; // read chunk group meta
+    let specs = ChunkGroupMeta::deserialize(&buffer)?;
+    Ok(specs)
+}
+
+pub async fn read_chunk_groups(
+    reader: &FileStreamReader,
+    chunk_group_meta: &ChunkGroupMeta,
+) -> TskvResult<BTreeMap<String, Arc<ChunkGroup>>> {
+    let mut specs = BTreeMap::new();
+    for chunk in chunk_group_meta.tables().values() {
+        let pos = chunk.chunk_group_offset();
+        let mut buffer = vec![0u8; chunk.chunk_group_size() as usize];
+        reader
+            .read_at(pos as usize, &mut buffer)
+            .await
+            .map_err(|e| {
+                ReadTsmSnafu {
+                    reason: e.to_string(),
+                }
+                .build()
+            })?; // read chunk group meta
+        let group = Arc::new(ChunkGroup::deserialize(&buffer)?);
+        specs.insert(chunk.name().to_string(), group);
+    }
+    Ok(specs)
+}
+
+pub async fn read_chunk(
+    reader: &FileStreamReader,
+    chunk_group: &BTreeMap<String, Arc<ChunkGroup>>,
+) -> TskvResult<BTreeMap<SeriesId, Arc<Chunk>>> {
+    let mut chunks = BTreeMap::new();
+    for group in chunk_group.values() {
+        for chunk_spec in group.chunks() {
+            let pos = chunk_spec.chunk_offset();
+            let mut buffer = vec![0u8; chunk_spec.chunk_size() as usize];
+            reader
+                .read_at(pos as usize, &mut buffer)
+                .await
+                .map_err(|e| {
+                    ReadTsmSnafu {
+                        reason: e.to_string(),
+                    }
+                    .build()
+                })?;
+            let chunk = Arc::new(Chunk::deserialize(&buffer)?);
+            chunks.insert(chunk_spec.series_id(), chunk);
+        }
+    }
+    Ok(chunks)
+}
+
+async fn read_page(reader: &FileStreamReader, page_spec: &PageWriteSpec) -> TskvResult<Page> {
+    let pos = page_spec.offset();
+    let mut buffer = vec![0u8; page_spec.size() as usize];
+    reader
+        .read_at(pos as usize, &mut buffer)
+        .await
+        .map_err(|e| {
+            ReadTsmSnafu {
+                reason: e.to_string(),
+            }
+            .build()
+        })?;
+    let page = Page {
+        meta: page_spec.meta().clone(),
+        bytes: Bytes::from(buffer),
+    };
+    page.crc_validation()
+}
+
+pub fn decode_pages(pages: Vec<Page>, table_schema: TskvTableSchemaRef) -> TskvResult<DataBlock> {
+    let mut time_column = MutableColumn::empty_with_cap(table_schema.time_column(), 0)?;
+
+    let mut other_columns = Vec::new();
+
+    for page in pages {
+        let column = page.to_column()?;
+        if page.desc().name == TIME_FIELD {
+            time_column = column;
+        } else {
+            other_columns.push(column);
+        }
+    }
+
+    Ok(DataBlock::new(table_schema, time_column, other_columns))
+}
+
+pub fn decode_pages_buf(
+    pages_buf: &[u8],
+    chunk: Arc<Chunk>,
+    column_group_id: ColumnGroupID,
+    table_schema: TskvTableSchemaRef,
+) -> TskvResult<DataBlock> {
+    let pages = decode_buf_to_pages(chunk, column_group_id, pages_buf)?;
+    let data_block = decode_pages(pages, table_schema)?;
+    Ok(data_block)
 }

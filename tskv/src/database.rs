@@ -1,38 +1,35 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::mem::size_of;
+use std::path::Path;
 use std::sync::Arc;
 
-use lru_cache::asynchronous::ShardedCache;
+use flatbuffers::{ForwardsUOffset, Vector};
 use memory_pool::MemoryPoolRef;
 use meta::model::MetaRef;
 use metrics::metric_register::MetricsRegister;
 use models::predicate::domain::TimeRange;
-use models::schema::{DatabaseSchema, Precision, TskvTableSchema};
-use models::utils::unite_id;
-use models::{ColumnId, SchemaId, SeriesId, SeriesKey, Timestamp};
-use protos::models::{FieldType, Point, Table};
-use protos::{fb_table_name, schema_field_name, schema_field_type, schema_tag_name};
-use snafu::ResultExt;
-use tokio::runtime::Runtime;
+use models::schema::{DatabaseSchema, Precision, TskvTableSchema, TskvTableSchemaRef};
+use models::{SeriesId, SeriesKey};
+use protos::models::{Column, ColumnType, FieldType, Table};
+use snafu::{OptionExt, ResultExt};
 use tokio::sync::mpsc::Sender;
 use tokio::sync::{oneshot, RwLock};
-use trace::{debug, error, info};
-use utils::BloomFilter;
+use trace::error;
 
-use crate::compaction::{CompactTask, FlushReq};
-use crate::context::GlobalContext;
-use crate::error::{self, Result, SchemaSnafu};
-use crate::index::{self, IndexResult};
-use crate::kv_option::{Options, INDEX_PATH};
-use crate::memcache::{MemCache, RowData, RowGroup};
+use crate::error::{
+    CommonSnafu, IndexErrSnafu, ModelSnafu, SchemaSnafu, TableNotFoundSnafu, TskvResult,
+};
+use crate::index::ts_index::TSIndex;
+use crate::index::IndexResult;
+use crate::kv_option::Options;
+use crate::memcache::{OrderedRowsData, RowData, RowGroup};
 use crate::schema::schemas::DBschemas;
 use crate::summary::{SummaryTask, VersionEdit};
-use crate::tseries_family::{LevelInfo, TseriesFamily, Version};
-use crate::version_set::VersionSet;
-use crate::Error::{self, InvalidPoint};
-use crate::{file_utils, ColumnFileId, TseriesFamilyId};
+use crate::tseries_family::{LevelInfo, TseriesFamily, TsfFactory, Version};
+use crate::tsm::reader::TsmReader;
+use crate::{TsKvContext, TseriesFamilyId};
 
-pub type FlatBufferPoint<'a> = flatbuffers::Vector<'a, flatbuffers::ForwardsUOffset<Point<'a>>>;
 pub type FlatBufferTable<'a> = flatbuffers::Vector<'a, flatbuffers::ForwardsUOffset<Table<'a>>>;
 
 #[derive(Debug)]
@@ -40,396 +37,396 @@ pub struct Database {
     //tenant_name.database_name => owner
     owner: Arc<String>,
     opt: Arc<Options>,
+    db_name: Arc<String>,
 
     schemas: Arc<DBschemas>,
-    ts_indexes: HashMap<TseriesFamilyId, Arc<index::ts_index::TSIndex>>,
+    ts_indexes: HashMap<TseriesFamilyId, Arc<RwLock<TSIndex>>>,
     ts_families: HashMap<TseriesFamilyId, Arc<RwLock<TseriesFamily>>>,
-    runtime: Arc<Runtime>,
+    tsf_factory: TsfFactory,
+}
+
+#[derive(Debug)]
+pub struct DatabaseFactory {
+    meta: MetaRef,
     memory_pool: MemoryPoolRef,
     metrics_register: Arc<MetricsRegister>,
+    opt: Arc<Options>,
+}
+
+impl DatabaseFactory {
+    pub fn new(
+        meta: MetaRef,
+        memory_pool: MemoryPoolRef,
+        metrics_register: Arc<MetricsRegister>,
+        opt: Arc<Options>,
+    ) -> Self {
+        Self {
+            meta,
+            memory_pool,
+            metrics_register,
+            opt,
+        }
+    }
+
+    pub async fn create_database(&self, schema: DatabaseSchema) -> TskvResult<Database> {
+        Database::new(
+            schema,
+            self.opt.clone(),
+            self.meta.clone(),
+            self.memory_pool.clone(),
+            self.metrics_register.clone(),
+        )
+        .await
+    }
 }
 
 impl Database {
     pub async fn new(
         schema: DatabaseSchema,
         opt: Arc<Options>,
-        runtime: Arc<Runtime>,
         meta: MetaRef,
         memory_pool: MemoryPoolRef,
         metrics_register: Arc<MetricsRegister>,
-    ) -> Result<Self> {
+    ) -> TskvResult<Self> {
+        let owner = Arc::new(schema.owner());
+        let tsf_factory = TsfFactory::new(
+            owner.clone(),
+            opt.clone(),
+            memory_pool.clone(),
+            metrics_register.clone(),
+        );
+
         let db = Self {
             opt,
+
             owner: Arc::new(schema.owner()),
+            db_name: Arc::new(schema.database_name().to_owned()),
             schemas: Arc::new(DBschemas::new(schema, meta).await.context(SchemaSnafu)?),
             ts_indexes: HashMap::new(),
             ts_families: HashMap::new(),
-            runtime,
-            memory_pool,
-            metrics_register,
+            tsf_factory,
         };
 
         Ok(db)
     }
 
-    pub fn open_tsfamily(
-        &mut self,
-        ver: Arc<Version>,
-        flush_task_sender: Sender<FlushReq>,
-        compact_task_sender: Sender<CompactTask>,
-    ) {
-        let tf = TseriesFamily::new(
-            ver.tf_id(),
-            ver.database(),
-            MemCache::new(
-                ver.tf_id(),
-                self.opt.cache.max_buffer_size,
-                ver.last_seq,
-                &self.memory_pool,
-            ),
-            ver.clone(),
-            self.opt.cache.clone(),
-            self.opt.storage.clone(),
-            flush_task_sender,
-            compact_task_sender,
-            self.memory_pool.clone(),
-            &self.metrics_register,
-        );
-        tf.schedule_compaction(self.runtime.clone());
-
+    pub fn open_tsfamily(&mut self, ver: Arc<Version>) {
+        let tf_id = ver.tf_id();
+        let tf = self.tsf_factory.create_tsf(tf_id, ver.clone());
         self.ts_families
             .insert(ver.tf_id(), Arc::new(RwLock::new(tf)));
     }
 
-    // todo: Maybe TseriesFamily::new() should be refactored.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn add_tsfamily(
+    pub async fn create_tsfamily(
         &mut self,
-        tsf_id: u32,
-        seq_no: u64,
-        version_edit: Option<VersionEdit>,
-        summary_task_sender: Sender<SummaryTask>,
-        flush_task_sender: Sender<FlushReq>,
-        compact_task_sender: Sender<CompactTask>,
-        global_ctx: Arc<GlobalContext>,
-    ) -> Result<Arc<RwLock<TseriesFamily>>> {
-        let (seq_no, version_edits, file_metas) = match version_edit {
-            Some(mut ve) => {
-                ve.tsf_id = tsf_id;
-                ve.has_seq_no = true;
-                ve.seq_no = seq_no;
-                let mut file_metas = HashMap::with_capacity(ve.add_files.len());
-                for f in ve.add_files.iter_mut() {
-                    let new_file_id = global_ctx.file_id_next();
-                    f.tsf_id = tsf_id;
-                    let file_path = f
-                        .rename_file(&self.opt.storage, &self.owner, f.tsf_id, new_file_id)
-                        .await?;
-                    let file_reader = crate::tsm::TsmReader::open(file_path).await?;
-                    file_metas.insert(new_file_id, file_reader.bloom_filter());
-                }
-                for f in ve.del_files.iter_mut() {
-                    let new_file_id = global_ctx.file_id_next();
-                    f.tsf_id = tsf_id;
-                    f.rename_file(&self.opt.storage, &self.owner, f.tsf_id, new_file_id)
-                        .await?;
-                }
-                //move index
-                let origin_index = self
-                    .opt
-                    .storage
-                    .move_dir(&self.owner, tsf_id)
-                    .join(INDEX_PATH);
-                let new_index = self.opt.storage.index_dir(&self.owner, tsf_id);
-                info!("move index from {:?} to {:?}", &origin_index, &new_index);
-                file_utils::rename(origin_index, new_index).await?;
-                tokio::fs::remove_dir_all(self.opt.storage.move_dir(&self.owner, tsf_id)).await?;
-                (ve.seq_no, vec![ve], Some(file_metas))
-            }
-            None => (
-                seq_no,
-                vec![VersionEdit::new_add_vnode(
-                    tsf_id,
-                    self.owner.as_ref().clone(),
-                    seq_no,
-                )],
-                None,
-            ),
-        };
+        tsf_id: TseriesFamilyId,
+        ctx: Arc<TsKvContext>,
+    ) -> TskvResult<Arc<RwLock<TseriesFamily>>> {
+        let tsm_reader_cache = Arc::new(cache::ShardedAsyncCache::create_lru_sharded_cache(
+            self.opt.storage.max_cached_readers,
+        ));
+        let levels = LevelInfo::init_levels(self.owner.clone(), tsf_id, self.opt.storage.clone());
+        let version_edit = VersionEdit::new_add_vnode(tsf_id, self.owner.as_ref().clone(), 0);
 
         let ver = Arc::new(Version::new(
             tsf_id,
             self.owner.clone(),
             self.opt.storage.clone(),
-            seq_no,
-            LevelInfo::init_levels(self.owner.clone(), tsf_id, self.opt.storage.clone()),
+            0,
+            levels,
             i64::MIN,
-            Arc::new(ShardedCache::with_capacity(
-                self.opt.storage.max_cached_readers,
-            )),
+            tsm_reader_cache,
         ));
-        let tf = TseriesFamily::new(
-            tsf_id,
-            self.owner.clone(),
-            MemCache::new(
-                tsf_id,
-                self.opt.cache.max_buffer_size,
-                seq_no,
-                &self.memory_pool,
-            ),
-            ver,
-            self.opt.cache.clone(),
-            self.opt.storage.clone(),
-            flush_task_sender,
-            compact_task_sender,
-            self.memory_pool.clone(),
-            &self.metrics_register,
-        );
 
+        let tf = self.tsf_factory.create_tsf(tsf_id, ver.clone());
         let tf = Arc::new(RwLock::new(tf));
         self.ts_families.insert(tsf_id, tf.clone());
 
-        let (task_state_sender, _task_state_receiver) = oneshot::channel();
-        let task = SummaryTask::new(version_edits, file_metas, None, task_state_sender);
-        if let Err(e) = summary_task_sender.send(task).await {
+        let (task_state_sender, task_state_receiver) = oneshot::channel();
+        let task = SummaryTask::new(tf.clone(), version_edit, None, None, task_state_sender);
+        if let Err(e) = ctx.summary_task_sender.send(task).await {
             error!("failed to send Summary task, {:?}", e);
         }
+        let _ = task_state_receiver.await;
+
+        Ok(tf)
+    }
+
+    // todo: Maybe TseriesFamily::new() should be refactored.
+    pub async fn add_tsfamily(
+        &mut self,
+        mut ve: VersionEdit,
+        data_dir: &Path,
+        ctx: Arc<TsKvContext>,
+    ) -> TskvResult<Arc<RwLock<TseriesFamily>>> {
+        let new_dir = self.opt.storage.ts_family_dir(&self.owner, ve.tsf_id);
+        let new_dir = new_dir.as_path();
+
+        let mut file_metas = HashMap::with_capacity(ve.add_files.len());
+        for f in ve.add_files.iter_mut() {
+            let new_file_id = ctx.global_ctx.file_id_next();
+            let file_path = f.rename_file(data_dir, new_dir, new_file_id).await?;
+
+            let file_reader = TsmReader::open(file_path).await?;
+            let bloom_filter = Arc::new(file_reader.footer().series().bloom_filter().clone());
+            file_metas.insert(new_file_id, bloom_filter.clone());
+
+            f.file_id = new_file_id;
+        }
+        for f in ve.del_files.iter_mut() {
+            let new_file_id = ctx.global_ctx.file_id_next();
+            f.rename_file(data_dir, new_dir, new_file_id).await?;
+
+            f.file_id = new_file_id;
+        }
+
+        let levels =
+            LevelInfo::init_levels(self.owner.clone(), ve.tsf_id, self.opt.storage.clone());
+        let tsm_reader_cache = Arc::new(cache::ShardedAsyncCache::create_lru_sharded_cache(
+            self.opt.storage.max_cached_readers,
+        ));
+        let ver = Arc::new(Version::new(
+            ve.tsf_id,
+            self.owner.clone(),
+            self.opt.storage.clone(),
+            ve.seq_no,
+            levels,
+            ve.max_level_ts,
+            tsm_reader_cache,
+        ));
+
+        let tf = self.tsf_factory.create_tsf(ve.tsf_id, ver.clone());
+        let tf = Arc::new(RwLock::new(tf));
+        self.ts_families.insert(ve.tsf_id, tf.clone());
+
+        let (task_state_sender, task_state_receiver) = oneshot::channel();
+        let task = SummaryTask::new(tf.clone(), ve, Some(file_metas), None, task_state_sender);
+        if let Err(e) = ctx.summary_task_sender.send(task).await {
+            error!("failed to send Summary task, {:?}", e);
+        }
+
+        let _ = task_state_receiver.await;
 
         Ok(tf)
     }
 
     pub async fn del_tsfamily(&mut self, tf_id: u32, summary_task_sender: Sender<SummaryTask>) {
         if let Some(tf) = self.ts_families.remove(&tf_id) {
-            tf.read().await.close();
-        }
+            let owner = tf.read().await.tenant_database();
+            let seq = tf.read().await.version().last_seq();
+            self.tsf_factory.drop_tsf(tf_id);
+            let edit = VersionEdit::new_del_vnode(tf_id, owner.to_string(), seq);
+            let (task_state_sender, task_state_receiver) = oneshot::channel();
+            let task = SummaryTask::new(tf.clone(), edit, None, None, task_state_sender);
+            if let Err(e) = summary_task_sender.send(task).await {
+                error!("failed to send Summary task, {:?}", e);
+            }
 
-        let edits = vec![VersionEdit::new_del_vnode(tf_id)];
-        let (task_state_sender, _task_state_receiver) = oneshot::channel();
-        let task = SummaryTask::new(edits, None, None, task_state_sender);
-        if let Err(e) = summary_task_sender.send(task).await {
-            error!("failed to send Summary task, {:?}", e);
+            let _ = task_state_receiver.await;
         }
     }
 
     pub async fn build_write_group(
         &self,
-        db_name: &str,
         precision: Precision,
         tables: FlatBufferTable<'_>,
-        ts_index: Arc<index::ts_index::TSIndex>,
-    ) -> Result<HashMap<(SeriesId, SchemaId), RowGroup>> {
-        if self.opt.storage.strict_write {
-            self.build_write_group_strict_mode(db_name, precision, tables, ts_index)
-                .await
-        } else {
-            self.build_write_group_loose_mode(db_name, precision, tables, ts_index)
-                .await
-        }
-    }
+        ts_index: Arc<RwLock<TSIndex>>,
+        recover_from_wal: bool,
+        strict_write: Option<bool>,
+    ) -> TskvResult<HashMap<SeriesId, (SeriesKey, RowGroup)>> {
+        let strict_write = strict_write.unwrap_or(self.opt.storage.strict_write);
 
-    pub async fn build_write_group_strict_mode(
-        &self,
-        db_name: &str,
-        precision: Precision,
-        tables: FlatBufferTable<'_>,
-        ts_index: Arc<index::ts_index::TSIndex>,
-    ) -> Result<HashMap<(SeriesId, SchemaId), RowGroup>> {
         // (series id, schema id) -> RowGroup
         let mut map = HashMap::new();
         for table in tables {
-            let table_name = fb_table_name(&table)?;
-
-            let points = table.points().ok_or(Error::CommonError {
-                reason: "table missing points".to_string(),
+            let table_name = table.tab_ext()?;
+            let columns = table.columns().context(CommonSnafu {
+                reason: "table missing columns".to_string(),
             })?;
+            let num_rows = table.num_rows() as usize;
 
-            for point in points {
-                let schema = table.schema().ok_or(Error::CommonError {
-                    reason: "table missing schema in point".to_string(),
-                })?;
-                let field_type = schema_field_type(&schema)?;
-                let field_names = schema_field_name(&schema)?;
-                let tag_names = schema_tag_name(&schema)?;
+            let fb_schema = FbSchema::from_fb_column(table_name, columns)?;
+            let schema = if strict_write {
+                self.schemas
+                    .get_table_schema(fb_schema.table)
+                    .await
+                    .context(SchemaSnafu)?
+                    .context(TableNotFoundSnafu {
+                        table: fb_schema.table.to_string(),
+                    })?
+            } else {
+                self.schemas
+                    .check_field_type_or_else_add(&fb_schema)
+                    .await
+                    .context(SchemaSnafu)?
+            };
 
-                let sid =
-                    Self::build_index(db_name, &table_name, &point, &tag_names, ts_index.clone())
-                        .await?;
-                self.build_row_data(
-                    &mut map,
-                    &table_name,
-                    precision,
-                    point,
-                    &field_names,
-                    &field_type,
-                    sid,
-                )?
-            }
-        }
-        Ok(map)
-    }
-
-    pub async fn build_write_group_loose_mode(
-        &self,
-        db_name: &str,
-        precision: Precision,
-        tables: FlatBufferTable<'_>,
-        ts_index: Arc<index::ts_index::TSIndex>,
-    ) -> Result<HashMap<(SeriesId, SchemaId), RowGroup>> {
-        let mut map = HashMap::new();
-        for table in tables {
-            let table_name = fb_table_name(&table)?;
-
-            let points = table.points().ok_or(Error::CommonError {
-                reason: "table missing points".to_string(),
-            })?;
-
-            for point in points {
-                let schema = table.schema().ok_or(Error::CommonError {
-                    reason: "table missing schema in point".to_string(),
-                })?;
-                let tag_names = schema_tag_name(&schema)?;
-                let field_names = schema_field_name(&schema)?;
-                let field_type = schema_field_type(&schema)?;
-
-                let sid =
-                    Self::build_index(db_name, &table_name, &point, &tag_names, ts_index.clone())
-                        .await?;
-                if self
-                    .schemas
-                    .check_field_type_from_cache(&table_name, &tag_names, &field_names, &field_type)
-                    .is_err()
-                {
-                    self.schemas
-                        .check_field_type_or_else_add(
-                            db_name,
-                            &table_name,
-                            &tag_names,
-                            &field_names,
-                            &field_type,
-                        )
-                        .await?;
-                }
-
-                self.build_row_data(
-                    &mut map,
-                    &table_name,
-                    precision,
-                    point,
-                    &field_names,
-                    &field_type,
-                    sid,
-                )?
-            }
+            let sids = Self::build_index(
+                &fb_schema,
+                &columns,
+                &schema,
+                num_rows,
+                ts_index.clone(),
+                recover_from_wal,
+            )
+            .await?;
+            // every row produces a sid
+            debug_assert_eq!(num_rows, sids.len());
+            self.build_row_data(
+                &fb_schema,
+                &columns,
+                schema.clone(),
+                &mut map,
+                precision,
+                &sids,
+            )?;
         }
         Ok(map)
     }
 
     fn build_row_data(
         &self,
-        map: &mut HashMap<(SeriesId, SchemaId), RowGroup>,
-        table_name: &str,
+        fb_schema: &FbSchema<'_>,
+        columns: &Vector<ForwardsUOffset<Column>>,
+        table_schema: TskvTableSchemaRef,
+        map: &mut HashMap<SeriesId, (SeriesKey, RowGroup)>,
         precision: Precision,
-        point: Point,
-        field_names: &[&str],
-        field_type: &[FieldType],
-        sid: u32,
-    ) -> Result<()> {
-        let table_schema = self.schemas.get_table_schema(table_name)?;
-        let table_schema = match table_schema {
-            Some(v) => v,
-            None => return Ok(()),
-        };
-
-        let row =
-            RowData::point_to_row_data(point, &table_schema, precision, field_names, field_type)?;
-        let schema_size = table_schema.size();
-        let schema_id = table_schema.schema_id;
-        let entry = map.entry((sid, schema_id)).or_insert(RowGroup {
-            schema: Arc::new(TskvTableSchema::default()),
-            rows: vec![],
-            range: TimeRange {
-                min_ts: i64::MAX,
-                max_ts: i64::MIN,
-            },
-            size: size_of::<RowGroup>(),
-        });
-        entry.schema = table_schema;
-        entry.size += schema_size;
-        entry.range.merge(&TimeRange {
-            min_ts: row.ts,
-            max_ts: row.ts,
-        });
-        entry.size += row.size();
-        //todo: remove this copy
-        entry.rows.push(row);
+        sids: &[(u32, SeriesKey)],
+    ) -> TskvResult<()> {
+        let mut sid_map: HashMap<u32, (SeriesKey, Vec<usize>)> = HashMap::new();
+        for (row_count, (sid, series_key)) in sids.iter().enumerate() {
+            let buf_and_row_idx = sid_map.entry(*sid).or_default();
+            if buf_and_row_idx.0.table().is_empty() && buf_and_row_idx.0.tags().is_empty() {
+                buf_and_row_idx.0 = series_key.clone();
+            }
+            buf_and_row_idx.1.push(row_count);
+        }
+        for (sid, (series_key_buf, row_idx)) in sid_map.into_iter() {
+            let rows = RowData::point_to_row_data(
+                table_schema.as_ref(),
+                precision,
+                columns,
+                fb_schema,
+                row_idx,
+            )?;
+            let mut row_group = RowGroup {
+                schema: table_schema.clone(),
+                rows: OrderedRowsData::new(),
+                range: TimeRange::none(),
+                size: size_of::<RowGroup>(),
+            };
+            for row in rows {
+                row_group.range.merge(&TimeRange::new(row.ts, row.ts));
+                row_group.size += row.size();
+                row_group.rows.insert(row);
+            }
+            let res = map.insert(sid, (series_key_buf, row_group));
+            // every sid of different table is different
+            debug_assert!(res.is_none())
+        }
         Ok(())
     }
 
-    async fn build_index(
-        db_name: &str,
-        tab_name: &str,
-        info: &Point<'_>,
-        tag_names: &[&str],
-        ts_index: Arc<index::ts_index::TSIndex>,
-    ) -> Result<u32> {
-        let nullbits = info.fields_nullbit().ok_or(InvalidPoint)?.bytes();
-        if !nullbits.iter().any(|x| *x != 0) {
-            return Err(InvalidPoint);
-        }
+    async fn build_index<'a>(
+        fb_schema: &'a FbSchema<'a>,
+        columns: &Vector<'a, ForwardsUOffset<Column<'a>>>,
+        table_column: &TskvTableSchema,
+        row_num: usize,
+        ts_index: Arc<RwLock<TSIndex>>,
+        recover_from_wal: bool,
+    ) -> TskvResult<Vec<(u32, SeriesKey)>> {
+        let mut res_sids = Vec::with_capacity(row_num);
+        let mut series_keys = Vec::with_capacity(row_num);
+        let ts_index_r = ts_index.read().await;
+        for row_count in 0..row_num {
+            let series_key = SeriesKey::build_series_key(
+                fb_schema.table,
+                columns,
+                table_column,
+                &fb_schema.tag_indexes,
+                row_count,
+            )
+            .context(ModelSnafu)?;
+            if let Some(id) = ts_index_r
+                .get_series_id(&series_key)
+                .await
+                .context(IndexErrSnafu)?
+            {
+                res_sids.push(Some((id, series_key)));
+                continue;
+            }
 
-        let series_key =
-            SeriesKey::build_series_key(db_name, tab_name, tag_names, info).map_err(|e| {
-                Error::CommonError {
-                    reason: e.to_string(),
+            if recover_from_wal {
+                if let Some(id) = ts_index_r
+                    .get_tombstone_series_id(&series_key)
+                    .await
+                    .context(IndexErrSnafu)?
+                {
+                    // 仅在 recover wal的时候有用
+                    res_sids.push(Some((id, series_key)));
+                    continue;
                 }
-            })?;
+            }
 
-        if let Some(id) = ts_index.get_series_id(&series_key).await? {
-            return Ok(id);
+            res_sids.push(None);
+            series_keys.push(series_key);
         }
+        drop(ts_index_r);
 
-        let id = ts_index.add_series_if_not_exists(&series_key).await?;
+        let mut ids = ts_index
+            .write()
+            .await
+            .add_series_if_not_exists(series_keys)
+            .await
+            .context(IndexErrSnafu)?
+            .into_iter();
+        for item in res_sids.iter_mut() {
+            if item.is_none() {
+                *item = Some(ids.next().context(CommonSnafu {
+                    reason: "add series failed, new series id is missing".to_string(),
+                })?);
+            }
+        }
+        let res_sids = res_sids.into_iter().flatten().collect::<Vec<_>>();
 
-        Ok(id)
+        Ok(res_sids)
     }
 
-    /// Snashots last version before `last_seq` of this database's all vnodes
-    /// or specified vnode by `vnode_id`.
-    ///
-    /// Generated version data will be inserted into `version_edits` and `file_metas`.
-    ///
-    /// - `version_edits` are for all vnodes and db-files,
-    /// - `file_metas` is for index data
-    /// (field-id filter) of db-files.
-    pub async fn snapshot(
+    pub async fn get_series_key(
         &self,
-        vnode_id: Option<TseriesFamilyId>,
-        version_edits: &mut Vec<VersionEdit>,
-        file_metas: &mut HashMap<ColumnFileId, Arc<BloomFilter>>,
-    ) {
-        if let Some(tsf_id) = vnode_id.as_ref() {
-            if let Some(tsf) = self.ts_families.get(tsf_id) {
-                let ve = tsf.read().await.snapshot(self.owner.clone(), file_metas);
-                version_edits.push(ve);
-            }
-        } else {
-            for tsf in self.ts_families.values() {
-                let ve = tsf.read().await.snapshot(self.owner.clone(), file_metas);
-                version_edits.push(ve);
-            }
-        }
-    }
-
-    pub async fn get_series_key(&self, vnode_id: u32, sid: u32) -> IndexResult<Option<SeriesKey>> {
+        vnode_id: u32,
+        sids: &[SeriesId],
+    ) -> IndexResult<Vec<SeriesKey>> {
+        let mut res = vec![];
         if let Some(idx) = self.get_ts_index(vnode_id) {
-            return idx.get_series_key(sid).await;
+            let idx = idx.read().await;
+            for sid in sids {
+                if let Some(key) = idx.get_series_key(*sid).await? {
+                    res.push(key)
+                }
+            }
         }
 
-        Ok(None)
+        Ok(res)
     }
 
-    pub fn get_table_schema(&self, table_name: &str) -> Result<Option<Arc<TskvTableSchema>>> {
-        Ok(self.schemas.get_table_schema(table_name)?)
+    pub async fn rebuild_tsfamily_index(
+        &mut self,
+        ts_family: Arc<RwLock<TseriesFamily>>,
+    ) -> TskvResult<Arc<RwLock<TSIndex>>> {
+        let id = ts_family.read().await.tf_id();
+        let ts_index = ts_family.read().await.rebuild_index().await?;
+
+        self.ts_indexes.insert(id, ts_index.clone());
+
+        Ok(ts_index)
+    }
+
+    pub async fn get_table_schema(
+        &self,
+        table_name: &str,
+    ) -> TskvResult<Option<TskvTableSchemaRef>> {
+        Ok(self.schemas.get_table_schema(table_name).await?)
     }
 
     pub fn get_tsfamily(&self, id: u32) -> Option<Arc<RwLock<TseriesFamily>>> {
@@ -451,11 +448,11 @@ impl Database {
         self.ts_families.iter().for_each(func);
     }
 
-    pub fn del_ts_index(&mut self, id: u32) {
+    pub fn del_ts_index(&mut self, id: TseriesFamilyId) {
         self.ts_indexes.remove(&id);
     }
 
-    pub fn get_ts_index(&self, id: u32) -> Option<Arc<index::ts_index::TSIndex>> {
+    pub fn get_ts_index(&self, id: TseriesFamilyId) -> Option<Arc<RwLock<TSIndex>>> {
         if let Some(v) = self.ts_indexes.get(&id) {
             return Some(v.clone());
         }
@@ -463,28 +460,18 @@ impl Database {
         None
     }
 
-    pub fn ts_indexes(&self) -> HashMap<TseriesFamilyId, Arc<index::ts_index::TSIndex>> {
+    pub fn ts_indexes(&self) -> HashMap<TseriesFamilyId, Arc<RwLock<TSIndex>>> {
         self.ts_indexes.clone()
     }
 
-    pub async fn get_table_sids(&self, table: &str) -> IndexResult<Vec<SeriesId>> {
-        let mut res = vec![];
-        for (_, ts_index) in self.ts_indexes.iter() {
-            let mut list = ts_index.get_series_id_list(table, &[]).await?;
-            res.append(&mut list);
-        }
-        Ok(res)
-    }
-
-    pub async fn get_ts_index_or_add(&mut self, id: u32) -> Result<Arc<index::ts_index::TSIndex>> {
+    pub async fn get_ts_index_or_add(&mut self, id: u32) -> TskvResult<Arc<RwLock<TSIndex>>> {
         if let Some(v) = self.ts_indexes.get(&id) {
             return Ok(v.clone());
         }
 
         let path = self.opt.storage.index_dir(&self.owner, id);
 
-        let idx = index::ts_index::TSIndex::new(path).await?;
-        let idx = Arc::new(idx);
+        let idx = TSIndex::new(path).await.context(IndexErrSnafu)?;
 
         self.ts_indexes.insert(id, idx.clone());
 
@@ -495,12 +482,16 @@ impl Database {
         self.schemas.clone()
     }
 
-    pub fn get_schema(&self) -> Result<DatabaseSchema> {
-        Ok(self.schemas.db_schema()?)
+    pub async fn get_schema(&self) -> TskvResult<DatabaseSchema> {
+        Ok(self.schemas.db_schema().await?)
     }
 
     pub fn owner(&self) -> Arc<String> {
         self.owner.clone()
+    }
+
+    pub fn db_name(&self) -> Arc<String> {
+        self.db_name.clone()
     }
 }
 
@@ -511,65 +502,75 @@ impl Database {
     }
 }
 
-pub(crate) async fn delete_table_async(
-    tenant: String,
-    database: String,
-    table: String,
-    version_set: Arc<RwLock<VersionSet>>,
-) -> Result<()> {
-    info!("Drop table: '{}.{}'", &database, &table);
-    let version_set_rlock = version_set.read().await;
-    let db_instance = version_set_rlock.get_db(&tenant, &database);
-    drop(version_set_rlock);
+#[derive(Debug)]
+pub struct FbSchema<'a> {
+    pub table: &'a str,
+    pub time_index: usize,
+    pub tag_indexes: Vec<usize>,
+    pub tag_names: Vec<Cow<'a, str>>,
+    pub field_indexes: Vec<usize>,
+    pub field_names: Vec<&'a str>,
+    pub field_types: Vec<FieldType>,
+}
 
-    if let Some(db) = db_instance {
-        let schemas = db.read().await.get_schemas();
-        let field_infos = schemas.get_table_schema(&table)?;
-        //schemas.del_table_schema(&table).await?;
+impl<'a> FbSchema<'a> {
+    pub fn from_fb_column(
+        table: &'a str,
+        columns: Vector<'a, ForwardsUOffset<Column<'a>>>,
+    ) -> TskvResult<FbSchema<'a>> {
+        let mut time_index = usize::MAX;
+        let mut tag_indexes = vec![];
+        let mut tag_names = vec![];
+        let mut field_indexes = vec![];
+        let mut field_names = vec![];
+        let mut field_types = vec![];
 
-        let mut sids = vec![];
-        for (_id, index) in db.read().await.ts_indexes().iter() {
-            let mut ids = index
-                .get_series_id_list(&table, &[])
-                .await
-                .context(error::IndexErrSnafu)?;
-
-            for sid in ids.iter() {
-                index
-                    .del_series_info(*sid)
-                    .await
-                    .context(error::IndexErrSnafu)?;
-            }
-            index.flush().await.context(error::IndexErrSnafu)?;
-
-            sids.append(&mut ids);
-        }
-
-        if let Some(fields) = field_infos {
-            debug!(
-                "Drop table: deleting series in table: {}.{}",
-                &database, &table
-            );
-            let fids: Vec<ColumnId> = fields.columns().iter().map(|f| f.id).collect();
-            let storage_fids: Vec<u64> = sids
-                .iter()
-                .flat_map(|sid| fids.iter().map(|fid| unite_id(*fid, *sid)))
-                .collect();
-            let time_range = &TimeRange {
-                min_ts: Timestamp::MIN,
-                max_ts: Timestamp::MAX,
-            };
-
-            for (_ts_family_id, ts_family) in db.read().await.ts_families().iter() {
-                // TODO: Concurrent delete on ts_family.
-                // TODO: Limit parallel delete to 1.
-                ts_family.write().await.delete_series(&sids, time_range);
-                let version = ts_family.read().await.super_version();
-                for column_file in version.version.column_files(&storage_fids, time_range) {
-                    column_file.add_tombstone(&storage_fids, time_range).await?;
+        for (index, column) in columns.iter().enumerate() {
+            match column.column_type() {
+                ColumnType::Time => {
+                    time_index = index;
                 }
+                ColumnType::Tag => {
+                    tag_indexes.push(index);
+                    let column_name = column.name().context(CommonSnafu {
+                        reason: "Tag column name not found in flatbuffer columns".to_string(),
+                    })?;
+
+                    tag_names.push(Cow::Borrowed(column_name));
+                }
+                ColumnType::Field => {
+                    field_indexes.push(index);
+                    field_names.push(column.name().context(CommonSnafu {
+                        reason: "Field column name not found in flatbuffer columns".to_string(),
+                    })?);
+                    field_types.push(column.field_type());
+                }
+                _ => {}
             }
         }
+
+        if time_index == usize::MAX {
+            return Err(CommonSnafu {
+                reason: "Time column not found in flatbuffer columns".to_string(),
+            }
+            .build());
+        }
+
+        if field_indexes.is_empty() {
+            return Err(CommonSnafu {
+                reason: "Field column not found in flatbuffer columns".to_string(),
+            }
+            .build());
+        }
+
+        Ok(Self {
+            table,
+            time_index,
+            tag_indexes,
+            tag_names,
+            field_indexes,
+            field_names,
+            field_types,
+        })
     }
-    Ok(())
 }

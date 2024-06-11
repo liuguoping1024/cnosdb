@@ -24,3 +24,12 @@ pub const TENANT: &str = "tenant";
 pub const DB: &str = "db";
 pub const TARGET_PARTITIONS: &str = "target_partitions";
 pub const STREAM_TRIGGER_INTERVAL: &str = "stream_trigger_interval";
+
+// encoding
+pub const GZIP: &str = "gzip";
+pub const DEFLATE: &str = "deflate";
+pub const BROTLI: &str = "br";
+pub const ZSTD: &str = "zstd";
+pub const SNAPPY: &str = "snappy";
+pub const LZ4: &str = "lz4";
+pub const IDENTITY: &str = "identity";

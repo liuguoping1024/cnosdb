@@ -6,17 +6,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::arrow::record_batch::RecordBatch;
 use models::meta_data::VnodeId;
-use models::predicate::domain::{ColumnDomains, TimeRange};
-use models::schema::{Precision, TableColumn};
-use models::{ColumnId, SeriesId, SeriesKey};
-use protos::kv_service::{WritePointsRequest, WritePointsResponse};
-use protos::models as fb_models;
-use trace::{debug, SpanContext};
+use models::predicate::domain::ColumnDomains;
+use models::{SeriesId, SeriesKey};
 
-use crate::error::Result;
+use crate::error::TskvResult;
 use crate::kv_option::StorageOptions;
-use crate::summary::VersionEdit;
 use crate::tseries_family::SuperVersion;
+use crate::vnode_store::VnodeStorage;
 use crate::{Engine, TseriesFamilyId};
 
 #[derive(Debug, Default)]
@@ -24,43 +20,26 @@ pub struct MockEngine {}
 
 #[async_trait]
 impl Engine for MockEngine {
-    async fn write(
+    async fn open_tsfamily(
         &self,
-        _span_ctx: Option<&SpanContext>,
-        id: u32,
-        precision: Precision,
-        write_batch: WritePointsRequest,
-    ) -> Result<WritePointsResponse> {
-        debug!("writing point");
-        let points = Arc::new(write_batch.points);
-        let fb_points = flatbuffers::root::<fb_models::Points>(&points).unwrap();
-
-        debug!("writed point: {:?}", fb_points);
-
-        Ok(WritePointsResponse { points_number: 0 })
+        tenant: &str,
+        db_name: &str,
+        vnode_id: VnodeId,
+    ) -> TskvResult<VnodeStorage> {
+        todo!()
     }
 
-    async fn write_from_wal(
+    async fn remove_tsfamily(&self, tenant: &str, database: &str, id: u32) -> TskvResult<()> {
+        Ok(())
+    }
+
+    async fn flush_tsfamily(
         &self,
+        tenant: &str,
+        database: &str,
         id: u32,
-        precision: Precision,
-        write_batch: WritePointsRequest,
-        seq: u64,
-    ) -> Result<()> {
-        debug!("write point");
-        Ok(())
-    }
-
-    async fn remove_tsfamily(&self, tenant: &str, database: &str, id: u32) -> Result<()> {
-        Ok(())
-    }
-
-    async fn flush_tsfamily(&self, tenant: &str, database: &str, id: u32) -> Result<()> {
-        Ok(())
-    }
-
-    async fn drop_database(&self, tenant: &str, database: &str) -> Result<()> {
-        println!("drop_database.sql {:?}", database);
+        trigger_compact: bool,
+    ) -> TskvResult<()> {
         Ok(())
     }
 
@@ -84,22 +63,6 @@ impl Engine for MockEngine {
     //     Ok(Some(DatabaseSchema::new(tenant, name)))
     // }
 
-    async fn drop_table(&self, tenant: &str, database: &str, table: &str) -> Result<()> {
-        println!("drop_table db:{:?}, table:{:?}", database, table);
-        Ok(())
-    }
-
-    async fn delete_series(
-        &self,
-        tenant: &str,
-        database: &str,
-        series_ids: &[SeriesId],
-        field_ids: &[ColumnId],
-        time_range: &TimeRange,
-    ) -> Result<()> {
-        todo!()
-    }
-
     async fn get_series_id_by_filter(
         &self,
         tenant: &str,
@@ -107,18 +70,19 @@ impl Engine for MockEngine {
         tab: &str,
         id: SeriesId,
         filter: &ColumnDomains<String>,
-    ) -> Result<Vec<SeriesId>> {
+    ) -> TskvResult<Vec<SeriesId>> {
         Ok(vec![])
     }
 
     async fn get_series_key(
         &self,
         tenant: &str,
-        db: &str,
-        vnode_id: u32,
-        sid: u32,
-    ) -> Result<Option<SeriesKey>> {
-        Ok(None)
+        database: &str,
+        table: &str,
+        vnode_id: VnodeId,
+        series_id: &[SeriesId],
+    ) -> TskvResult<Vec<SeriesKey>> {
+        Ok(vec![])
     }
 
     async fn get_db_version(
@@ -126,26 +90,7 @@ impl Engine for MockEngine {
         tenant: &str,
         db: &str,
         vnode_id: u32,
-    ) -> Result<Option<Arc<SuperVersion>>> {
-        todo!()
-    }
-
-    async fn get_vnode_summary(
-        &self,
-        tenant: &str,
-        database: &str,
-        vnode_id: u32,
-    ) -> Result<Option<VersionEdit>> {
-        todo!()
-    }
-
-    async fn apply_vnode_summary(
-        &self,
-        tenant: &str,
-        database: &str,
-        vnode_id: u32,
-        summary: VersionEdit,
-    ) -> Result<()> {
+    ) -> TskvResult<Option<Arc<SuperVersion>>> {
         todo!()
     }
 
@@ -153,56 +98,17 @@ impl Engine for MockEngine {
     //     todo!()
     // }
 
-    async fn add_table_column(
-        &self,
-        tenant: &str,
-        database: &str,
-        table: &str,
-        column: TableColumn,
-    ) -> Result<()> {
-        todo!()
-    }
-
-    async fn drop_table_column(
-        &self,
-        tenant: &str,
-        database: &str,
-        table: &str,
-        column: &str,
-    ) -> Result<()> {
-        todo!()
-    }
-
-    async fn change_table_column(
-        &self,
-        tenant: &str,
-        database: &str,
-        table: &str,
-        column_name: &str,
-        new_column: TableColumn,
-    ) -> Result<()> {
-        todo!()
-    }
-
     fn get_storage_options(&self) -> Arc<StorageOptions> {
         todo!()
     }
 
-    async fn drop_vnode(&self, id: TseriesFamilyId) -> Result<()> {
+    async fn compact(&self, vnode_ids: Vec<TseriesFamilyId>) -> TskvResult<()> {
         todo!()
     }
 
-    async fn compact(&self, vnode_ids: Vec<TseriesFamilyId>) -> Result<()> {
-        todo!()
-    }
-
-    async fn get_vnode_hash_tree(&self, vnode_ids: VnodeId) -> Result<RecordBatch> {
+    async fn get_vnode_hash_tree(&self, vnode_ids: VnodeId) -> TskvResult<RecordBatch> {
         todo!()
     }
 
     async fn close(&self) {}
-
-    async fn prepare_copy_vnode(&self, tenant: &str, database: &str, vnode_id: u32) -> Result<()> {
-        todo!()
-    }
 }

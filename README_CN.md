@@ -30,7 +30,11 @@
     <a href="https://docs.cnosdb.com/zh/">Documentation</a>
     •
     <a href="https://docs.cnosdb.com/zh/guide/quick_start.html">Quick Start</a>
+    •
+    <a href="https://docs.cnosdb.com/eco-integration/">Eco-Integration</a>
 </h3>
+
+[English](./README.md) | 简体中文
 
 CnosDB 是一款高性能、高压缩率、高易用性的开源分布式时序数据库。主要应用场景为物联网，工业互联网，车联网，IT运维等。所有代码均已在GitHub开源。
 
@@ -99,6 +103,19 @@ $ cmake -G "Xcode" -DCMAKE_BUILD_TYPE=Release
 $ sudo make install
 ```
 
+4. 安装Protobuf
+
+```shell
+# Arch Linux
+pacman -S protobuf
+# Fedora
+dnf install protobuf
+# Ubuntu
+snap install protobuf
+# macOS
+brew install protobuf
+```
+
 ### **编译**
 
 ```shell
@@ -110,7 +127,7 @@ make build
 
 #### 运行CnosDB
 
-以下为单节点启动，如需启动集群，见 [启动一个集群](https://docs.cnosdb.com/zh/guide/cluster/cluster.html#%E9%9B%86%E7%BE%A4%E5%90%AF%E5%8A%A8%E6%B5%81%E7%A8%8B)
+以下为单节点启动，如需启动集群，请参考 [部署](https://docs.cnosdb.com/docs/deploy/) 章节。
 
 ```bash
 ./target/debug/cnosdb run -M singleton --config ./config/config.toml
@@ -147,7 +164,7 @@ cnosdb-cli
 - [SQL写入](https://docs.cnosdb.com/zh/latest/reference/sql.html#insert)
 - [influxdb行协议](https://docs.influxdata.com/influxdb/v2.6/reference/syntax/line-protocol/)
 - [批量导入](https://docs.cnosdb.com/zh/latest/develop/write.html#load-data)
-- [telegraf](https://docs.cnosdb.com/en/latest/versatility/collect/telegraf.html)
+- [telegraf](https://docs.cnosdb.com/eco-integration/telegraf)
 
 下面将展示使用cli进行SQL写入的例子
 
@@ -213,7 +230,7 @@ Query took 0.038 seconds.
 ## 数据查询
 
 - [SQL](https://docs.cnosdb.com/zh/latest/reference/sql.html)，兼容SQL标准
-- [Prometheus remote read](https://docs.cnosdb.com/zh/latest/versatility/collect/prometheus.html#remote-read)
+- [Prometheus remote read](https://docs.cnosdb.com/eco-integration/prometheus#remote-read)
 
 下面将展示使用cli进行SQL查询的例子
 
@@ -273,5 +290,6 @@ CnosDB支持多种客户端的连接：
 - CnosDB 2.0使用[Apache Arrow](https://github.com/apache/arrow)作为内存模型。
 - CnosDB 2.0的查询引擎基于[Apache Arrow DataFusion](https://github.com/apache/arrow-datafusion)构建。
 - CnosDB 2.0的Bug挖掘工具使用[SQLancer](https://github.com/sqlancer/sqlancer)作为支持。
-- CnosDB 2.0的集成测试框架基于[sqllogictest-rs](https://github.com/risinglightdb/sqllogictest-rs)构建.
+- CnosDB 2.0的集成测试框架基于[sqllogictest-rs](https://github.com/risinglightdb/sqllogictest-rs)构建。
+- CnosDB 2.0 结合 [LangChain](https://github.com/hwchase17/langchain) 实现自然语言与数据库的交流。
 

@@ -12,24 +12,31 @@ protos = { path = "../protos" }
 trace = { path = "../trace" }
 utils = { path = "../utils" }
 
+arrow = { workspace = true }
+arrow-array = { workspace = true }
 arrow-schema = { workspace = true, features = ["serde"] }
 async-backtrace = { workspace = true, optional = true }
 async-trait = { workspace = true }
 bincode = { workspace = true }
+bcrypt = { workspace = true }
+byteorder = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 datafusion = { workspace = true }
 datafusion-proto = { workspace = true }
 derive_builder = { workspace = true }
 futures = { workspace = true }
+flatbuffers = { workspace = true }
 libc = { workspace = true }
+minivec = { workspace = true }
 openssl = { workspace = true }
 parking_lot = { workspace = true }
 pin-project = { workspace = true }
+prost = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 snafu = { workspace = true }
-tokio = { workspace = true, features = ["full"] }
+tokio = { workspace = true, features = ["full", "tracing"] }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
 uuid = { workspace = true }
@@ -43,3 +50,4 @@ default = []
 backtrace = ["async-backtrace"]
 [dev-dependencies]
 flatbuffers = { workspace = true }
+toml = { workspace = true }

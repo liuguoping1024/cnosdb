@@ -1,9 +1,7 @@
-use std::sync::Arc;
-
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::config::ConfigOptions;
 use datafusion::error::{DataFusionError, Result};
-use datafusion::logical_expr::{expr, LogicalPlan, Projection, Sort};
+use datafusion::logical_expr::{expr, LogicalPlan, LogicalPlanBuilder, Projection, Sort};
 use datafusion::optimizer::analyzer::AnalyzerRule;
 use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue;
@@ -46,21 +44,16 @@ fn analyze_internal(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
 }
 
 fn do_transform(bottom_function: &Expr, projection: &Projection) -> Result<LogicalPlan> {
-    let Projection {
-        expr,
-        input,
-        schema,
-        ..
-    } = projection;
+    let Projection { expr, input, .. } = projection;
 
     let (field, k) = extract_args(bottom_function)?;
 
     let sort_expr = Expr::Sort(expr::Sort {
-        /// The expression to sort on
+        // The expression to sort on
         expr: Box::new(field.clone()),
-        /// The direction of the sort
+        // The direction of the sort
         asc: true,
-        /// Whether to put Nulls before all other data values
+        // Whether to put Nulls before all other data values
         nulls_first: false,
     });
 
@@ -73,19 +66,23 @@ fn do_transform(bottom_function: &Expr, projection: &Projection) -> Result<Logic
     // 2. construct a new projection node
     // * replace bottom func expression with inner column expr
     // * not construct the new set of required columns
-    let new_projection = LogicalPlan::Projection(Projection::try_new_with_schema(
-        expr_utils::replace_expr_with(expr, bottom_function, &field),
-        Arc::new(topk_node),
-        schema.clone(),
-    )?);
+    let plan = LogicalPlanBuilder::from(topk_node)
+        .project(expr_utils::replace_expr_with(expr, bottom_function, &field))?
+        .limit(0, Some(k))?
+        .build()?;
 
     // 3. Assemble the new execution plan return
-    Ok(new_projection)
+    Ok(plan)
 }
 
 fn valid_exprs(exprs: &[Expr]) -> Result<bool> {
     let selector_function_num = expr_utils::find_selector_function_exprs(exprs).len();
     let selector_function_with_nested_num = expr_utils::find_selector_function_exprs(exprs).len();
+
+    let exprs = exprs
+        .iter()
+        .map(|e| e.display_name())
+        .collect::<Result<Vec<_>>>()?;
 
     // 1. There cannot be nested selection functions
     // 2. There cannot be multiple selection functions
@@ -95,16 +92,18 @@ fn valid_exprs(exprs: &[Expr]) -> Result<bool> {
             1 => return Ok(true),
             _ => {
                 return Err(DataFusionError::Plan(format!(
-                    "{}, found: {:#?}",
-                    INVALID_EXPRS, exprs
-                )))
+                    "{}, found: [{}]",
+                    INVALID_EXPRS,
+                    exprs.join(", ")
+                )));
             }
         }
     }
 
     Err(DataFusionError::Plan(format!(
-        "{}, found: {:#?}",
-        INVALID_EXPRS, exprs
+        "{}, found: {}",
+        INVALID_EXPRS,
+        exprs.join(", ")
     )))
 }
 
@@ -112,10 +111,10 @@ fn extract_bottom_function(exprs: &[Expr]) -> Option<Expr> {
     expr_utils::find_exprs_in_exprs(exprs, &|nested_expr| {
         matches!(
             nested_expr,
-            Expr::ScalarUDF {
+            Expr::ScalarUDF(expr::ScalarUDF {
                 fun,
                 ..
-            } if fun.name.eq_ignore_ascii_case(BOTTOM)
+            }) if fun.name.eq_ignore_ascii_case(BOTTOM)
         )
     })
     .first()
@@ -123,13 +122,13 @@ fn extract_bottom_function(exprs: &[Expr]) -> Option<Expr> {
 }
 
 fn extract_args(expr: &Expr) -> Result<(Expr, usize)> {
-    if let Expr::ScalarUDF { fun: _, args } = expr {
+    if let Expr::ScalarUDF(expr::ScalarUDF { fun: _, args }) = expr {
         if args.len() != 2 {
             return Err(DataFusionError::Plan(INVALID_ARGUMENTS.to_string()));
         }
 
         let field_expr = args
-            .get(0)
+            .first()
             .ok_or_else(|| DataFusionError::Plan(INVALID_ARGUMENTS.to_string()))?;
         let k_expr = args
             .get(1)

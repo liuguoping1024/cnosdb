@@ -1,16 +1,23 @@
 use std::collections::HashMap;
-use std::fmt;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use crate::auth::role::{CustomTenantRole, TenantRoleIdentifier};
 use crate::node_info::NodeStatus;
+use crate::oid::Oid;
 use crate::predicate::domain::TimeRange;
-use crate::schema::{DatabaseSchema, TableSchema};
+use crate::schema::{DatabaseSchema, ResourceInfo, TableSchema};
 
 pub type VnodeId = u32;
 pub type NodeId = u64;
 pub type ReplicationSetId = u32;
+
+#[derive(Debug, Clone)]
+pub enum MetaModifyType {
+    NodeMetrics(NodeMetrics),
+    ResourceInfo(Box<ResourceInfo>),
+}
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct SysInfo {
@@ -33,38 +40,10 @@ pub struct UserInfo {
     pub perm: u64, //read write admin bitmap
 }
 
-#[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Default, Clone)]
-pub enum NodeAttribute {
-    #[default]
-    Hot,
-    Cold,
-}
-
-impl fmt::Display for NodeAttribute {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            NodeAttribute::Hot => write!(f, "HOT"),
-            NodeAttribute::Cold => write!(f, "COLD"),
-        }
-    }
-}
-
-impl From<String> for NodeAttribute {
-    fn from(node_attribute: String) -> Self {
-        match node_attribute.to_uppercase().as_str() {
-            "HOT" => NodeAttribute::Hot,
-            "COLD" => NodeAttribute::Cold,
-            _ => panic!("Invalid NodeAttribute:{}", node_attribute),
-        }
-    }
-}
-
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct NodeInfo {
     pub id: NodeId,
     pub grpc_addr: String,
-    pub http_addr: String,
-    pub attribute: NodeAttribute,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
@@ -73,6 +52,12 @@ pub struct NodeMetrics {
     pub disk_free: u64,
     pub time: i64,
     pub status: NodeStatus,
+}
+
+impl NodeMetrics {
+    pub fn is_healthy(&self) -> bool {
+        self.status == NodeStatus::Healthy
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
@@ -91,19 +76,51 @@ impl BucketInfo {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+#[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, Eq, Hash)]
 pub struct ReplicationSet {
     pub id: ReplicationSetId,
+    pub leader_node_id: NodeId,
+    pub leader_vnode_id: VnodeId,
     pub vnodes: Vec<VnodeInfo>,
 }
 
 impl ReplicationSet {
-    pub fn new(id: ReplicationSetId, vnodes: Vec<VnodeInfo>) -> Self {
-        Self { id, vnodes }
+    pub fn new(
+        id: ReplicationSetId,
+        leader_node_id: NodeId,
+        leader_vnode_id: VnodeId,
+        vnodes: Vec<VnodeInfo>,
+    ) -> Self {
+        Self {
+            id,
+            vnodes,
+            leader_node_id,
+            leader_vnode_id,
+        }
+    }
+
+    pub fn vnode(&self, id: VnodeId) -> Option<VnodeInfo> {
+        for vnode in &self.vnodes {
+            if vnode.id == id {
+                return Some(vnode.clone());
+            }
+        }
+
+        None
+    }
+
+    pub fn by_node_id(&self, id: NodeId) -> Option<VnodeInfo> {
+        for vnode in &self.vnodes {
+            if vnode.node_id == id {
+                return Some(vnode.clone());
+            }
+        }
+
+        None
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, Eq, Hash)]
 pub struct VnodeInfo {
     pub id: VnodeId,
     pub node_id: NodeId,
@@ -121,7 +138,7 @@ impl VnodeInfo {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Default, Clone, Copy, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VnodeStatus {
     #[default]
     Running,
@@ -140,6 +157,16 @@ pub struct VnodeAllInfo {
     pub status: VnodeStatus,
     pub start_time: i64,
     pub end_time: i64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+pub struct ReplicaAllInfo {
+    pub bucket_id: u32,
+    pub db_name: String,
+    pub tenant: String,
+    pub start_time: i64,
+    pub end_time: i64,
+    pub replica_set: ReplicationSet,
 }
 
 impl VnodeAllInfo {
@@ -190,6 +217,10 @@ impl DatabaseInfo {
         TimeRange::new(min_ts, max_ts)
     }
 
+    pub fn is_hidden(&self) -> bool {
+        self.schema.options().get_db_is_hidden()
+    }
+
     // return the min timestamp value database allowed to store
     pub fn time_to_expired(&self) -> i64 {
         self.schema.time_to_expired()
@@ -199,16 +230,19 @@ impl DatabaseInfo {
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct TenantMetaData {
     pub version: u64,
-    pub users: HashMap<String, UserInfo>,
+    // db_name -> database_info
     pub dbs: HashMap<String, DatabaseInfo>,
+    pub roles: HashMap<String, CustomTenantRole<Oid>>,
+    pub members: HashMap<String, TenantRoleIdentifier>,
 }
 
 impl TenantMetaData {
     pub fn new() -> Self {
         Self {
             version: 0,
-            users: HashMap::new(),
             dbs: HashMap::new(),
+            roles: HashMap::new(),
+            members: HashMap::new(),
         }
     }
 
@@ -302,6 +336,8 @@ pub fn allocation_replication_set(
         let mut repl_set = ReplicationSet {
             id: incr_id,
             vnodes: vec![],
+            leader_node_id: 0,
+            leader_vnode_id: 0,
         };
         incr_id += 1;
 
@@ -313,6 +349,8 @@ pub fn allocation_replication_set(
             incr_id += 1;
             index += 1;
         }
+        repl_set.leader_vnode_id = repl_set.vnodes[0].id;
+        repl_set.leader_node_id = repl_set.vnodes[0].node_id;
 
         group.push(repl_set);
     }
@@ -348,18 +386,47 @@ pub fn get_disk_info(path: &str) -> std::io::Result<u64> {
         use std::ffi::OsStr;
 
         use windows::core::HSTRING;
-        use windows::Win32::Storage::FileSystem::{
-            GetDiskSpaceInformationW, DISK_SPACE_INFORMATION,
-        };
+        use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
 
-        let hdir = HSTRING::from(OsStr::new(path));
-        let mut disk_space_info = MaybeUninit::<DISK_SPACE_INFORMATION>::zeroed();
-        let disk_space_info = unsafe {
-            GetDiskSpaceInformationW(&hdir, disk_space_info.as_mut_ptr())
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-            disk_space_info.assume_init()
+        // See https://learn.microsoft.com/zh-cn/windows/win32/api/fileapi/nf-fileapi-getdiskfreespaceexw
+        // Minimum supported client: Windows XP [desktop apps | UWP apps]
+        // Minimum supported server: Windows Server 2003 [desktop apps | UWP apps]
+        // Target Platform:          Windows
+        // Header:                   fileapi.h (include Windows.h)
+        // Library:                  Kernel32.lib
+        // DLL:                      Kernel32.dll
+
+        let lp_directory_name = HSTRING::from(OsStr::new(path));
+        let mut lp_free_bytes_available_to_caller = MaybeUninit::<u64>::zeroed();
+        let free_bytes_available_to_caller = unsafe {
+            GetDiskFreeSpaceExW(
+                &lp_directory_name,
+                Some(lp_free_bytes_available_to_caller.as_mut_ptr()),
+                None, // lp_total_number_of_bytes
+                None, // lp_total_number_of_free_bytes
+            )
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            lp_free_bytes_available_to_caller.assume_init()
         };
-        Ok(disk_space_info.ActualAvailableAllocationUnits
-            * (disk_space_info.SectorsPerAllocationUnit * disk_space_info.BytesPerSector) as u64)
+        Ok(free_bytes_available_to_caller)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::get_disk_info;
+
+    #[test]
+    fn test_get_disk_info() {
+        let p = get_disk_info(".").unwrap();
+        println!("disk info: {}", p);
+
+        let p = get_disk_info("/").unwrap();
+        println!("disk info: {}", p);
+
+        let p = get_disk_info("/not_existed");
+        assert!(p.is_err());
+        let pe = std::io::Error::last_os_error();
+        println!("disk info error: {}", pe);
     }
 }

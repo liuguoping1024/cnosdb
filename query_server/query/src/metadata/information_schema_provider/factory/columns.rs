@@ -14,7 +14,9 @@ use datafusion::physical_plan::ExecutionPlan;
 use meta::model::MetaClientRef;
 use models::auth::user::User;
 use models::oid::Identifier;
-use models::schema::{ColumnType, ExternalTableSchema, StreamTable, TableSchema, TskvTableSchema};
+use models::schema::{
+    ColumnType, ExternalTableSchema, StreamTable, TableSchema, TskvTableSchemaRef,
+};
 use models::ValueType;
 
 use crate::dispatcher::query_tracker::QueryTracker;
@@ -23,7 +25,7 @@ use crate::metadata::information_schema_provider::builder::columns::{
 };
 use crate::metadata::information_schema_provider::InformationSchemaTableFactory;
 
-const INFORMATION_SCHEMA_COLUMNS: &str = "COLUMNS";
+pub const INFORMATION_SCHEMA_COLUMNS: &str = "COLUMNS";
 
 /// This view only displays the column information of tables under the database that the current user has Read permission or higher.
 pub struct ColumnsFactory {}
@@ -87,9 +89,13 @@ impl TableProvider for InformationColumnsTable {
         let tenant_id = tenant.id();
         let tenant_name = tenant.name();
 
-        for db in dbs {
+        for (db, info) in dbs {
             // Check if the current user has at least read permission on this db, skip if not
             if !self.user.can_read_database(*tenant_id, &db) {
+                continue;
+            }
+
+            if info.is_hidden() {
                 continue;
             }
 
@@ -128,7 +134,7 @@ impl TableProvider for InformationColumnsTable {
 fn append_tskv_table(
     tenant_name: &str,
     database_name: &str,
-    table: Arc<TskvTableSchema>,
+    table: TskvTableSchemaRef,
     builder: &mut InformationSchemaColumnsBuilder,
 ) {
     for (idx, col) in table.columns().iter().enumerate() {
@@ -141,7 +147,7 @@ fn append_tskv_table(
             idx as u64,
             "NULL",
             col.nullable(),
-            col.column_type.to_sql_type_str(),
+            col.column_type.to_sql_type_str_with_unit(),
             Some(col.encoding.as_str()),
         );
     }

@@ -1,10 +1,12 @@
 use async_trait::async_trait;
+use coordinator::resource_manager::ResourceManager;
 use meta::error::MetaError;
-use protos::kv_service::admin_command_request::Command::DropDb;
-use protos::kv_service::{AdminCommandRequest, DropDbRequest};
+use models::oid::Identifier;
+use models::schema::{ResourceInfo, ResourceOperator};
+use snafu::ResultExt;
 use spi::query::execution::{Output, QueryStateMachineRef};
 use spi::query::logical_planner::{DropTenantObject, TenantObjectType};
-use spi::{QueryError, Result};
+use spi::{CoordinatorSnafu, MetaSnafu, QueryError, QueryResult};
 use trace::debug;
 
 use super::DDLDefinitionTask;
@@ -22,17 +24,17 @@ impl DropTenantObjectTask {
 
 #[async_trait]
 impl DDLDefinitionTask for DropTenantObjectTask {
-    async fn execute(&self, query_state_machine: QueryStateMachineRef) -> Result<Output> {
+    async fn execute(&self, query_state_machine: QueryStateMachineRef) -> QueryResult<Output> {
         let DropTenantObject {
             ref tenant_name,
             ref name,
             ref if_exist,
             ref obj_type,
+            ref after,
         } = self.stmt;
 
         let meta = query_state_machine
             .meta
-            .tenant_manager()
             .tenant_meta(tenant_name)
             .await
             .ok_or_else(|| QueryError::Meta {
@@ -52,7 +54,7 @@ impl DDLDefinitionTask for DropTenantObjectTask {
                 //     tenant_id: &Oid
                 // ) -> Result<bool>;
                 debug!("Drop role {} of tenant {}", name, tenant_name);
-                let success = meta.drop_custom_role(name).await?;
+                let success = meta.drop_custom_role(name).await.context(MetaSnafu)?;
 
                 if let (false, false) = (if_exist, success) {
                     return Err(QueryError::Meta {
@@ -70,23 +72,34 @@ impl DDLDefinitionTask for DropTenantObjectTask {
                 // tenant_id
                 // database_name
 
-                let req = AdminCommandRequest {
-                    tenant: tenant_name.to_string(),
-                    command: Some(DropDb(DropDbRequest { db: name.clone() })),
-                };
-
-                query_state_machine.coord.broadcast_command(req).await?;
-
-                debug!("Drop database {} of tenant {}", name, tenant_name);
-                let success = meta.drop_db(name).await?;
-
-                if let (false, false) = (if_exist, success) {
-                    return Err(QueryError::Meta {
-                        source: MetaError::DatabaseNotFound {
-                            database: name.to_string(),
-                        },
-                    });
+                if meta.get_db_schema(name).is_ok_and(|opt| opt.is_none()) {
+                    if *if_exist {
+                        return Ok(Output::Nil(()));
+                    } else {
+                        return Err(QueryError::Meta {
+                            source: MetaError::DatabaseNotFound {
+                                database: name.to_string(),
+                            },
+                        });
+                    }
                 }
+
+                // first, set hidden to TRUE
+                meta.set_db_is_hidden(tenant_name, name, true)
+                    .await
+                    .map_err(|err| QueryError::Meta { source: err })?;
+
+                // second, add drop task
+                let resourceinfo = ResourceInfo::new(
+                    (*meta.tenant().id(), name.to_string()),
+                    tenant_name.clone() + "-" + name,
+                    ResourceOperator::DropDatabase(tenant_name.clone(), name.clone()),
+                    after,
+                    query_state_machine.coord.node_id(),
+                );
+                ResourceManager::add_resource_task(query_state_machine.coord.clone(), resourceinfo)
+                    .await
+                    .context(CoordinatorSnafu)?;
 
                 Ok(Output::Nil(()))
             }

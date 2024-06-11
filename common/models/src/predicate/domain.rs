@@ -1,29 +1,33 @@
-use std::cmp::{self, Ordering};
+use std::cmp::{self, max, min, Ordering};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fmt::Display;
+use std::fmt::{Display, Formatter};
 use std::hash::Hash;
 use std::ops::{Bound as StdBound, RangeBounds};
 use std::sync::Arc;
 
 use arrow_schema::Schema;
 use datafusion::arrow::datatypes::DataType;
+use datafusion::common::DFSchema;
 use datafusion::logical_expr::Expr;
-use datafusion::optimizer::utils::conjunction;
+use datafusion::physical_expr::execution_props::ExecutionProps;
+use datafusion::physical_expr::{create_physical_expr, PhysicalExpr};
 use datafusion::prelude::Column;
 use datafusion::scalar::ScalarValue;
 use datafusion_proto::protobuf;
+use datafusion_proto::protobuf::PhysicalExprNode;
+use prost::Message;
 use protos::models_helper::to_prost_bytes;
 use serde::de::Visitor;
 use serde::ser::SerializeStruct;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use snafu::ResultExt;
 
 use super::transformation::RowExpressionToDomainsVisitor;
 use super::utils::filter_to_time_ranges;
 use super::PlacedSplit;
-use crate::schema::{
-    ColumnType, ScalarValueForkDF, TableColumn, TskvTableSchema, TskvTableSchemaRef,
-};
-use crate::{Error, Result, Timestamp};
+use crate::errors::{InternalSnafu, InvalidQueryExprMsgSnafu, InvalidSerdeMessageSnafu};
+use crate::schema::{ColumnType, TableColumn, TskvTableSchemaRef};
+use crate::{ModelResult, Timestamp};
 
 pub type PredicateRef = Arc<Predicate>;
 pub type ResolvedPredicateRef = Arc<ResolvedPredicate>;
@@ -54,6 +58,7 @@ impl From<(StdBound<i64>, StdBound<i64>)> for TimeRange {
 }
 
 impl TimeRange {
+    /// notice: when min_ts > max_ts, time_range is considered [`Self::none()`]
     pub fn new(min_ts: i64, max_ts: i64) -> Self {
         Self { min_ts, max_ts }
     }
@@ -116,6 +121,37 @@ impl TimeRange {
         self.min_ts = self.min_ts.min(other.min_ts);
         self.max_ts = self.max_ts.max(other.max_ts);
     }
+
+    pub fn exclude(&self, other: &TimeRange) -> (Option<TimeRange>, Option<TimeRange>) {
+        //              other
+        //           |__________|
+        // self
+        // |____________________|
+        let left = if self.min_ts < other.min_ts {
+            Some(TimeRange::new(
+                self.min_ts,
+                min(self.max_ts, other.min_ts - 1),
+            ))
+        } else {
+            None
+        };
+        // other
+        // |___________|
+        //               self
+        // |________________|
+        let right = if self.max_ts > other.max_ts {
+            Some(TimeRange::new(
+                max(self.min_ts, other.max_ts + 1),
+                self.max_ts,
+            ))
+        } else {
+            None
+        };
+        (left, right)
+    }
+    pub fn is_none(&self) -> bool {
+        self.min_ts > self.max_ts
+    }
 }
 
 impl From<(Timestamp, Timestamp)> for TimeRange {
@@ -157,62 +193,80 @@ impl Display for TimeRange {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TimeRanges {
     // Sorted time ranges.
-    inner: Vec<TimeRange>,
+    inner: BTreeMap<i64, i64>,
     min_ts: Timestamp,
     max_ts: Timestamp,
-    is_boundless: bool,
 }
 
 impl TimeRanges {
-    pub fn new(time_ranges: Vec<TimeRange>) -> Self {
-        let TimeRange { min_ts, max_ts } = Self::time_range_of_time_ranges(&time_ranges);
-        if min_ts == Timestamp::MIN && max_ts == Timestamp::MAX {
-            Self::all()
-        } else {
-            Self {
-                inner: time_ranges,
-                min_ts,
-                max_ts,
-                is_boundless: false,
-            }
+    fn add_time_range(&mut self, time_range: TimeRange) {
+        self.min_ts = min(self.min_ts, time_range.min_ts);
+        self.max_ts = max(self.max_ts, time_range.max_ts);
+        let timestamps = self
+            .inner
+            .range(..=time_range.max_ts)
+            .rev()
+            .take_while(|(_, &max)| max >= time_range.min_ts)
+            .map(|(&min, _)| min)
+            .collect::<Vec<_>>();
+        let mut new_range = (time_range.min_ts, time_range.max_ts);
+        if !timestamps.is_empty() {
+            new_range.0 = new_range.0.min(*timestamps.last().unwrap());
+            new_range.1 = new_range.1.max(self.inner[&timestamps[0]]);
+
+            timestamps.iter().for_each(|ts| {
+                self.inner.remove(ts);
+            });
         }
+        self.inner.insert(new_range.0, new_range.1);
+    }
+
+    pub fn new(time_ranges: Vec<TimeRange>) -> Self {
+        let mut res = Self::empty();
+        res.extend_from_slice(&time_ranges);
+        res
     }
 
     pub fn with_inclusive_bounds(min_ts: i64, max_ts: i64) -> Self {
         Self {
-            inner: vec![TimeRange::new(min_ts, max_ts)],
+            inner: BTreeMap::from([(min_ts, max_ts)]),
             min_ts,
             max_ts,
-            is_boundless: min_ts == Timestamp::MIN && max_ts == Timestamp::MAX,
         }
     }
 
     pub fn all() -> Self {
         Self {
-            inner: vec![TimeRange::all()],
+            inner: BTreeMap::from([(Timestamp::MIN, Timestamp::MAX)]),
             min_ts: Timestamp::MIN,
             max_ts: Timestamp::MAX,
-            is_boundless: true,
         }
     }
 
     pub fn empty() -> Self {
         Self {
-            inner: vec![],
+            inner: BTreeMap::new(),
             min_ts: Timestamp::MAX,
             max_ts: Timestamp::MIN,
-            is_boundless: false,
         }
     }
 
-    fn time_range_of_time_ranges(time_ranges: &[TimeRange]) -> TimeRange {
-        let mut min_ts = Timestamp::MAX;
-        let mut max_ts = Timestamp::MIN;
-        for tr in time_ranges {
-            min_ts = min_ts.min(tr.min_ts);
-            max_ts = max_ts.max(tr.max_ts);
+    /// Push time range to time ranges.
+    pub fn push(&mut self, time_range: TimeRange) {
+        if self.is_boundless() {
+            return;
         }
-        TimeRange { min_ts, max_ts }
+        self.add_time_range(time_range)
+    }
+
+    /// Push time range to time ranges.
+    pub fn extend_from_slice(&mut self, time_ranges: &[TimeRange]) {
+        if self.is_boundless() {
+            return;
+        }
+        for time_range in time_ranges {
+            self.add_time_range(*time_range);
+        }
     }
 
     #[inline(always)]
@@ -225,8 +279,10 @@ impl TimeRanges {
         self.inner.is_empty()
     }
 
-    pub fn time_ranges(&self) -> &[TimeRange] {
-        &self.inner
+    pub fn time_ranges(&self) -> impl Iterator<Item = TimeRange> + '_ {
+        self.inner
+            .iter()
+            .map(|(min, max)| TimeRange::new(*min, *max))
     }
 
     pub fn min_ts(&self) -> Timestamp {
@@ -238,97 +294,66 @@ impl TimeRanges {
     }
 
     pub fn is_boundless(&self) -> bool {
-        self.is_boundless
+        self.min_ts == Timestamp::MIN && self.max_ts == Timestamp::MAX
     }
 
     pub fn overlaps(&self, time_range: &TimeRange) -> bool {
-        for tr in self.inner.iter() {
-            if tr.overlaps(time_range) {
-                return true;
-            }
-        }
-        false
+        self.max_time_range().overlaps(time_range)
+            && self.time_ranges().any(|tr| tr.overlaps(time_range))
     }
 
     pub fn includes(&self, time_range: &TimeRange) -> bool {
-        if self.inner.is_empty()
-            || time_range.max_ts < self.min_ts
-            || time_range.min_ts > self.max_ts
-        {
-            return false;
-        }
-        match self
-            .inner
-            .binary_search_by_key(&time_range.min_ts, |tr| tr.min_ts)
-        {
-            Ok(i) => {
-                for tr in self.inner[i..].iter() {
-                    if time_range.max_ts <= tr.max_ts {
-                        return true;
-                    }
-                    if time_range.max_ts > tr.max_ts {
-                        return false;
-                    }
-                }
-                false
-            }
-            Err(i) => {
-                if i == 0 {
-                    false
-                } else {
-                    for tr in self.inner[..i].iter().rev() {
-                        if tr.max_ts >= time_range.max_ts {
-                            return true;
-                        }
-                    }
-                    false
-                }
-            }
-        }
+        matches!(
+            self.inner.range(..=time_range.max_ts).next_back(),
+            Some((&min, &max)) if time_range.max_ts <= max && time_range.min_ts >= min
+        )
     }
 
     pub fn contains(&self, timestamp: Timestamp) -> bool {
-        if self.inner.is_empty() || timestamp < self.min_ts || timestamp > self.max_ts {
-            return false;
-        }
-        match self.inner.binary_search_by_key(&timestamp, |tr| tr.min_ts) {
-            Ok(_) => true,
-            Err(i) => {
-                if i == 0 {
-                    false
-                } else if i == self.inner.len() {
-                    let tr = unsafe { self.inner.get_unchecked(i - 1) };
-                    tr.max_ts >= timestamp
-                } else {
-                    for tr in self.inner[..i].iter().rev() {
-                        if tr.max_ts >= timestamp {
-                            return true;
-                        }
-                    }
-                    false
-                }
-            }
-        }
+        self.includes(&TimeRange::new(timestamp, timestamp))
     }
 
     pub fn intersect(&self, time_range: &TimeRange) -> Option<Self> {
         if self.overlaps(time_range) {
             let mut new_time_ranges = vec![];
-            for tr in self.inner.iter() {
+            for tr in self.time_ranges() {
                 if let Some(intersect_tr) = tr.intersect(time_range) {
                     new_time_ranges.push(intersect_tr);
                 }
             }
-            return Some(Self::new(new_time_ranges));
+            if new_time_ranges.is_empty() {
+                return None;
+            } else {
+                return Some(Self::new(new_time_ranges));
+            }
         }
 
         None
     }
-}
 
-impl AsRef<[TimeRange]> for TimeRanges {
-    fn as_ref(&self) -> &[TimeRange] {
-        &self.inner
+    pub fn max_time_range(&self) -> TimeRange {
+        TimeRange::new(self.min_ts, self.max_ts)
+    }
+
+    pub fn exclude(&self, time_range: &TimeRange) -> TimeRanges {
+        let trs = self
+            .inner
+            .iter()
+            .flat_map(|tr| {
+                let tr_tuple = TimeRange::new(*tr.0, *tr.1).exclude(time_range);
+                [tr_tuple.0, tr_tuple.1]
+            })
+            .collect::<Vec<Option<TimeRange>>>()
+            .into_iter()
+            .flatten()
+            .collect::<Vec<TimeRange>>();
+        TimeRanges::new(trs)
+    }
+
+    pub fn exclude_time_ranges(&self, other: &[&TimeRange]) -> TimeRanges {
+        let mut res = self.clone();
+        other.iter().for_each(|o| res = res.exclude(o));
+        res
     }
 }
 
@@ -338,14 +363,34 @@ impl From<(Timestamp, Timestamp)> for TimeRanges {
     }
 }
 
+impl Display for TimeRanges {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{{ ")?;
+        for tr in &self.inner {
+            write!(f, "{:?}", tr)?;
+        }
+        write!(f, " }}")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 enum Bound {
     /// lower than the value, but infinitesimally close to the value.
     Below,
-    // exactly the value.
+    /// exactly the value.
     Exactly,
-    // higher than the value, but infinitesimally close to the value.
+    /// higher than the value, but infinitesimally close to the value.
     Above,
+}
+
+impl Display for Bound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Bound::Below => write!(f, "<"),
+            Bound::Exactly => write!(f, "="),
+            Bound::Above => write!(f, ">"),
+        }
+    }
 }
 
 /// A point on the continuous space defined by the specified type.
@@ -363,7 +408,7 @@ impl Serialize for Marker {
     where
         S: serde::Serializer,
     {
-        let value: Option<ScalarValueForkDF> = self.value.clone().map(|e| e.into());
+        let value: Option<ScalarValue> = self.value.clone();
 
         let mut ve = serializer.serialize_struct("Marker", 3)?;
         ve.serialize_field("data_type", &self.data_type)?;
@@ -387,7 +432,7 @@ impl<'a> Deserialize<'a> for Marker {
 #[derive(Serialize, Deserialize)]
 struct MarkerSerialize {
     data_type: DataType,
-    value: Option<ScalarValueForkDF>,
+    value: Option<ScalarValue>,
     bound: Bound,
 }
 
@@ -400,7 +445,7 @@ impl From<MarkerSerialize> for Marker {
         } = mark;
         Self {
             data_type,
-            value: value.map(|e| e.into()),
+            value,
             bound,
         }
     }
@@ -445,11 +490,39 @@ impl Marker {
             bound: Bound::Above,
         }
     }
+
+    /// Greater than the value.
+    fn lower_bounded(data_type: DataType, value: ScalarValue) -> Marker {
+        Self {
+            data_type,
+            value: Some(value),
+            bound: Bound::Above,
+        }
+    }
+
+    /// Equal to the value.
+    fn exactly(data_type: DataType, value: ScalarValue) -> Marker {
+        Self {
+            data_type,
+            value: Some(value),
+            bound: Bound::Exactly,
+        }
+    }
+
     /// Infinitely small (less than a nonexistent number).
     fn upper_unbound(data_type: DataType) -> Marker {
         Self {
             data_type,
             value: None,
+            bound: Bound::Below,
+        }
+    }
+
+    /// Less than the value.
+    fn upper_bounded(data_type: DataType, value: ScalarValue) -> Marker {
+        Self {
+            data_type,
+            value: Some(value),
             bound: Bound::Below,
         }
     }
@@ -501,21 +574,18 @@ impl PartialEq for Marker {
             .eq(other.value.as_ref().unwrap())
     }
 }
-
-impl PartialOrd for Marker {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        if !self.check_type_compatibility(other) {
-            return None;
-        }
+impl Ord for Marker {
+    fn cmp(&self, other: &Self) -> Ordering {
+        debug_assert!(self.check_type_compatibility(other));
         // (∞, ∞)
         // => Equal
         // (∞, _)
         // => Greater
         if self.is_upper_unbound() {
             return if other.is_upper_unbound() {
-                Some(std::cmp::Ordering::Equal)
+                std::cmp::Ordering::Equal
             } else {
-                Some(std::cmp::Ordering::Greater)
+                std::cmp::Ordering::Greater
             };
         }
         // (-∞, -∞)
@@ -524,36 +594,46 @@ impl PartialOrd for Marker {
         // => Less
         if self.is_lower_unbound() {
             return if other.is_lower_unbound() {
-                Some(std::cmp::Ordering::Equal)
+                std::cmp::Ordering::Equal
             } else {
-                Some(std::cmp::Ordering::Less)
+                std::cmp::Ordering::Less
             };
         }
         // self not unbound
         // (_, ∞)
         // => Less
         if other.is_upper_unbound() {
-            return Some(std::cmp::Ordering::Less);
+            return std::cmp::Ordering::Less;
         }
         // self not unbound
         // (_, -∞)
         // => Greater
         if other.is_lower_unbound() {
-            return Some(std::cmp::Ordering::Greater);
+            return std::cmp::Ordering::Greater;
         }
         // value and other.value are present
         let self_data = self.value.as_ref().unwrap();
         let other_data = other.value.as_ref().unwrap();
 
-        self_data.partial_cmp(other_data)
+        self_data.partial_cmp(other_data).unwrap()
+    }
+}
+
+impl PartialOrd for Marker {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 
 impl Eq for Marker {}
 
-impl Ord for Marker {
-    fn cmp(&self, other: &Self) -> cmp::Ordering {
-        self.partial_cmp(other).unwrap()
+impl Display for Marker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", self.bound, self.data_type)?;
+        if let Some(ref v) = self.value {
+            return write!(f, "{}", v);
+        }
+        Ok(())
     }
 }
 
@@ -574,6 +654,67 @@ impl RangeBounds<ScalarValue> for Range {
     }
 }
 
+impl Display for Range {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn write_scalar_value_opt_for_bound_display(
+            f: &mut std::fmt::Formatter<'_>,
+            marker: &Marker,
+            is_left_bound: bool,
+        ) -> std::fmt::Result {
+            write!(f, "({})", marker.data_type)?;
+            if let Some(ref v) = &marker.value {
+                write!(f, "{}", v)
+            } else if is_left_bound {
+                write!(f, "-∞")
+            } else {
+                write!(f, "∞")
+            }
+        }
+        fn write_marker_for_bound_display(
+            f: &mut std::fmt::Formatter<'_>,
+            marker: &Marker,
+            is_left_bound: bool,
+        ) -> std::fmt::Result {
+            match (is_left_bound, &marker.bound) {
+                (true, Bound::Above) => {
+                    write!(f, "(",)?;
+                    write_scalar_value_opt_for_bound_display(f, marker, is_left_bound)
+                }
+                (false, Bound::Below) => {
+                    write_scalar_value_opt_for_bound_display(f, marker, is_left_bound)?;
+                    write!(f, ")")
+                }
+                (true, Bound::Exactly) => {
+                    write!(f, "[",)?;
+                    write_scalar_value_opt_for_bound_display(f, marker, is_left_bound)
+                }
+                (false, Bound::Exactly) => {
+                    write_scalar_value_opt_for_bound_display(f, marker, is_left_bound)?;
+                    write!(f, "]")
+                }
+                _ => {
+                    // Unexpected patterns.
+                    write!(f, "#")?;
+                    write_scalar_value_opt_for_bound_display(f, marker, is_left_bound)?;
+                    write!(f, "#")
+                }
+            }
+        }
+
+        if self.low.is_lower_unbound() {
+            write!(f, "(-∞")?;
+        } else {
+            write_marker_for_bound_display(f, &self.low, true)?;
+        }
+        write!(f, ", ")?;
+        if self.high.is_upper_unbound() {
+            write!(f, "∞)")
+        } else {
+            write_marker_for_bound_display(f, &self.high, false)
+        }
+    }
+}
+
 impl Range {
     fn get_type(&self) -> &DataType {
         &self.low.data_type
@@ -583,15 +724,16 @@ impl Range {
     /// Returns an exception if the data types do not match.
     ///
     /// Returns the data type of self if the data types match.
-    fn check_type_compatibility(&self, other: &Range) -> Result<DataType> {
+    fn check_type_compatibility(&self, other: &Range) -> ModelResult<DataType> {
         if !self.low.check_type_compatibility(&other.low) {
-            return Err(Error::Internal {
+            return Err(InternalSnafu {
                 err: format!(
                     "mismatched types: excepted {}, found {}",
                     self.get_type(),
                     other.get_type()
                 ),
-            });
+            }
+            .build());
         }
 
         Ok(self.low.data_type.clone())
@@ -613,52 +755,34 @@ impl Range {
     }
     /// Constructs a range of values equal to scalar_value [scalar_value, scalar_value].
     pub fn eq(data_type: &DataType, scalar_value: &ScalarValue) -> Range {
-        let low = Marker {
-            data_type: data_type.clone(),
-            value: Some(scalar_value.clone()),
-            bound: Bound::Exactly,
-        };
-        let high = Marker {
-            data_type: data_type.clone(),
-            value: Some(scalar_value.clone()),
-            bound: Bound::Exactly,
-        };
+        let low = Marker::exactly(data_type.clone(), scalar_value.clone());
+        let high = Marker::exactly(data_type.clone(), scalar_value.clone());
 
         Self { low, high }
     }
     /// TODO Constructs a range of values not equal to scalar_value [scalar_value, scalar_value].
-    pub fn ne(data_type: &DataType, _scalar_value: &ScalarValue) -> Range {
-        let low = Marker {
-            data_type: data_type.clone(),
-            value: None,
-            bound: Bound::Below,
-        };
-        let high = Marker {
-            data_type: data_type.clone(),
-            value: None,
-            bound: Bound::Above,
-        };
-
-        Self { low, high }
+    pub fn ne(data_type: &DataType, scalar_value: &ScalarValue) -> Vec<Range> {
+        vec![
+            Self {
+                low: Marker::lower_unbound(data_type.clone()),
+                high: Marker::upper_bounded(data_type.clone(), scalar_value.clone()),
+            },
+            Self {
+                low: Marker::lower_bounded(data_type.clone(), scalar_value.clone()),
+                high: Marker::upper_unbound(data_type.clone()),
+            },
+        ]
     }
     /// Construct a range of values greater than scalar_value (scalar_value, +∞).
     pub fn gt(data_type: &DataType, scalar_value: &ScalarValue) -> Range {
-        let low = Marker {
-            data_type: data_type.clone(),
-            value: Some(scalar_value.clone()),
-            bound: Bound::Above,
-        };
+        let low = Marker::lower_bounded(data_type.clone(), scalar_value.clone());
         let high = Marker::upper_unbound(data_type.clone());
 
         Self { low, high }
     }
     /// Construct a range of values greater than or equal to scalar_value [scalar_value, +∞).
     pub fn ge(data_type: &DataType, scalar_value: &ScalarValue) -> Range {
-        let low = Marker {
-            data_type: data_type.clone(),
-            value: Some(scalar_value.clone()),
-            bound: Bound::Exactly,
-        };
+        let low = Marker::exactly(data_type.clone(), scalar_value.clone());
         let high = Marker::upper_unbound(data_type.clone());
 
         Self { low, high }
@@ -666,25 +790,46 @@ impl Range {
     /// Construct a range of values smaller than scalar_value (-∞, scalar_value).
     pub fn lt(data_type: &DataType, scalar_value: &ScalarValue) -> Range {
         let low = Marker::lower_unbound(data_type.clone());
-        let high = Marker {
-            data_type: data_type.clone(),
-            value: Some(scalar_value.clone()),
-            bound: Bound::Below,
-        };
+        let high = Marker::upper_bounded(data_type.clone(), scalar_value.clone());
 
         Self { low, high }
     }
     /// Construct a range of values less than or equal to scalar_value (-∞, scalar_value].
     pub fn le(data_type: &DataType, scalar_value: &ScalarValue) -> Range {
         let low = Marker::lower_unbound(data_type.clone());
-        let high = Marker {
-            data_type: data_type.clone(),
-            value: Some(scalar_value.clone()),
-            bound: Bound::Exactly,
-        };
+        let high = Marker::exactly(data_type.clone(), scalar_value.clone());
 
         Self { low, high }
     }
+    /// Construct a range of values in a left-open and right-open interval (low, high).
+    pub fn gtlt(data_type: &DataType, low: &ScalarValue, high: &ScalarValue) -> Range {
+        Self {
+            low: Marker::lower_bounded(data_type.clone(), low.clone()),
+            high: Marker::upper_bounded(data_type.clone(), high.clone()),
+        }
+    }
+    /// Construct a range of values in a left-closed and right-open interval [low, high).
+    pub fn gelt(data_type: &DataType, low: &ScalarValue, high: &ScalarValue) -> Range {
+        Self {
+            low: Marker::exactly(data_type.clone(), low.clone()),
+            high: Marker::upper_bounded(data_type.clone(), high.clone()),
+        }
+    }
+    /// Construct a range of values in a left-open and right-closed interval (low, high].
+    pub fn gtle(data_type: &DataType, low: &ScalarValue, high: &ScalarValue) -> Range {
+        Self {
+            low: Marker::lower_bounded(data_type.clone(), low.clone()),
+            high: Marker::exactly(data_type.clone(), high.clone()),
+        }
+    }
+    /// Construct a range of values in a left-closed and right-closed interval [low, high].
+    pub fn gele(data_type: &DataType, low: &ScalarValue, high: &ScalarValue) -> Range {
+        Self {
+            low: Marker::exactly(data_type.clone(), low.clone()),
+            high: Marker::exactly(data_type.clone(), high.clone()),
+        }
+    }
+
     /// Determine if two ranges of values overlap.
     ///
     /// If there is overlap, return Ok(true).
@@ -692,9 +837,16 @@ impl Range {
     /// If there no overlap, return Ok(false).
     ///
     /// Returns an exception if the data types are incompatible.
-    fn overlaps(&self, other: &Self) -> Result<bool> {
+    fn overlaps(&self, other: &Self) -> ModelResult<bool> {
         self.check_type_compatibility(other)?;
         if self.low <= other.high && other.low <= self.high {
+            // like (-∞, 2) and (2, +∞) is not overlap
+            if self.high == other.low
+                && self.high.bound == Bound::Below
+                && other.low.bound == Bound::Above
+            {
+                return Ok(false);
+            }
             return Ok(true);
         }
         Ok(false)
@@ -702,7 +854,7 @@ impl Range {
     /// Calculates the intersection of two ranges.
     ///
     /// return an exception, if there is no intersection.
-    fn intersect(&self, other: &Self) -> Result<Self> {
+    fn intersect(&self, other: &Self) -> ModelResult<Self> {
         // Type mismatch directly returns an exception
         if self.overlaps(other)? {
             // There is overlap, calculate the intersection
@@ -716,16 +868,17 @@ impl Range {
         }
         // If the type matches and there is no intersection, an exception is returned.
         // If it is executed here, it means that there is a bug in the upper-level system logic.
-        Err(Error::Internal {
+        Err(InternalSnafu {
             err: "cannot intersect non-overlapping ranges".to_string(),
-        })
+        }
+        .build())
     }
     /// Calculates the span of two ranges
     ///
     /// return new Range
     ///
     /// Returns an exception if the data types are incompatible.
-    fn span(&self, other: &Self) -> Result<Self> {
+    fn span(&self, other: &Self) -> ModelResult<Self> {
         //Type mismatch directly returns an exception
         if self.overlaps(other)? {
             // There is overlap, calculate the intersection
@@ -739,9 +892,10 @@ impl Range {
         }
         // If the type matches and there is no intersection, an exception is returned.
         // If it is executed here, it means that there is a bug in the upper-level system logic.
-        Err(Error::Internal {
+        Err(InternalSnafu {
             err: "cannot span non-overlapping ranges".to_string(),
-        })
+        }
+        .build())
     }
     /// whether to match all lines
     pub fn is_all(&self) -> bool {
@@ -772,7 +926,7 @@ impl Serialize for ValueEntry {
             .try_into()
             .map_err(serde::ser::Error::custom)?;
 
-        let value_buf = to_prost_bytes(value);
+        let value_buf = to_prost_bytes(&value);
 
         let mut ve = serializer.serialize_struct("ValueEntry", 2)?;
         ve.serialize_field("data_type", &self.data_type)?;
@@ -787,6 +941,12 @@ impl<'a> Deserialize<'a> for ValueEntry {
         D: serde::Deserializer<'a>,
     {
         deserializer.deserialize_struct("ValueEntry", &["data_type", "value"], ValueEntryVisitor)
+    }
+}
+
+impl Display for ValueEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "({}) {}", self.data_type, self.value)
     }
 }
 
@@ -831,6 +991,48 @@ impl RangeValueSet {
     }
 }
 
+impl Display for RangeValueSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn write_marker_for_range_value_set_display(
+            f: &mut std::fmt::Formatter<'_>,
+            marker: &Marker,
+        ) -> std::fmt::Result {
+            // write!(f, "{} ({})", self.bound, self.data_type)?;
+            // if let Some(ref v) = self.value {
+            //     return write!(f, "{}", v);
+            // }
+            if marker.is_lower_unbound() {
+                write!(f, "(-∞, )")
+            } else {
+                match marker.bound {
+                    Bound::Below => write!(f, "#")?,
+                    Bound::Exactly => write!(f, "[")?,
+                    Bound::Above => write!(f, "(")?,
+                }
+                write!(f, "({})", &marker.data_type)?;
+                if let Some(ref v) = marker.value {
+                    write!(f, "{v}")?;
+                }
+                write!(f, ",..")
+            }
+        }
+
+        write!(f, "{{ ")?;
+        if !self.low_indexed_ranges.is_empty() {
+            let max_i = self.low_indexed_ranges.len() - 1;
+            for (i, (marker, range)) in self.low_indexed_ranges.iter().enumerate() {
+                write!(f, "(")?;
+                write_marker_for_range_value_set_display(f, marker)?;
+                write!(f, ": {range}")?;
+                if i < max_i {
+                    write!(f, ", ")?;
+                }
+            }
+        }
+        write!(f, " }}")
+    }
+}
+
 /// A set containing values that are uniquely identifiable.
 ///
 /// Assumes an infinite number of possible values.
@@ -852,6 +1054,28 @@ impl EqutableValueSet {
     }
 }
 
+impl Display for EqutableValueSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "({} ", self.data_type)?;
+        if self.white_list {
+            write!(f, "white_list")?;
+        }
+        write!(f, ") [")?;
+        if !self.entries.is_empty() {
+            let max_i = self.entries.len() - 1;
+            for (i, value_entry) in self.entries.iter().enumerate() {
+                write!(f, "{value_entry}")?;
+                if i < max_i {
+                    write!(f, ", ")?;
+                }
+            }
+        }
+        write!(f, " ]")?;
+
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Domain {
     Range(RangeValueSet),
@@ -866,7 +1090,7 @@ impl Domain {
     /// Return new ValueSet(RangeValueSet)
     ///
     /// Returns an exception if the data types are incompatible.
-    pub fn of_ranges(res: &[Range]) -> Result<Domain> {
+    pub fn of_ranges(res: &[Range]) -> ModelResult<Domain> {
         if res.is_empty() {
             return Ok(Domain::None);
         }
@@ -875,7 +1099,7 @@ impl Domain {
         ranges.sort_by(|l, r| l.low.cmp(&r.low));
 
         // at least one element
-        let mut current = ranges.get(0).unwrap().to_owned();
+        let mut current = ranges.first().unwrap().to_owned();
 
         let mut low_indexed_ranges: BTreeMap<Marker, Range> = BTreeMap::default();
 
@@ -926,7 +1150,7 @@ impl Domain {
     /// Calculates the intersection of two ranges, and returns None if the intersection does not exist
     ///
     /// This method returns the new value without changing the old value
-    fn intersect(&self, other: &Domain) -> Result<Domain> {
+    fn intersect(&self, other: &Domain) -> ModelResult<Domain> {
         match (self, other) {
             (Self::Range(ref self_val_set), Self::Range(ref other_val_set)) => {
                 Domain::range_intersect(self_val_set, other_val_set)
@@ -937,9 +1161,10 @@ impl Domain {
             (Self::None, _) | (_, Self::None) => Ok(Self::None),
             (Self::All, _) => Ok(other.clone()),
             (_, Self::All) => Ok(self.clone()),
-            _ => Err(Error::Internal {
+            _ => Err(InternalSnafu {
                 err: "mismatched ValueSet type".to_string(),
-            }),
+            }
+            .build()),
         }
     }
     /// Calculates the union of two ranges
@@ -949,7 +1174,7 @@ impl Domain {
     /// Returns an exception if the ValueSet types are incompatible.
     ///
     /// This method returns the new ValueSet without changing the old value
-    fn union(&self, other: &Domain) -> Result<Domain> {
+    fn union(&self, other: &Domain) -> ModelResult<Domain> {
         match (self, other) {
             (Self::Range(ref self_val_set), Self::Range(ref other_val_set)) => {
                 Domain::range_union(self_val_set, other_val_set)
@@ -960,15 +1185,16 @@ impl Domain {
             (Self::None, _) => Ok(other.clone()),
             (_, Self::None) => Ok(self.clone()),
             (Self::All, _) | (_, Self::All) => Ok(Self::All),
-            _ => Err(Error::Internal {
+            _ => Err(InternalSnafu {
                 err: "mismatched ValueSet type".to_string(),
-            }),
+            }
+            .build()),
         }
     }
     /// Merge and intersect two ordered range sets
     ///
     /// This method returns the new ValueSet without changing the old value
-    fn range_intersect(first: &RangeValueSet, other: &RangeValueSet) -> Result<Domain> {
+    fn range_intersect(first: &RangeValueSet, other: &RangeValueSet) -> ModelResult<Domain> {
         let mut result: Vec<Range> = Vec::default();
 
         let mut first_values = first.low_indexed_ranges.values();
@@ -1006,9 +1232,10 @@ impl Domain {
                 }
             }
             (_, _) => {
-                return Err(Error::Internal {
+                return Err(InternalSnafu {
                     err: "RangeValueSet not contains value".to_string(),
-                });
+                }
+                .build());
             }
         }
 
@@ -1017,7 +1244,7 @@ impl Domain {
     /// Merge and intersect two equable value sets
     ///
     /// This method returns the new ValueSet without changing the old value
-    fn value_intersect(first: &EqutableValueSet, other: &EqutableValueSet) -> Result<Domain> {
+    fn value_intersect(first: &EqutableValueSet, other: &EqutableValueSet) -> ModelResult<Domain> {
         let result_data_type = &first.data_type;
         let result_white_list: bool;
         let result_entries: Vec<&ScalarValue>;
@@ -1095,7 +1322,7 @@ impl Domain {
     /// Merge and intersect two equable value sets
     ///
     /// This method returns the new ValueSet without changing the old value
-    fn range_union(first: &RangeValueSet, other: &RangeValueSet) -> Result<Domain> {
+    fn range_union(first: &RangeValueSet, other: &RangeValueSet) -> ModelResult<Domain> {
         let mut result: Vec<_> = first.low_indexed_ranges.values().cloned().collect();
         let mut other_ranges: Vec<_> = other.low_indexed_ranges.values().cloned().collect();
 
@@ -1104,7 +1331,7 @@ impl Domain {
         Domain::of_ranges(&result)
     }
 
-    fn value_union(first: &EqutableValueSet, other: &EqutableValueSet) -> Result<Domain> {
+    fn value_union(first: &EqutableValueSet, other: &EqutableValueSet) -> ModelResult<Domain> {
         let result_data_type = &first.data_type;
         let result_white_list: bool;
         let result_entries: Vec<&ScalarValue>;
@@ -1148,6 +1375,17 @@ impl Domain {
             result_white_list,
             result_entries.as_ref(),
         ))
+    }
+}
+
+impl Display for Domain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Domain::Range(s) => write!(f, "range({s})"),
+            Domain::Equtable(s) => write!(f, "equtable({s})"),
+            Domain::None => write!(f, "none"),
+            Domain::All => write!(f, "all"),
+        }
     }
 }
 
@@ -1323,24 +1561,85 @@ impl<T: Eq + Hash + Clone> ColumnDomains<T> {
     }
 }
 
+impl<T> Display for ColumnDomains<T>
+where
+    T: Eq + Hash + Clone + Display,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{{ ")?;
+        if let Some(ref column_to_domain) = self.column_to_domain {
+            let max_i = column_to_domain.len() - 1;
+            for (i, (column, domain)) in column_to_domain.iter().enumerate() {
+                write!(f, "{column}: {domain}")?;
+                if i < max_i {
+                    write!(f, ", ")?;
+                }
+            }
+        }
+        write!(f, " }}")
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PhysicalExprNodeWrap(PhysicalExprNode);
+impl Serialize for PhysicalExprNodeWrap {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_bytes(&self.0.encode_to_vec())
+    }
+}
+
+impl<'de> Deserialize<'de> for PhysicalExprNodeWrap {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct BytesVisit;
+        impl<'de> Visitor<'de> for BytesVisit {
+            type Value = PhysicalExprNode;
+
+            fn expecting(&self, formatter: &mut Formatter) -> std::fmt::Result {
+                formatter.write_str("expecting PhysicalExprNode")
+            }
+
+            fn visit_bytes<E>(self, v: &[u8]) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                let node = PhysicalExprNode::decode(v).map_err(|e| serde::de::Error::custom(e))?;
+                Ok(node)
+            }
+        }
+        let node = deserializer.deserialize_bytes(BytesVisit)?;
+        Ok(PhysicalExprNodeWrap(node))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResolvedPredicate {
     time_ranges: Arc<TimeRanges>,
     tags_filter: ColumnDomains<String>,
-    fields_filter: ColumnDomains<String>,
+    physical_expr: PhysicalExprNodeWrap,
 }
 
 impl ResolvedPredicate {
     pub fn new(
         time_ranges: Arc<TimeRanges>,
         tags_filter: ColumnDomains<String>,
-        fields_filter: ColumnDomains<String>,
-    ) -> Self {
-        Self {
+        physical_expr: Option<Arc<dyn PhysicalExpr>>,
+    ) -> ModelResult<Self> {
+        let node = match physical_expr {
+            None => PhysicalExprNode { expr_type: None },
+            Some(e) => PhysicalExprNode::try_from(e)?,
+        };
+
+        Ok(Self {
             time_ranges,
             tags_filter,
-            fields_filter,
-        }
+            physical_expr: PhysicalExprNodeWrap(node),
+        })
     }
 
     pub fn time_ranges(&self) -> Arc<TimeRanges> {
@@ -1351,14 +1650,15 @@ impl ResolvedPredicate {
         &self.tags_filter
     }
 
-    pub fn fields_filter(&self) -> &ColumnDomains<String> {
-        &self.fields_filter
+    pub fn filter(&self) -> &PhysicalExprNode {
+        &self.physical_expr.0
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Predicate {
     pushed_down_domains: ColumnDomains<Column>,
+    physical_expr: Option<Arc<dyn PhysicalExpr>>,
     limit: Option<usize>,
 }
 
@@ -1371,7 +1671,11 @@ impl Predicate {
         &self.pushed_down_domains
     }
 
-    pub fn set_limit(mut self, limit: Option<usize>) -> Predicate {
+    pub fn physical_expr(&self) -> Option<&Arc<dyn PhysicalExpr>> {
+        self.physical_expr.as_ref()
+    }
+
+    pub fn with_limit(mut self, limit: Option<usize>) -> Self {
         self.limit = limit;
         self
     }
@@ -1379,43 +1683,58 @@ impl Predicate {
     /// resolve and extract supported filter
     /// convert filter to ColumnDomains and set self
     pub fn push_down_filter(
-        mut self,
-        filters: &[Expr],
-        _table_schema: &TskvTableSchema,
-    ) -> Predicate {
-        if let Some(ref expr) = conjunction(filters.to_vec()) {
-            if let Ok(domains) = RowExpressionToDomainsVisitor::expr_to_column_domains(expr) {
-                self.pushed_down_domains = domains;
+        filter: Option<Expr>,
+        df_schema: &DFSchema,
+        arrow_schema: &Schema,
+        limit: Option<usize>,
+    ) -> crate::ModelResult<Predicate> {
+        match filter {
+            None => Ok(Predicate {
+                pushed_down_domains: ColumnDomains::all(),
+                physical_expr: None,
+                limit,
+            }),
+            Some(expr) => {
+                let mut push_down_domains = ColumnDomains::all();
+
+                if let Ok(domains) = RowExpressionToDomainsVisitor::expr_to_column_domains(&expr) {
+                    push_down_domains = domains;
+                }
+
+                let execution_props = ExecutionProps::new();
+                let expr = create_physical_expr(&expr, df_schema, arrow_schema, &execution_props)?;
+                Ok(Predicate {
+                    pushed_down_domains: push_down_domains,
+                    physical_expr: Some(expr),
+                    limit,
+                })
             }
         }
-        self
     }
 
-    pub fn resolve(&self, table: &TskvTableSchemaRef) -> Result<ResolvedPredicateRef, String> {
+    pub fn resolve(&self, table: &TskvTableSchemaRef) -> ModelResult<ResolvedPredicateRef> {
         let domains_filter = self
             .filter()
             .translate_column(|c| table.column(&c.name).cloned());
+
+        let time_filter = domains_filter.translate_column(|e| match e.column_type {
+            ColumnType::Time(_) => Some(e.name.clone()),
+            _ => None,
+        });
+
+        let time_ranges = filter_to_time_ranges(&time_filter);
 
         let tags_filter = domains_filter.translate_column(|e| match e.column_type {
             ColumnType::Tag => Some(e.name.clone()),
             _ => None,
         });
-
-        let fields_filter = domains_filter.translate_column(|e| match e.column_type {
-            ColumnType::Field(_) => Some(e.name.clone()),
-            _ => None,
-        });
-        let time_filter = domains_filter.translate_column(|e| match e.column_type {
-            ColumnType::Time(_) => Some(e.name.clone()),
-            _ => None,
-        });
-        let time_ranges = filter_to_time_ranges(&time_filter);
-
-        Ok(Arc::new(ResolvedPredicate::new(
+        let res = ResolvedPredicate::new(
             Arc::new(TimeRanges::new(time_ranges)),
             tags_filter,
-            fields_filter,
-        )))
+            self.physical_expr.clone(),
+        )?;
+
+        Ok(Arc::new(res))
     }
 }
 
@@ -1428,19 +1747,14 @@ pub struct QueryArgs {
 }
 
 impl QueryArgs {
-    pub fn encode(args: &QueryArgs) -> Result<Vec<u8>> {
-        let d = bincode::serialize(args).map_err(|err| Error::InvalidSerdeMessage {
-            err: err.to_string(),
-        })?;
+    pub fn encode(args: &QueryArgs) -> ModelResult<Vec<u8>> {
+        let d = bincode::serialize(args).context(InvalidSerdeMessageSnafu)?;
 
         Ok(d)
     }
 
-    pub fn decode(buf: &[u8]) -> Result<QueryArgs> {
-        let args =
-            bincode::deserialize::<QueryArgs>(buf).map_err(|err| Error::InvalidSerdeMessage {
-                err: err.to_string(),
-            })?;
+    pub fn decode(buf: &[u8]) -> ModelResult<QueryArgs> {
+        let args = bincode::deserialize::<QueryArgs>(buf).context(InvalidSerdeMessageSnafu)?;
 
         Ok(args)
     }
@@ -1450,39 +1764,28 @@ impl QueryArgs {
 pub struct QueryExpr {
     pub split: PlacedSplit,
     pub df_schema: Schema,
-    pub table_schema: TskvTableSchema,
+    pub table_schema: TskvTableSchemaRef,
 }
 
 impl QueryExpr {
-    pub fn encode(option: &QueryExpr) -> Result<Vec<u8>> {
-        let bytes = bincode::serialize(option).map_err(|e| Error::InvalidQueryExprMsg {
-            err: format!("encode error {}", e),
-        })?;
-
-        Ok(bytes)
+    pub fn encode(&self) -> ModelResult<Vec<u8>> {
+        bincode::serialize(self).context(InvalidQueryExprMsgSnafu)
     }
 
-    pub fn decode(buf: &[u8]) -> Result<QueryExpr> {
-        bincode::deserialize::<QueryExpr>(buf).map_err(|e| Error::InvalidQueryExprMsg {
-            err: format!("decode error {}", e),
-        })
+    pub fn decode(buf: &[u8]) -> ModelResult<QueryExpr> {
+        bincode::deserialize::<QueryExpr>(buf).context(InvalidQueryExprMsgSnafu)
     }
 }
 
-pub fn encode_agg(agg: &Option<Vec<TableColumn>>) -> Result<Vec<u8>> {
-    let d = bincode::serialize(agg).map_err(|err| Error::InvalidSerdeMessage {
-        err: err.to_string(),
-    })?;
+pub fn encode_agg(agg: &Option<Vec<TableColumn>>) -> ModelResult<Vec<u8>> {
+    let d = bincode::serialize(agg).context(InvalidSerdeMessageSnafu)?;
 
     Ok(d)
 }
 
-pub fn decode_agg(buf: &[u8]) -> Result<Option<Vec<TableColumn>>> {
-    let args = bincode::deserialize::<Option<Vec<TableColumn>>>(buf).map_err(|err| {
-        Error::InvalidSerdeMessage {
-            err: err.to_string(),
-        }
-    })?;
+pub fn decode_agg(buf: &[u8]) -> ModelResult<Option<Vec<TableColumn>>> {
+    let args =
+        bincode::deserialize::<Option<Vec<TableColumn>>>(buf).context(InvalidSerdeMessageSnafu)?;
 
     Ok(args)
 }
@@ -1494,6 +1797,10 @@ pub enum PushedAggregateFunction {
 
 #[cfg(test)]
 mod tests {
+    use datafusion::common::DFSchema;
+    use datafusion::prelude::lit;
+    use datafusion_proto::protobuf::PhysicalExprNode;
+
     use super::*;
 
     #[test]
@@ -1617,17 +1924,22 @@ mod tests {
     #[test]
     fn test_time_ranges() {
         let trs_all = TimeRanges::all();
-        assert_eq!(trs_all.time_ranges(), &[TimeRange::all()]);
+        assert_eq!(
+            trs_all.time_ranges().collect::<Vec<_>>(),
+            &[TimeRange::all()]
+        );
         assert_eq!(trs_all.min_ts(), i64::MIN);
         assert_eq!(trs_all.max_ts(), i64::MAX);
         assert!(trs_all.is_boundless());
 
-        let trs = TimeRanges::new(vec![
+        let trs_source = vec![
             TimeRange::new(2, 3),
             TimeRange::new(22, 33),
             TimeRange::new(222, 333),
-        ]);
-        assert_eq!(trs.time_ranges(), &trs.inner);
+        ];
+
+        let trs = TimeRanges::new(trs_source.clone());
+        assert_eq!(trs.time_ranges().collect::<Vec<_>>(), trs_source);
         assert_eq!(trs.min_ts(), 2);
         assert_eq!(trs.max_ts(), 333);
         assert!(!trs.is_boundless());
@@ -1696,6 +2008,44 @@ mod tests {
     }
 
     #[test]
+    fn test_time_range_exclude() {
+        let tr = TimeRange::new(1, 5);
+        let exclude = tr.exclude(&TimeRange::new(2, 6));
+        assert_eq!(exclude.0.unwrap(), TimeRange::new(1, 1));
+
+        let tr = TimeRange::new(5, 10);
+        let exclude = tr.exclude(&TimeRange::new(1, 7));
+        assert_eq!(exclude.1.unwrap(), TimeRange::new(8, 10));
+
+        let tr = TimeRange::new(3, 4);
+        let exclude = tr.exclude(&TimeRange::new(1, 5));
+        assert!(exclude.0.is_none());
+        assert!(exclude.1.is_none());
+
+        let tr = TimeRange::new(1, 5);
+        let exclude = tr.exclude(&TimeRange::new(3, 4));
+        assert_eq!(exclude.0.unwrap(), TimeRange::new(1, 2));
+        assert_eq!(exclude.1.unwrap(), TimeRange::new(5, 5));
+    }
+
+    #[test]
+    fn test_time_ranges_exclude() {
+        let trs = vec![
+            TimeRange::new(1, 2),
+            TimeRange::new(4, 5),
+            TimeRange::new(7, 9),
+        ];
+        let trs = TimeRanges::new(trs);
+        let exclude_ranges = trs.exclude(&TimeRange::new(3, 8));
+        let expected = TimeRanges::new(vec![(1, 2).into(), (9, 9).into()]);
+        assert_eq!(expected, exclude_ranges);
+
+        let exclude_ranges =
+            trs.exclude_time_ranges(&[&TimeRange::new(3, 4), &TimeRange::new(5, 8)]);
+        assert_eq!(expected, exclude_ranges);
+    }
+
+    #[test]
     fn test_of_ranges() {
         let f1 = Range::lt(&DataType::Float64, &ScalarValue::Float64(Some(-1000000.1)));
         let f2 = Range::gt(&DataType::Float64, &ScalarValue::Float64(Some(2.2)));
@@ -1703,9 +2053,11 @@ mod tests {
             &DataType::Float64,
             &ScalarValue::Float64(Some(3333333333333333.3)),
         );
+        let f4 = Range::ne(&DataType::Float64, &ScalarValue::Float64(Some(4.4)));
 
         let domain_1 = Domain::of_ranges(&[f1]).unwrap();
         let domain_2 = Domain::of_ranges(&[f2, f3]).unwrap();
+        let domain_3 = Domain::of_ranges(&f4).unwrap();
 
         assert!(matches!(domain_1, Domain::Range(_)));
 
@@ -1716,6 +2068,13 @@ mod tests {
             }
             _ => false,
         });
+
+        assert!(match domain_3 {
+            Domain::Range(val_set) => {
+                val_set.low_indexed_ranges.len() == 2
+            }
+            _ => false,
+        })
     }
 
     #[test]
@@ -1745,5 +2104,22 @@ mod tests {
                 panic!("excepted Domain::Equtable")
             }
         };
+    }
+
+    #[test]
+    fn test_serialize_physical_expr_node_wrap() {
+        let expr = create_physical_expr(
+            &lit(true),
+            &Arc::new(DFSchema::empty()),
+            &Arc::new(Schema::empty()),
+            &ExecutionProps::new(),
+        )
+        .unwrap();
+        let expr = PhysicalExprNode::try_from(expr.clone()).unwrap();
+        let wrap = PhysicalExprNodeWrap(expr);
+        let data = bincode::serialize(&wrap).unwrap();
+        let wrap1 = bincode::deserialize::<PhysicalExprNodeWrap>(&data).unwrap();
+
+        assert_eq!(wrap.0.expr_type, wrap1.0.expr_type);
     }
 }

@@ -1,29 +1,30 @@
 name: Prepare Rust Builder
 description: 'Prepare Rust Build Environment'
-inputs:
-  rust-version:
-    description: 'version of rust to install (e.g. stable)'
-    required: true
-    default: 'stable'
 runs:
   using: "composite"
   steps:
+    - name: clean pkg
+      shell: bash
+      run: |
+        bash ./.github/tools/free_disk_space.sh
     - name: Install Build Dependencies
       shell: bash
       run: |
-        curl -o flatbuffers.zip -sL https://github.com/google/flatbuffers/releases/download/v22.9.29/Linux.flatc.binary.clang++-12.zip
-        unzip  flatbuffers.zip
-        mv flatc /usr/local/bin
-    - name: Setup Rust toolchain
+        TARGETPLATFORM="linux/amd64" bash ./.github/tools/install_dependencies.sh
+    - name: Disable incremental compilation
+      # Disable incremental compilation
       shell: bash
-      run: |
-        echo "Installing ${{ inputs.rust-version }}"
-        source "$HOME/.cargo/env"
-        rustup toolchain install ${{ inputs.rust-version }}
-        rustup default ${{ inputs.rust-version }}
-    - name: Install Protoc
+      run: echo "CARGO_INCREMENTAL=0" >> $GITHUB_ENV
+
+    - name: Run sccache-cache
+      uses: mozilla-actions/sccache-action@v0.0.3
+
+    - uses: rui314/setup-mold@v1
+
+    - name: Fixup git permissions
+      # https://github.com/actions/checkout/issues/766
       shell: bash
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y protobuf-compiler
-        protoc --version
+      run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+    - name: Enable backtraces
+      shell: bash
+      run: echo "RUST_BACKTRACE=1" >> $GITHUB_ENV

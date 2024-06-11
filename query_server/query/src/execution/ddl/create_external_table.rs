@@ -3,7 +3,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
-use datafusion::common::TableReference;
 use datafusion::datasource::file_format::avro::AvroFormat;
 use datafusion::datasource::file_format::csv::CsvFormat;
 use datafusion::datasource::file_format::file_type::{FileCompressionType, FileType};
@@ -18,7 +17,7 @@ use meta::error::MetaError;
 use models::schema::{ExternalTableSchema, TableSchema};
 use snafu::ResultExt;
 use spi::query::execution::{Output, QueryStateMachineRef};
-use spi::{DatafusionSnafu, Result};
+use spi::{DatafusionSnafu, MetaSnafu, QueryError, QueryResult};
 
 use super::DDLDefinitionTask;
 
@@ -35,29 +34,31 @@ impl CreateExternalTableTask {
 
 #[async_trait]
 impl DDLDefinitionTask for CreateExternalTableTask {
-    async fn execute(&self, query_state_machine: QueryStateMachineRef) -> Result<Output> {
+    async fn execute(&self, query_state_machine: QueryStateMachineRef) -> QueryResult<Output> {
         let CreateExternalTable {
             ref name,
             ref if_not_exists,
             ..
         } = self.stmt;
-        let unresolved_name = name.to_string();
-        let table_name = TableReference::parse_str(&unresolved_name).resolve(
-            query_state_machine.session.tenant(),
-            query_state_machine.session.default_database(),
-        );
+        let table = name.table();
+        let database = name.schema().ok_or_else(|| QueryError::Internal {
+            reason: "couldn't resolve database".to_string(),
+        })?;
+        let tenant = name.catalog().ok_or_else(|| QueryError::Internal {
+            reason: "couldn't resolve tenant".to_string(),
+        })?;
         let client = query_state_machine
             .meta
-            .tenant_manager()
-            .tenant_meta(&table_name.catalog)
+            .tenant_meta(tenant)
             .await
-            .ok_or(MetaError::TenantNotFound {
-                tenant: table_name.catalog.to_string(),
-            })?;
-        // .context(spi::MetaSnafu)?;
+            .ok_or_else(|| MetaError::TenantNotFound {
+                tenant: tenant.to_string(),
+            })
+            .context(MetaSnafu)?;
 
-        let table = client.get_external_table_schema(&table_name.schema, &table_name.table)?;
-        // .context(spi::MetaSnafu)?;
+        let table = client
+            .get_external_table_schema(database, table)
+            .context(MetaSnafu)?;
 
         match (if_not_exists, table) {
             // do not create if exists
@@ -65,11 +66,11 @@ impl DDLDefinitionTask for CreateExternalTableTask {
             // Report an error if it exists
             (false, Some(_)) => Err(MetaError::TableAlreadyExists {
                 table_name: name.to_string(),
-            })?,
-            // .context(spi::MetaSnafu),
+            })
+            .context(MetaSnafu)?,
             // does not exist, create
             (_, None) => {
-                create_exernal_table(&self.stmt, query_state_machine).await?;
+                create_external_table(&self.stmt, query_state_machine).await?;
                 Ok(Output::Nil(()))
             }
         }
@@ -77,51 +78,46 @@ impl DDLDefinitionTask for CreateExternalTableTask {
 }
 
 #[allow(dead_code)]
-async fn create_exernal_table(
+async fn create_external_table(
     stmt: &CreateExternalTable,
     query_state_machine: QueryStateMachineRef,
-) -> Result<()> {
-    let state = query_state_machine.session.inner().state();
+) -> QueryResult<()> {
+    let schema = build_table_schema(stmt, query_state_machine.session.inner()).await?;
 
-    let schema = build_table_schema(
-        stmt,
-        query_state_machine.session.tenant().to_string(),
-        query_state_machine.session.default_database().to_string(),
-        &state,
-    )
-    .await?;
-
-    let tenant = query_state_machine.session.tenant();
     let client = query_state_machine
         .meta
-        .tenant_manager()
-        .tenant_meta(tenant)
+        .tenant_meta(schema.tenant.as_str())
         .await
-        .ok_or(MetaError::TenantNotFound {
-            tenant: tenant.to_string(),
-        })?;
-    // .context(MetaSnafu)?;
+        .ok_or_else(|| MetaError::TenantNotFound {
+            tenant: schema.tenant.clone(),
+        })
+        .context(MetaSnafu)?;
 
-    Ok(client
+    client
         .create_table(&TableSchema::ExternalTableSchema(Arc::new(schema)))
-        .await?)
-    // .context(MetaSnafu)
+        .await
+        .context(MetaSnafu)
 }
 
 async fn build_table_schema(
     stmt: &CreateExternalTable,
-    tenant: String,
-    db: String,
     state: &SessionState,
-) -> Result<ExternalTableSchema> {
+) -> QueryResult<ExternalTableSchema> {
+    let db = stmt.name.schema().ok_or_else(|| QueryError::Internal {
+        reason: "couldn't resolve database".to_string(),
+    })?;
+    let tenant = stmt.name.catalog().ok_or_else(|| QueryError::Internal {
+        reason: "couldn't resolve tenant".to_string(),
+    })?;
+
     let options = build_external_table_config(stmt, state.config().target_partitions())?;
 
     let schema = construct_listing_table_schema(stmt, state, &options).await?;
 
     let schema = ExternalTableSchema {
-        tenant,
-        db,
-        name: stmt.name.to_string(),
+        tenant: tenant.to_string(),
+        db: db.to_string(),
+        name: stmt.name.table().to_string(),
         location: stmt.location.clone(),
         file_type: stmt.file_type.clone(),
         file_compression_type: stmt.file_compression_type.to_string(),
@@ -138,7 +134,7 @@ async fn construct_listing_table_schema(
     stmt: &CreateExternalTable,
     state: &SessionState,
     options: &ListingOptions,
-) -> Result<SchemaRef> {
+) -> QueryResult<SchemaRef> {
     let CreateExternalTable {
         ref schema,
         ref location,
@@ -165,7 +161,7 @@ async fn construct_listing_table_schema(
 fn build_external_table_config(
     stmt: &CreateExternalTable,
     target_partitions: usize,
-) -> Result<ListingOptions> {
+) -> QueryResult<ListingOptions> {
     let file_compression_type = FileCompressionType::from(stmt.file_compression_type);
     let file_type = FileType::from_str(stmt.file_type.as_str())?;
     let file_extension = file_type.get_ext_with_compression(file_compression_type.to_owned())?;
@@ -177,9 +173,14 @@ fn build_external_table_config(
                 .with_file_compression_type(file_compression_type),
         ),
         FileType::PARQUET => Arc::new(ParquetFormat::default()),
-        FileType::AVRO => Arc::new(AvroFormat::default()),
+        FileType::AVRO => Arc::new(AvroFormat),
         FileType::JSON => {
             Arc::new(JsonFormat::default().with_file_compression_type(file_compression_type))
+        }
+        FileType::ARROW => {
+            return Err(QueryError::NotImplemented {
+                err: "Build arrow external table config".to_string(),
+            })
         }
     };
 

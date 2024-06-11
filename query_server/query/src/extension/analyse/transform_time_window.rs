@@ -3,11 +3,15 @@ use std::time::Duration;
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use datafusion::common::scalar::{dt_to_nano, mdn_to_nano, ym_to_nano};
 use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::DFSchemaRef;
 use datafusion::config::ConfigOptions;
 use datafusion::error::{DataFusionError, Result};
+use datafusion::execution::context::ExecutionProps;
 use datafusion::logical_expr::utils::expand_wildcard;
-use datafusion::logical_expr::{GetIndexedField, LogicalPlan, LogicalPlanBuilder};
+use datafusion::logical_expr::{expr, GetIndexedField, LogicalPlan, LogicalPlanBuilder};
 use datafusion::optimizer::analyzer::AnalyzerRule;
+use datafusion::optimizer::simplify_expressions::{ExprSimplifier, SimplifyContext};
+use datafusion::optimizer::{OptimizerConfig, OptimizerContext};
 use datafusion::prelude::{and, cast, col, lit, Expr};
 use datafusion::scalar::ScalarValue;
 use models::duration::DAY;
@@ -38,8 +42,8 @@ impl AnalyzerRule for TransformTimeWindowRule {
 fn analyze_internal(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
     if plan.inputs().len() == 1 {
         let child = plan.inputs()[0];
-        let child_project_exprs = expand_wildcard(child.schema().as_ref(), child)?;
-        let window_expressions = find_window_exprs(&plan);
+        let child_project_exprs = expand_wildcard(child.schema().as_ref(), child, None)?;
+        let mut window_expressions = find_window_exprs(&plan);
 
         // Only support a single window expression for now
         if window_expressions.len() > 1 {
@@ -47,8 +51,8 @@ fn analyze_internal(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
         }
 
         if window_expressions.len() == 1 {
-            let window_expr = unsafe { window_expressions.get_unchecked(0) };
-            let window = make_time_window(window_expr)
+            let window_expr = window_expressions.remove(0);
+            let window = make_time_window(window_expr, plan.schema().clone())
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
             debug!("Construct time window: {:?}", window);
@@ -61,10 +65,24 @@ fn analyze_internal(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
                 build_sliding_window_plan(&window, child.clone(), child_project_exprs)?
             };
 
-            // replace current plan's exprs and child
-            let final_plan =
-                replace_window_expr(col(WINDOW_COL_NAME).alias(&window.window_alias), &plan)?
-                    .with_new_inputs(&[window_plan])?;
+            debug!("Origin plan: {}", plan.display_indent_schema());
+            debug!("Window_plan: {}", window_plan.display_indent_schema());
+
+            // replace current plan's child
+            let wait_replaced_plan = plan.with_new_inputs(&[window_plan])?;
+
+            debug!(
+                "Wait_replaced_plan: {}",
+                wait_replaced_plan.display_indent_schema()
+            );
+
+            // replace new plan's exprs
+            let final_plan = replace_window_expr(
+                col(WINDOW_COL_NAME).alias(&window.window_alias),
+                &wait_replaced_plan,
+            )?;
+
+            debug!("Final plan: {}", final_plan.display_indent_schema());
 
             return Ok(Transformed::Yes(final_plan));
         }
@@ -76,18 +94,18 @@ fn analyze_internal(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
 fn find_window_exprs(plan: &LogicalPlan) -> Vec<Expr> {
     let exprs = plan.expressions();
     find_exprs_in_exprs_deeply_nested(&exprs, &|nested_expr| {
-        matches!(nested_expr, Expr::ScalarUDF {
+        matches!(nested_expr, Expr::ScalarUDF(expr::ScalarUDF {
             fun,
             ..
-        } if fun.name == TIME_WINDOW)
+        }) if fun.name == TIME_WINDOW)
     })
 }
 
-fn make_time_window(expr: &Expr) -> Result<TimeWindow, QueryError> {
+fn make_time_window(expr: Expr, schema: DFSchemaRef) -> Result<TimeWindow, QueryError> {
     let window_alias = expr.display_name()?;
     match expr {
-        Expr::ScalarUDF { fun, args } if fun.name == TIME_WINDOW => {
-            let mut args = args.iter();
+        Expr::ScalarUDF(expr::ScalarUDF { fun, args }) if fun.name == TIME_WINDOW => {
+            let mut args = args.into_iter();
 
             // first arg: time_column
             let time_column = args.next().ok_or_else(|| QueryError::Internal {
@@ -97,19 +115,21 @@ fn make_time_window(expr: &Expr) -> Result<TimeWindow, QueryError> {
             let window_duration = args.next().ok_or_else(|| QueryError::Internal {
                 reason: format!("Invalid signature of {TIME_WINDOW}"),
             })?;
-            let window_duration = valid_duration(parse_duration_arg(window_duration)?)?;
+            let window_duration = simplify_expr(window_duration, schema.clone())?;
+            let window_duration = valid_duration(parse_duration_arg(&window_duration)?)?;
 
             let mut time_window_builder =
-                TimeWindowBuilder::new(window_alias, time_column.clone(), window_duration);
+                TimeWindowBuilder::new(window_alias, time_column, window_duration);
 
             // time_window(time, interval '10 seconds', interval '5 milliseconds')
             // third arg: slide_duration
             if let Some(slide_duration) = args.next() {
-                let slide_duration = valid_duration(parse_duration_arg(slide_duration)?)?;
+                let slide_duration = simplify_expr(slide_duration, schema)?;
+                let slide_duration = valid_duration(parse_duration_arg(&slide_duration)?)?;
                 time_window_builder.with_slide_duration(slide_duration);
 
                 args.next()
-                    .map(|start_time| time_window_builder.with_start_time(start_time.clone()));
+                    .map(|start_time| time_window_builder.with_start_time(start_time));
             }
 
             Ok(time_window_builder.build())
@@ -375,16 +395,25 @@ fn build_sliding_window_plan(
 /// Replace udf [`TIME_WINDOW`] with the specified expression
 fn replace_window_expr(new_expr: Expr, plan: &LogicalPlan) -> Result<LogicalPlan> {
     plan.transform_expressions_down(&|expr: &Expr| {
-        if matches!(expr, Expr::ScalarUDF {
+        if matches!(expr, Expr::ScalarUDF(expr::ScalarUDF {
             fun,
             ..
-        } if fun.name == TIME_WINDOW)
+        }) if fun.name == TIME_WINDOW)
         {
             Some(new_expr.clone())
         } else {
             None
         }
     })
+}
+
+fn simplify_expr(expr: Expr, schema: DFSchemaRef) -> Result<Expr> {
+    let mut execution_props = ExecutionProps::new();
+    let ctx = OptimizerContext::new();
+    execution_props.query_execution_start_time = ctx.query_execution_start_time();
+    let info = SimplifyContext::new(&execution_props).with_schema(schema);
+    let simplifier = ExprSimplifier::new(info);
+    simplifier.simplify(expr)
 }
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-#![feature(type_name_of_val)]
+#![recursion_limit = "256"]
 extern crate core;
 
 pub mod auth;
@@ -13,3 +13,4 @@ pub mod prom;
 pub mod sql;
 pub mod stream;
 mod utils;
+pub mod variable;

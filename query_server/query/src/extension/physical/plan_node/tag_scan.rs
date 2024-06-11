@@ -21,9 +21,11 @@ use futures::{Stream, StreamExt};
 use models::predicate::domain::PredicateRef;
 use models::predicate::PlacedSplit;
 use models::schema::{TskvTableSchema, TskvTableSchemaRef};
-use spi::QueryError;
-use trace::{debug, SpanContext, SpanExt, SpanRecorder};
-use tskv::query_iterator::QueryOption;
+use snafu::ResultExt;
+use spi::{CommonSnafu, CoordinatorSnafu, QueryError};
+use trace::span_ext::SpanExt;
+use trace::{debug, Span, SpanContext};
+use tskv::reader::QueryOption;
 
 use crate::extension::physical::plan_node::TableScanMetrics;
 
@@ -131,7 +133,7 @@ impl ExecutionPlan for TagScanExec {
             split,
             batch_size,
             metrics,
-            SpanRecorder::new(span_ctx.child_span(format!("TagScanStream ({partition})"))),
+            Span::from_context(format!("TagScanStream ({partition})"), span_ctx.as_deref()),
         )
         .map_err(|err| DataFusionError::External(Box::new(err)))?;
 
@@ -140,7 +142,7 @@ impl ExecutionPlan for TagScanExec {
 
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
-            DisplayFormatType::Default => {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 let filter = self.predicate();
                 let fields: Vec<_> = self
                     .proj_schema
@@ -222,7 +224,7 @@ pub struct TagScanStream {
 
     metrics: TableScanMetrics,
     #[allow(unused)]
-    span_recorder: SpanRecorder,
+    span: Span,
 }
 
 impl TagScanStream {
@@ -233,19 +235,20 @@ impl TagScanStream {
         split: PlacedSplit,
         batch_size: usize,
         metrics: TableScanMetrics,
-        span_recorder: SpanRecorder,
+        span: Span,
     ) -> Result<Self, QueryError> {
         let mut proj_fileds = Vec::with_capacity(proj_schema.fields().len());
         for field_name in proj_schema.fields().iter().map(|f| f.name()) {
             if let Some(v) = table_schema.column(field_name) {
                 proj_fileds.push(v.clone());
             } else {
-                return Err(QueryError::CommonError {
+                return Err(CommonSnafu {
                     msg: format!(
                         "tag scan stream build fail, because can't found field: {}",
                         field_name
                     ),
-                });
+                }
+                .build());
             }
         }
         let proj_table_schema = TskvTableSchema::new(
@@ -260,11 +263,13 @@ impl TagScanStream {
             split,
             None,
             proj_schema.clone(),
-            proj_table_schema,
+            proj_table_schema.into(),
         );
 
-        let span_ctx = span_recorder.span_ctx();
-        let stream = coord.tag_scan(option, span_ctx)?;
+        let span_ctx = span.context();
+        let stream = coord
+            .tag_scan(option, span_ctx.as_ref())
+            .context(CoordinatorSnafu)?;
 
         Ok(Self {
             proj_schema,
@@ -272,7 +277,7 @@ impl TagScanStream {
             coord,
             stream,
             metrics,
-            span_recorder,
+            span,
         })
     }
 }

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::Deref;
 use std::pin::Pin;
@@ -5,32 +6,45 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use async_trait::async_trait;
+use coordinator::service::CoordinatorRef;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::Result as DFResult;
 use datafusion::physical_plan::{RecordBatchStream, SendableRecordBatchStream};
 use futures::{Stream, StreamExt};
+use models::schema::{Precision, CLUSTER_SCHEMA, DEFAULT_CATALOG};
+use models::utils::now_timestamp_nanos;
 use parking_lot::RwLock;
+use protocol_parser::Line;
+use protos::FieldValue;
 use spi::query::dispatcher::{QueryInfo, QueryStatus};
 use spi::query::execution::{Output, QueryExecution, QueryExecutionRef, QueryType};
 use spi::service::protocol::QueryId;
-use spi::{QueryError, Result};
+use spi::{QueryError, QueryResult};
 use trace::{debug, warn};
 
 use super::persister::QueryPersisterRef;
+
+const SQL_HISTORY: &str = "sql_history";
 
 pub struct QueryTracker {
     queries: RwLock<HashMap<QueryId, Arc<dyn QueryExecution>>>,
     query_limit: usize,
     query_persister: QueryPersisterRef,
+    coord: CoordinatorRef,
 }
 
 impl QueryTracker {
-    pub fn new(query_limit: usize, query_persister: QueryPersisterRef) -> Self {
+    pub fn new(
+        query_limit: usize,
+        query_persister: QueryPersisterRef,
+        coord: CoordinatorRef,
+    ) -> Self {
         Self {
             queries: RwLock::new(HashMap::new()),
             query_limit,
             query_persister,
+            coord,
         }
     }
 }
@@ -46,13 +60,19 @@ impl QueryTracker {
         self: &Arc<Self>,
         query_id: QueryId,
         query: Arc<dyn QueryExecution>,
-    ) -> Result<TrackedQuery> {
+    ) -> QueryResult<TrackedQuery> {
         debug!(
-            "total query count: {}, current query info {:?} status {:?}",
+            "total query count: {}, status {:?}",
             self.queries.read().len(),
-            query.info(),
             query.status(),
         );
+
+        // debug!(
+        //     "total query count: {}, current query info {:?} status {:?}",
+        //     self.queries.read().len(),
+        //     query.info(),
+        //     query.status(),
+        // );
 
         self.save_query(query_id, query.clone()).await?;
 
@@ -86,7 +106,7 @@ impl QueryTracker {
     }
 
     /// all persistent queries
-    pub async fn persistent_queries(&self) -> Result<Vec<QueryInfo>> {
+    pub async fn persistent_queries(&self) -> QueryResult<Vec<QueryInfo>> {
         self.query_persister.queries().await
     }
 
@@ -98,17 +118,104 @@ impl QueryTracker {
     }
 
     pub fn expire_query(&self, id: &QueryId) -> Option<Arc<dyn QueryExecution>> {
-        self.queries.write().remove(id).map(|q| {
-            if q.need_persist() {
+        self.queries.write().remove(id).map(|query| {
+            if query.need_persist() {
                 let _ = self.query_persister.remove(id).map_err(|err| {
                     warn!("Remove query from persister failed: {:?}", err);
                 });
             }
-            q
+            if *query.status().duration() >= self.coord.get_config().query.sql_record_timeout {
+                let info = query.info();
+                let status = query.status();
+
+                let query_text = info.query();
+                let user_id = info.user_id().to_string();
+                let user_name = info.user_name();
+                let tenant_id = info.tenant_id().to_string();
+                let tenant_name = info.tenant_name();
+
+                let state = status.query_state();
+                let duration = status.duration().as_secs_f64();
+                let processed_count = status.processed_count();
+                let error_count = status.error_count();
+                let line = Line {
+                    hash_id: 0,
+                    table: Cow::Owned(SQL_HISTORY.to_string()),
+                    tags: vec![
+                        (
+                            Cow::Owned("user_id".to_string()),
+                            Cow::Owned(user_id.to_string()),
+                        ),
+                        (
+                            Cow::Owned("user_name".to_string()),
+                            Cow::Owned(user_name.to_string()),
+                        ),
+                        (
+                            Cow::Owned("tenant_id".to_string()),
+                            Cow::Owned(tenant_id.to_string()),
+                        ),
+                        (
+                            Cow::Owned("tenant_name".to_string()),
+                            Cow::Owned(tenant_name.to_string()),
+                        ),
+                    ],
+                    fields: vec![
+                        (
+                            Cow::Owned("query_id".to_string()),
+                            FieldValue::Str(id.to_string().as_bytes().to_owned()),
+                        ),
+                        (
+                            Cow::Owned("query_type".to_string()),
+                            FieldValue::Str(query.query_type().to_string().as_bytes().to_owned()),
+                        ),
+                        (
+                            Cow::Owned("query_text".to_string()),
+                            FieldValue::Str(query_text.as_bytes().to_owned()),
+                        ),
+                        (
+                            Cow::Owned("state".to_string()),
+                            FieldValue::Str(state.as_ref().as_bytes().to_owned()),
+                        ),
+                        (
+                            Cow::Owned("duration".to_string()),
+                            FieldValue::F64(duration),
+                        ),
+                        (
+                            Cow::Owned("processed_count".to_string()),
+                            FieldValue::U64(processed_count),
+                        ),
+                        (
+                            Cow::Owned("error_count".to_string()),
+                            FieldValue::U64(error_count),
+                        ),
+                    ],
+                    timestamp: now_timestamp_nanos(),
+                };
+                let coord = self.coord.clone();
+                tokio::spawn(async move {
+                    let _ = coord
+                        .write_lines(
+                            DEFAULT_CATALOG,
+                            CLUSTER_SCHEMA,
+                            Precision::NS,
+                            vec![line],
+                            None,
+                        )
+                        .await
+                        .map_err(|err| {
+                            warn!("write_lines failed: {:?}", err);
+                        });
+                });
+            }
+            query
         })
     }
 
-    async fn save_query(&self, query_id: QueryId, query: Arc<dyn QueryExecution>) -> Result<()> {
+    async fn save_query(
+        &self,
+        query_id: QueryId,
+        query: Arc<dyn QueryExecution>,
+    ) -> QueryResult<()> {
         if self.queries.read().len() >= self.query_limit {
             warn!("simultaneous request limit exceeded - dropping request");
             return Err(QueryError::RequestLimit);
@@ -160,7 +267,7 @@ impl QueryExecution for QueryExecutionTrackedProxy {
         self.inner.query_type()
     }
 
-    async fn start(&self) -> Result<Output> {
+    async fn start(&self) -> QueryResult<Output> {
         match self.inner.start().await {
             Ok(Output::StreamData(stream)) => {
                 debug!("Track RecordBatchStream: {:?}", self.query_id);
@@ -187,7 +294,7 @@ impl QueryExecution for QueryExecutionTrackedProxy {
         }
     }
 
-    fn cancel(&self) -> Result<()> {
+    fn cancel(&self) -> QueryResult<()> {
         self.inner.cancel()
     }
 
@@ -233,13 +340,15 @@ impl Drop for TrackedRecordBatchStream {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::sync::Arc;
     use std::time::Duration;
 
     use async_trait::async_trait;
+    use coordinator::service_mock::MockCoordinator;
     use datafusion::arrow::datatypes::Schema;
     use datafusion::physical_plan::EmptyRecordBatchStream;
-    use models::auth::user::{UserDesc, UserOptions};
+    use models::auth::user::{User, UserDesc, UserOptions};
     use spi::query::dispatcher::{QueryInfo, QueryStatus};
     use spi::query::execution::{Output, QueryExecution, QueryState, RUNNING};
     use spi::service::protocol::QueryId;
@@ -263,12 +372,14 @@ mod tests {
         fn info(&self) -> QueryInfo {
             let options = UserOptions::default();
             let desc = UserDesc::new(0_u128, "user".to_string(), options, true);
+            let user = User::new(desc, HashSet::new(), None);
             QueryInfo::new(
                 1_u64.into(),
                 "test".to_string(),
                 0_u128,
                 "tenant".to_string(),
-                desc,
+                "db".to_string(),
+                user,
             )
         }
         fn status(&self) -> QueryStatus {
@@ -283,6 +394,7 @@ mod tests {
         QueryTracker::new(
             limit,
             Arc::new(LocalQueryPersister::try_new("/tmp/cnosdb/query").unwrap()),
+            Arc::new(MockCoordinator {}),
         )
     }
 

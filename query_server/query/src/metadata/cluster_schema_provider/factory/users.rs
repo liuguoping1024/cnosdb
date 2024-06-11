@@ -12,20 +12,17 @@ use datafusion::physical_plan::memory::MemoryExec;
 use datafusion::physical_plan::ExecutionPlan;
 use meta::model::MetaRef;
 use models::auth::user::User;
-use models::oid::Identifier;
 
 use crate::metadata::cluster_schema_provider::builder::users::{
     ClusterSchemaUsersBuilder, USER_SCHEMA,
 };
-use crate::metadata::cluster_schema_provider::ClusterSchemaTableFactory;
-
-const INFORMATION_SCHEMA_USERS: &str = "USERS";
+use crate::metadata::cluster_schema_provider::{ClusterSchemaTableFactory, CLUSTER_SCHEMA_USERS};
 
 pub struct ClusterSchemaUsersFactory {}
 
 impl ClusterSchemaTableFactory for ClusterSchemaUsersFactory {
     fn table_name(&self) -> &str {
-        INFORMATION_SCHEMA_USERS
+        CLUSTER_SCHEMA_USERS
     }
 
     fn create(&self, user: &User, metadata: MetaRef) -> Arc<dyn TableProvider> {
@@ -71,7 +68,7 @@ impl TableProvider for ClusterSchemaUsersTable {
         // Only visible to admin
         if self.user.desc().is_admin() {
             let users =
-                self.metadata.user_manager().users().await.map_err(|e| {
+                self.metadata.users().await.map_err(|e| {
                     DataFusionError::Internal(format!("Failed to get users: {:?}", e))
                 })?;
             for user in users {

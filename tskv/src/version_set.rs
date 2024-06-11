@@ -7,41 +7,52 @@ use metrics::metric_register::MetricsRegister;
 use models::schema::{make_owner, split_owner, DatabaseSchema};
 use snafu::ResultExt;
 use tokio::runtime::Runtime;
-use tokio::sync::mpsc::Sender;
 use tokio::sync::RwLock;
-use utils::BloomFilter;
 
-use crate::compaction::{CompactTask, FlushReq};
-use crate::context::GlobalSequenceContext;
-use crate::database::Database;
-use crate::error::{MetaSnafu, Result};
-use crate::summary::VersionEdit;
+use crate::database::{Database, DatabaseFactory};
+use crate::error::{MetaSnafu, TskvResult};
+use crate::index::ts_index::TSIndex;
+use crate::summary::SummaryRequest;
 use crate::tseries_family::{TseriesFamily, Version};
-use crate::{ColumnFileId, Options, TseriesFamilyId};
+use crate::{Options, TseriesFamilyId};
 
 #[derive(Debug)]
 pub struct VersionSet {
-    opt: Arc<Options>,
     /// Maps DBName -> DB
     dbs: HashMap<String, Arc<RwLock<Database>>>,
-    runtime: Arc<Runtime>,
-    memory_pool: MemoryPoolRef,
-    metrics_register: Arc<MetricsRegister>,
+    _runtime: Arc<Runtime>,
+    db_factory: DatabaseFactory,
 }
 
 impl VersionSet {
     pub fn empty(
+        meta: MetaRef,
         opt: Arc<Options>,
         runtime: Arc<Runtime>,
         memory_pool: MemoryPoolRef,
         metrics_register: Arc<MetricsRegister>,
     ) -> Self {
+        let db_factory = DatabaseFactory::new(meta, memory_pool.clone(), metrics_register, opt);
+
         Self {
-            opt,
             dbs: HashMap::new(),
-            runtime,
-            memory_pool,
-            metrics_register,
+            _runtime: runtime,
+            db_factory,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn build_empty_test(runtime: Arc<Runtime>) -> Self {
+        use meta::model::meta_admin::AdminMeta;
+        let opt = Arc::new(Options::from(&config::tskv::Config::default()));
+        let register = Arc::new(MetricsRegister::default());
+        let memory_pool = Arc::new(memory_pool::GreedyMemoryPool::default());
+        let meta = Arc::new(AdminMeta::mock());
+        let db_factory = DatabaseFactory::new(meta, memory_pool, register, opt);
+        Self {
+            dbs: HashMap::new(),
+            _runtime: runtime,
+            db_factory,
         }
     }
 
@@ -52,16 +63,16 @@ impl VersionSet {
         runtime: Arc<Runtime>,
         memory_pool: MemoryPoolRef,
         ver_set: HashMap<TseriesFamilyId, Arc<Version>>,
-        flush_task_sender: Sender<FlushReq>,
-        compact_task_sender: Sender<CompactTask>,
         metrics_register: Arc<MetricsRegister>,
-    ) -> Result<Self> {
+    ) -> TskvResult<Self> {
         let mut dbs = HashMap::new();
+        let db_factory = DatabaseFactory::new(meta.clone(), memory_pool, metrics_register, opt);
+
         for ver in ver_set.into_values() {
-            let owner = ver.database().to_string();
+            let owner = ver.tenant_database().to_string();
             let (tenant, database) = split_owner(&owner);
 
-            let schema = match meta.tenant_manager().tenant_meta(tenant).await {
+            let schema = match meta.tenant_meta(tenant).await {
                 None => DatabaseSchema::new(tenant, database),
                 Some(client) => match client.get_db_schema(database).context(MetaSnafu)? {
                     None => DatabaseSchema::new(tenant, database),
@@ -70,62 +81,27 @@ impl VersionSet {
             };
 
             let db: &mut Arc<RwLock<Database>> = dbs.entry(owner).or_insert(Arc::new(RwLock::new(
-                Database::new(
-                    schema,
-                    opt.clone(),
-                    runtime.clone(),
-                    meta.clone(),
-                    memory_pool.clone(),
-                    metrics_register.clone(),
-                )
-                .await?,
+                db_factory.create_database(schema).await?,
             )));
 
             let tf_id = ver.tf_id();
-            db.write().await.open_tsfamily(
-                ver,
-                flush_task_sender.clone(),
-                compact_task_sender.clone(),
-            );
+            db.write().await.open_tsfamily(ver);
             db.write().await.get_ts_index_or_add(tf_id).await?;
         }
 
         Ok(Self {
             dbs,
-            opt,
-            runtime,
-            memory_pool,
-            metrics_register,
+            _runtime: runtime,
+            db_factory,
         })
     }
 
-    pub fn options(&self) -> Arc<Options> {
-        self.opt.clone()
-    }
-
-    pub async fn create_db(
-        &mut self,
-        schema: DatabaseSchema,
-        meta: MetaRef,
-        memory_pool: MemoryPoolRef,
-    ) -> Result<Arc<RwLock<Database>>> {
-        let sub_register = self.metrics_register.sub_register([
-            ("tenant", schema.tenant_name()),
-            ("database", schema.database_name()),
-        ]);
+    pub async fn create_db(&mut self, schema: DatabaseSchema) -> TskvResult<Arc<RwLock<Database>>> {
         let db = self
             .dbs
             .entry(schema.owner())
             .or_insert(Arc::new(RwLock::new(
-                Database::new(
-                    schema,
-                    self.opt.clone(),
-                    self.runtime.clone(),
-                    meta.clone(),
-                    memory_pool,
-                    sub_register,
-                )
-                .await?,
+                self.db_factory.create_database(schema).await?,
             )))
             .clone();
         Ok(db)
@@ -139,19 +115,6 @@ impl VersionSet {
     pub fn db_exists(&self, tenant: &str, database: &str) -> bool {
         let owner = make_owner(tenant, database);
         self.dbs.get(&owner).is_some()
-    }
-
-    pub async fn get_db_schema(
-        &self,
-        tenant: &str,
-        database: &str,
-    ) -> Result<Option<DatabaseSchema>> {
-        let owner = make_owner(tenant, database);
-        let db = self.dbs.get(&owner);
-        match db {
-            None => Ok(None),
-            Some(db) => Ok(Some(db.read().await.get_schema()?)),
-        }
     }
 
     pub fn get_all_db(&self) -> &HashMap<String, Arc<RwLock<Database>>> {
@@ -168,6 +131,7 @@ impl VersionSet {
     }
 
     pub async fn get_tsfamily_by_tf_id(&self, tf_id: u32) -> Option<Arc<RwLock<TseriesFamily>>> {
+        // FIXME: add tsf_id -> db HashTable
         for db in self.dbs.values() {
             if let Some(v) = db.read().await.get_tsfamily(tf_id) {
                 return Some(v);
@@ -175,6 +139,29 @@ impl VersionSet {
         }
 
         None
+    }
+
+    pub async fn get_tsfamily_tsindex_by_tf_id(
+        &self,
+        tf_id: u32,
+    ) -> (
+        Option<Arc<RwLock<TseriesFamily>>>,
+        Option<Arc<RwLock<TSIndex>>>,
+    ) {
+        let mut vnode = None;
+        let mut vnode_index = None;
+        for db in self.dbs.values() {
+            let db = db.read().await;
+            if let Some(v) = db.get_tsfamily(tf_id) {
+                vnode = Some(v);
+                if let Some(v) = db.get_ts_index(tf_id) {
+                    vnode_index = Some(v);
+                }
+                break;
+            }
+        }
+
+        (vnode, vnode_index)
     }
 
     pub async fn get_tsfamily_by_name_id(
@@ -191,50 +178,43 @@ impl VersionSet {
         None
     }
 
-    /// Snashots last version before `last_seq` of system state.
-    ///
     /// Generated data is `VersionEdit`s for all vnodes and db-files,
     /// and `HashMap<ColumnFileId, Arc<BloomFilter>>` for index data
     /// (field-id filter) of db-files.
-    pub async fn snapshot(&self) -> (Vec<VersionEdit>, HashMap<ColumnFileId, Arc<BloomFilter>>) {
-        let mut version_edits = vec![];
-        let mut file_metas: HashMap<ColumnFileId, Arc<BloomFilter>> = HashMap::new();
+    pub async fn ts_families_version_edit(&self) -> TskvResult<Vec<SummaryRequest>> {
+        let mut requests = vec![];
         for db in self.dbs.values() {
-            db.read()
-                .await
-                .snapshot(None, &mut version_edits, &mut file_metas)
-                .await;
-        }
-        (version_edits, file_metas)
-    }
+            let db_reader = db.read().await;
+            let ts_families = db_reader.ts_families();
+            for (_, tsf) in ts_families.iter() {
+                let tf_family = tsf.read().await;
+                let ve = tf_family.build_version_edit();
+                let file_metas = tf_family.column_files_bloom_filter().await?;
 
-    /// Try to build and send `FlushReq`s to flush job for all ts_families.
-    pub async fn send_flush_req(&self) {
-        for db in self.dbs.values() {
-            for tsf in db.read().await.ts_families().values() {
-                let tsf_inner = tsf.clone();
-                self.runtime.spawn(async move {
-                    let mut tsf = tsf_inner.write().await;
-                    tsf.switch_to_immutable();
-                    tsf.send_flush_req(true).await;
-                });
-            }
-        }
-    }
+                let request = SummaryRequest {
+                    version_edit: ve,
+                    ts_family: tsf.clone(),
+                    mem_caches: None,
+                    file_metas: Some(file_metas),
+                };
 
-    /// **Please call this function after system recovered.**
-    ///
-    /// Get GlobalSequenceContext to store current minimum sequence number of all TseriesFamilies,
-    /// one use is fetching wal files which could be deleted.
-    pub async fn get_global_sequence_context(&self) -> GlobalSequenceContext {
-        let mut tsf_seq_map: HashMap<TseriesFamilyId, u64> = HashMap::new();
-        for (_, database) in self.dbs.iter() {
-            for (tsf_id, tsf) in database.read().await.ts_families().iter() {
-                tsf_seq_map.insert(*tsf_id, tsf.read().await.seq_no());
+                requests.push(request);
             }
         }
 
-        GlobalSequenceContext::new(tsf_seq_map)
+        Ok(requests)
+    }
+
+    pub async fn get_tsfamily_seq_no_map(&self) -> HashMap<TseriesFamilyId, u64> {
+        let mut r = HashMap::with_capacity(self.dbs.len());
+        for db in self.dbs.values() {
+            let db = db.read().await;
+            for tsf in db.ts_families().values() {
+                let tsf = tsf.read().await;
+                r.insert(tsf.tf_id(), tsf.super_version().version.last_seq());
+            }
+        }
+        r
     }
 }
 

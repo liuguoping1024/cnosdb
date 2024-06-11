@@ -19,7 +19,7 @@ use spi::query::logical_planner::Plan;
 use spi::query::session::SessionCtxFactory;
 use spi::server::dbms::DatabaseManagerSystem;
 use spi::service::protocol::{Query, QueryHandle, QueryId};
-use spi::{AuthSnafu, Result};
+use spi::{AuthSnafu, MetaSnafu, QueryResult};
 use trace::{debug, SpanContext};
 use tskv::kv_option::Options;
 
@@ -31,11 +31,13 @@ use crate::dispatcher::persister::LocalQueryPersister;
 use crate::dispatcher::query_tracker::QueryTracker;
 use crate::execution::factory::SqlQueryExecutionFactory;
 use crate::execution::scheduler::local::LocalScheduler;
-use crate::extension::expr::load_all_functions;
+use crate::extension::expr::{load_all_functions, register_session_udfs};
+use crate::extension::variable::load_all_system_vars;
 use crate::function::simple_func_manager::SimpleFunctionMetadataManager;
 use crate::metadata::BaseTableProvider;
 use crate::sql::optimizer::CascadeOptimizerBuilder;
 use crate::sql::parser::DefaultParser;
+use crate::variable::simple_sys_var_manager::SimpleSystemVarManager;
 
 pub const DEFAULT_CNOSDB_PATH: &str = ".cnosdb";
 pub const DEFAULT_CNOSDB_QUERY_DIRECTORY_NAME: &str = "query";
@@ -53,11 +55,11 @@ impl<D> DatabaseManagerSystem for Cnosdbms<D>
 where
     D: QueryDispatcher,
 {
-    async fn start(&self) -> Result<()> {
+    async fn start(&self) -> QueryResult<()> {
         self.query_dispatcher.start().await
     }
 
-    async fn authenticate(&self, user_info: &UserInfo, tenant_name: Option<&str>) -> Result<User> {
+    async fn authenticate(&self, user_info: &UserInfo, tenant_name: &str) -> QueryResult<User> {
         self.access_control
             .access_check(user_info, tenant_name)
             .await
@@ -68,8 +70,11 @@ where
         &self,
         query: &Query,
         span_context: Option<&SpanContext>,
-    ) -> Result<QueryHandle> {
-        let tenant_id = self.get_tenant_id(query.context().tenant()).await?;
+    ) -> QueryResult<QueryHandle> {
+        let tenant_id = self
+            .get_tenant_id(query.context().tenant())
+            .await
+            .context(AuthSnafu)?;
         let query_id = self.query_dispatcher.create_query_id();
 
         let result = self
@@ -84,9 +89,12 @@ where
         &self,
         query: Query,
         span_context: Option<&SpanContext>,
-    ) -> Result<QueryStateMachineRef> {
+    ) -> QueryResult<QueryStateMachineRef> {
         let query_id = self.query_dispatcher.create_query_id();
-        let tenant_id = self.get_tenant_id(query.context().tenant()).await?;
+        let tenant_id = self
+            .get_tenant_id(query.context().tenant())
+            .await
+            .context(AuthSnafu)?;
 
         let query_state_machine = self
             .query_dispatcher
@@ -99,7 +107,7 @@ where
     async fn build_logical_plan(
         &self,
         query_state_machine: QueryStateMachineRef,
-    ) -> Result<Option<Plan>> {
+    ) -> QueryResult<Option<Plan>> {
         let logical_plan = self
             .query_dispatcher
             .build_logical_plan(query_state_machine)
@@ -112,7 +120,7 @@ where
         &self,
         logical_plan: Plan,
         query_state_machine: QueryStateMachineRef,
-    ) -> Result<QueryHandle> {
+    ) -> QueryResult<QueryHandle> {
         let query_id = query_state_machine.query_id;
         let query = query_state_machine.query.clone();
         let result = self
@@ -159,23 +167,30 @@ pub async fn make_cnosdbms(
     coord: CoordinatorRef,
     options: Options,
     memory_pool: MemoryPoolRef,
-) -> Result<impl DatabaseManagerSystem> {
+) -> QueryResult<impl DatabaseManagerSystem> {
     let query_dedicated_hidden_dir = dirs::home_dir()
         .expect("Could not find user's home directory")
         .join(DEFAULT_CNOSDB_PATH)
         .join(DEFAULT_CNOSDB_QUERY_DIRECTORY_NAME);
 
+    // init Function Manager
+    let mut func_manager = SimpleFunctionMetadataManager::default();
+    load_all_functions(&mut func_manager)?;
+    // init System Variable Manager
+    let mut var_manager = SimpleSystemVarManager::default();
+    load_all_system_vars(&mut var_manager, coord.clone())?;
+
     let split_manager = Arc::new(SplitManager::new(coord.clone()));
     // TODO session config need load global system config
-    let session_factory = Arc::new(SessionCtxFactory::new(query_dedicated_hidden_dir.clone()));
+    let session_factory = Arc::new(SessionCtxFactory::new(
+        Some(Arc::new(var_manager)),
+        query_dedicated_hidden_dir.clone(),
+        Some(register_session_udfs),
+    ));
     let parser = Arc::new(DefaultParser::default());
     let optimizer = Arc::new(CascadeOptimizerBuilder::default().build());
     // TODO wrap, and num_threads configurable
     let scheduler = Arc::new(LocalScheduler {});
-
-    // init Function Manager
-    let mut func_manager = SimpleFunctionMetadataManager::default();
-    load_all_functions(&mut func_manager)?;
 
     // init stream provider manager
     let mut stream_provider_manager = StreamProviderManager::default();
@@ -201,6 +216,7 @@ pub async fn make_cnosdbms(
     let query_tracker = Arc::new(QueryTracker::new(
         options.query.max_server_connections as usize,
         query_persister,
+        coord.clone(),
     ));
 
     let query_execution_factory = Arc::new(SqlQueryExecutionFactory::new(
@@ -208,17 +224,18 @@ pub async fn make_cnosdbms(
         scheduler,
         query_tracker.clone(),
         Arc::new(stream_checker_manager),
+        options.query.clone(),
     ));
 
     let meta_manager = coord.meta_manager();
 
-    let default_meta_client =
-        coord
-            .tenant_meta(DEFAULT_CATALOG)
-            .await
-            .ok_or_else(|| MetaError::TenantNotFound {
-                tenant: DEFAULT_CATALOG.to_string(),
-            })?;
+    let default_meta_client = coord
+        .tenant_meta(DEFAULT_CATALOG)
+        .await
+        .ok_or_else(|| MetaError::TenantNotFound {
+            tenant: DEFAULT_CATALOG.to_string(),
+        })
+        .context(MetaSnafu)?;
 
     let stream_provider_manager: Arc<StreamProviderManager> = Arc::new(stream_provider_manager);
 
@@ -268,7 +285,7 @@ mod tests {
     use std::ops::DerefMut;
 
     use chrono::Utc;
-    use config::get_config_for_test;
+    use config::tskv::get_config_for_test;
     use coordinator::service_mock::MockCoordinator;
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::arrow::util::pretty::pretty_format_batches;
@@ -305,7 +322,7 @@ mod tests {
         };
 
         let user = db
-            .authenticate(&user, Some(DEFAULT_CATALOG))
+            .authenticate(&user, DEFAULT_CATALOG)
             .await
             .expect("authenticate");
 
@@ -328,7 +345,7 @@ mod tests {
 
         let mut result = exec_sql(&db, "SELECT * FROM (VALUES (1, 'one'), (2, 'two'), (3, 'three')) AS t (num,letter) order by num").await;
 
-        let expected = vec![
+        let expected = [
             "+-----+--------+",
             "| num | letter |",
             "+-----+--------+",
@@ -398,7 +415,7 @@ mod tests {
 
         println!("used time: {}", (start - end).num_milliseconds());
 
-        let expected = vec![
+        let expected = [
             "+-----+--------+",
             "| num | letter |",
             "+-----+--------+",
@@ -430,7 +447,7 @@ mod tests {
         )
         .await;
 
-        let expected = vec![
+        let expected = [
             "+-----+--------+",
             "| num | letter |",
             "+-----+--------+",
@@ -459,7 +476,7 @@ mod tests {
             .unwrap();
 
         assert_batches_eq!(
-            vec!["++", "++", "++",],
+            ["++", "++", "++"],
             exec_sql(
                 &db,
                 "CREATE EXTERNAL TABLE decimal_simple (
@@ -516,7 +533,7 @@ mod tests {
             .unwrap();
 
         assert_batches_eq!(
-            vec!["++", "++", "++",],
+            ["++", "++", "++"],
             exec_sql(
                 &db,
                 "
@@ -565,7 +582,7 @@ mod tests {
             .unwrap();
 
         assert_batches_eq!(
-            vec!["++", "++", "++",],
+            ["++", "++", "++"],
             exec_sql(
                 &db,
                 "
@@ -578,7 +595,7 @@ mod tests {
         );
 
         assert_batches_eq!(
-            vec![
+            [
                 "+-----+------+-------+---+",
                 "| a   | b    | c     | d |",
                 "+-----+------+-------+---+",
@@ -587,7 +604,7 @@ mod tests {
                 "| 2   | 0.6  | false |   |",
                 "| 1   | 2    | false | 4 |",
                 "| 4   |      |       |   |",
-                "+-----+------+-------+---+",
+                "+-----+------+-------+---+"
             ],
             exec_sql(
                 &db,

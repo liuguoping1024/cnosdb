@@ -7,6 +7,8 @@
 //!         - Column #3
 //!         - Column #4
 
+use std::borrow::Cow;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt::{self, Display};
 use std::mem::size_of_val;
@@ -14,11 +16,11 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
-use arrow_schema::{DataType, Field as DFField};
-use config::{RequestLimiterConfig, TenantLimiterConfig, TenantObjectLimiterConfig};
+use config::common::{RequestLimiterConfig, TenantLimiterConfig, TenantObjectLimiterConfig};
 use datafusion::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema, SchemaRef, TimeUnit,
 };
+use datafusion::common::{DFField, DFSchema, DFSchemaRef};
 use datafusion::datasource::file_format::avro::AvroFormat;
 use datafusion::datasource::file_format::csv::CsvFormat;
 use datafusion::datasource::file_format::file_type::{FileCompressionType, FileType};
@@ -26,19 +28,23 @@ use datafusion::datasource::file_format::json::JsonFormat;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::file_format::FileFormat;
 use datafusion::datasource::listing::ListingOptions;
-use datafusion::error::Result as DataFusionResult;
+use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::prelude::Column;
-use datafusion::scalar::ScalarValue;
 use derive_builder::Builder;
 use serde::{Deserialize, Serialize};
+use snafu::ResultExt;
 
 use crate::codec::Encoding;
+use crate::errors::InvalidSerdeMessageSnafu;
+use crate::gis::data_type::Geometry;
+use crate::meta_data::{NodeId, ReplicationSet};
 use crate::oid::{Identifier, Oid};
 use crate::utils::{
-    DAY_MICROS, DAY_MILLS, DAY_NANOS, HOUR_MICROS, HOUR_MILLS, HOUR_NANOS, MINUTES_MICROS,
-    MINUTES_MILLS, MINUTES_NANOS,
+    now_timestamp_nanos, DAY_MICROS, DAY_MILLS, DAY_NANOS, HOUR_MICROS, HOUR_MILLS, HOUR_NANOS,
+    MINUTES_MICROS, MINUTES_MILLS, MINUTES_NANOS,
 };
-use crate::{ColumnId, Error, SchemaId, Timestamp, ValueType};
+use crate::value_type::ValueType;
+use crate::{ColumnId, ModelResult, PhysicalDType, SchemaVersion, Timestamp};
 
 pub type TskvTableSchemaRef = Arc<TskvTableSchema>;
 
@@ -50,30 +56,200 @@ pub const TIME_FIELD: &str = "time";
 
 pub const DEFAULT_DATABASE: &str = "public";
 pub const USAGE_SCHEMA: &str = "usage_schema";
+pub const CLUSTER_SCHEMA: &str = "cluster_schema";
 pub const DEFAULT_CATALOG: &str = "cnosdb";
 pub const DEFAULT_PRECISION: &str = "NS";
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum ResourceOperator {
+    // tenant_name
+    DropTenant(String),
+
+    // tenant_name, db_name
+    DropDatabase(String, String),
+
+    // tenant_name, db_name, table_name
+    DropTable(String, String, String),
+
+    // table_schema, new_table_column
+    AddColumn(TskvTableSchema, TableColumn),
+
+    // drop_table_column_name, table_schema
+    DropColumn(String, TskvTableSchema),
+
+    // column_name, table_schema, new_table_column
+    AlterColumn(String, TskvTableSchema, TableColumn),
+
+    // tenant_name, db_name, new_tags_vec, series_keys, shards
+    UpdateTagValue(
+        String,
+        String,
+        Vec<(Vec<u8>, Option<Vec<u8>>)>,
+        Vec<Vec<u8>>,
+        Vec<ReplicationSet>,
+    ),
+}
+
+impl fmt::Display for ResourceOperator {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            ResourceOperator::DropTenant(..) => write!(f, "DropTenant"),
+            ResourceOperator::DropDatabase(..) => write!(f, "DropDatabase"),
+            ResourceOperator::DropTable(..) => write!(f, "DropTable"),
+            ResourceOperator::DropColumn(..) => write!(f, "DropColumn"),
+            ResourceOperator::AddColumn(..) => write!(f, "AddColumn"),
+            ResourceOperator::AlterColumn(..) => write!(f, "AlterColumn"),
+            ResourceOperator::UpdateTagValue(..) => write!(f, "UpdateTagValue"),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub enum ResourceStatus {
+    Schedule,
+    Executing,
+    Successed,
+    Failed,
+    Cancel,
+    Fatal,
+}
+
+impl fmt::Display for ResourceStatus {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            ResourceStatus::Schedule => write!(f, "Schedule"),
+            ResourceStatus::Executing => write!(f, "Executing"),
+            ResourceStatus::Successed => write!(f, "Successed"),
+            ResourceStatus::Failed => write!(f, "Failed"),
+            ResourceStatus::Cancel => write!(f, "Cancel"),
+            ResourceStatus::Fatal => write!(f, "Fatal"),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ResourceInfo {
+    time: i64,
+    tenant_id_and_db: (Oid, String),
+    name: String,
+    operator: ResourceOperator,
+    try_count: u64,
+    after: Option<Duration>,
+    // None means now
+    status: ResourceStatus,
+    comment: String,
+    execute_node_id: NodeId,
+    is_new_add: bool,
+}
+
+impl ResourceInfo {
+    pub fn new(
+        tenant_id_and_db: (Oid, String),
+        name: String,
+        operator: ResourceOperator,
+        after: &Option<Duration>,
+        execute_node_id: NodeId,
+    ) -> Self {
+        let mut res_info = ResourceInfo {
+            time: now_timestamp_nanos(),
+            tenant_id_and_db,
+            name,
+            operator,
+            try_count: 0,
+            after: after.clone(),
+            status: ResourceStatus::Executing,
+            comment: String::default(),
+            execute_node_id,
+            is_new_add: true,
+        };
+        if let Some(after) = after {
+            let after_nanos = after.to_nanoseconds();
+            if after_nanos > 0 {
+                res_info.status = ResourceStatus::Schedule;
+                res_info.time += after_nanos;
+            }
+        }
+        res_info
+    }
+
+    pub fn get_time(&self) -> i64 {
+        self.time
+    }
+
+    pub fn get_tenant_id_and_db(&self) -> &(Oid, String) {
+        &self.tenant_id_and_db
+    }
+
+    pub fn get_name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn get_operator(&self) -> &ResourceOperator {
+        &self.operator
+    }
+
+    pub fn get_try_count(&self) -> u64 {
+        self.try_count
+    }
+
+    pub fn get_status(&self) -> &ResourceStatus {
+        &self.status
+    }
+
+    pub fn get_comment(&self) -> &String {
+        &self.comment
+    }
+
+    pub fn get_execute_node_id(&self) -> &NodeId {
+        &self.execute_node_id
+    }
+
+    pub fn get_is_new_add(&self) -> bool {
+        self.is_new_add
+    }
+
+    pub fn increase_try_count(&mut self) {
+        self.try_count += 1;
+    }
+
+    pub fn set_status(&mut self, status: ResourceStatus) {
+        self.status = status;
+    }
+
+    pub fn set_comment(&mut self, comment: &str) {
+        self.comment = comment.to_string();
+    }
+
+    pub fn set_execute_node_id(&mut self, execute_node_id: NodeId) {
+        self.execute_node_id = execute_node_id;
+    }
+
+    pub fn set_is_new_add(&mut self, is_new_add: bool) {
+        self.is_new_add = is_new_add;
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum TableSchema {
-    TsKvTableSchema(Arc<TskvTableSchema>),
+    TsKvTableSchema(TskvTableSchemaRef),
     ExternalTableSchema(Arc<ExternalTableSchema>),
     StreamTableSchema(Arc<StreamTable>),
 }
 
 impl TableSchema {
-    pub fn name(&self) -> String {
+    pub fn name(&self) -> &str {
         match self {
-            TableSchema::TsKvTableSchema(schema) => schema.name.clone(),
-            TableSchema::ExternalTableSchema(schema) => schema.name.clone(),
-            TableSchema::StreamTableSchema(schema) => schema.name().into(),
+            TableSchema::TsKvTableSchema(schema) => schema.name.as_str(),
+            TableSchema::ExternalTableSchema(schema) => schema.name.as_str(),
+            TableSchema::StreamTableSchema(schema) => schema.name(),
         }
     }
 
-    pub fn db(&self) -> String {
+    pub fn db(&self) -> &str {
         match self {
-            TableSchema::TsKvTableSchema(schema) => schema.db.clone(),
-            TableSchema::ExternalTableSchema(schema) => schema.db.clone(),
-            TableSchema::StreamTableSchema(schema) => schema.db().into(),
+            TableSchema::TsKvTableSchema(schema) => schema.db.as_str(),
+            TableSchema::ExternalTableSchema(schema) => schema.db.as_str(),
+            TableSchema::StreamTableSchema(schema) => schema.db(),
         }
     }
 
@@ -103,7 +279,7 @@ pub struct ExternalTableSchema {
     pub file_type: String,
     pub location: String,
     pub target_partitions: usize,
-    pub table_partition_cols: Vec<(String, DataType)>,
+    pub table_partition_cols: Vec<(String, ArrowDataType)>,
     pub has_header: bool,
     pub delimiter: u8,
     pub schema: Schema,
@@ -123,9 +299,14 @@ impl ExternalTableSchema {
                     .with_file_compression_type(file_compression_type),
             ),
             FileType::PARQUET => Arc::new(ParquetFormat::default()),
-            FileType::AVRO => Arc::new(AvroFormat::default()),
+            FileType::AVRO => Arc::new(AvroFormat),
             FileType::JSON => {
                 Arc::new(JsonFormat::default().with_file_compression_type(file_compression_type))
+            }
+            FileType::ARROW => {
+                return Err(DataFusionError::NotImplemented(
+                    "Arrow external table.".to_string(),
+                ));
             }
         };
 
@@ -142,7 +323,7 @@ pub struct TskvTableSchema {
     pub tenant: String,
     pub db: String,
     pub name: String,
-    pub schema_id: SchemaId,
+    pub schema_version: SchemaVersion,
     next_column_id: ColumnId,
 
     columns: Vec<TableColumn>,
@@ -150,13 +331,25 @@ pub struct TskvTableSchema {
     columns_index: HashMap<String, usize>,
 }
 
+impl PartialOrd for TskvTableSchema {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.schema_version.cmp(&other.schema_version))
+    }
+}
+
+impl Ord for TskvTableSchema {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.schema_version.cmp(&other.schema_version)
+    }
+}
+
 impl Default for TskvTableSchema {
     fn default() -> Self {
         Self {
-            tenant: "cnosdb".to_string(),
-            db: "public".to_string(),
+            tenant: DEFAULT_CATALOG.to_string(),
+            db: DEFAULT_DATABASE.to_string(),
             name: "template".to_string(),
-            schema_id: 0,
+            schema_version: 0,
             next_column_id: 0,
             columns: Default::default(),
             columns_index: Default::default(),
@@ -166,12 +359,21 @@ impl Default for TskvTableSchema {
 
 impl TskvTableSchema {
     pub fn to_arrow_schema(&self) -> SchemaRef {
-        let fields: Vec<ArrowField> = self
+        let fields: Vec<ArrowField> = self.columns.iter().map(|field| field.into()).collect();
+        Arc::new(Schema::new(fields))
+    }
+
+    pub fn to_df_schema(&self) -> std::result::Result<DFSchemaRef, DataFusionError> {
+        let fields: Vec<DFField> = self
             .columns
             .iter()
-            .map(|field| field.to_arrow_field())
+            .map(ArrowField::from)
+            .map(|f| DFField::from_qualified(self.name.as_str(), f))
             .collect();
-        Arc::new(Schema::new(fields))
+        Ok(Arc::new(DFSchema::new_with_metadata(
+            fields,
+            HashMap::new(),
+        )?))
     }
 
     pub fn new(tenant: String, db: String, name: String, columns: Vec<TableColumn>) -> Self {
@@ -185,7 +387,7 @@ impl TskvTableSchema {
             tenant,
             db,
             name,
-            schema_id: 0,
+            schema_version: 0,
             next_column_id: columns.len() as ColumnId,
             columns,
             columns_index,
@@ -233,6 +435,7 @@ impl TskvTableSchema {
             None => return,
             Some(id) => *id,
         };
+        self.columns_index.remove(col_name);
         self.columns_index.insert(new_column.name.clone(), id);
         self.columns[id] = new_column;
     }
@@ -242,6 +445,10 @@ impl TskvTableSchema {
         self.columns_index
             .get(name)
             .map(|idx| unsafe { self.columns.get_unchecked(*idx) })
+    }
+
+    pub fn column_id_column_map(&self) -> HashMap<ColumnId, &TableColumn> {
+        self.columns.iter().map(|c| (c.id, c)).collect()
     }
 
     pub fn time_column_precision(&self) -> Precision {
@@ -273,6 +480,10 @@ impl TskvTableSchema {
 
     pub fn columns(&self) -> &[TableColumn] {
         &self.columns
+    }
+
+    pub fn column_ids(&self) -> Vec<ColumnId> {
+        self.columns.iter().map(|c| c.id).collect()
     }
 
     pub fn fields(&self) -> Vec<TableColumn> {
@@ -360,7 +571,7 @@ pub fn is_time_column(field: &ArrowField) -> bool {
     TIME_FIELD_NAME == field.name()
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub struct TableColumn {
     pub id: ColumnId,
     pub name: String,
@@ -368,15 +579,34 @@ pub struct TableColumn {
     pub encoding: Encoding,
 }
 
-impl From<TableColumn> for ArrowField {
-    fn from(column: TableColumn) -> Self {
+pub const GIS_SRID_META_KEY: &str = "gis.srid";
+pub const GIS_SUB_TYPE_META_KEY: &str = "gis.sub_type";
+
+pub const COLUMN_ID_META_KEY: &str = "column_id";
+
+impl From<&TableColumn> for ArrowField {
+    fn from(column: &TableColumn) -> Self {
         let mut map = HashMap::new();
-        map.insert(FIELD_ID.to_string(), column.id.to_string());
-        map.insert(TAG.to_string(), column.column_type.is_tag().to_string());
+        map.insert(COLUMN_ID_META_KEY.to_string(), column.id.to_string());
+
+        // 通过 SRID_META_KEY 标记 Geometry 类型的列
+        if let ColumnType::Field(ValueType::Geometry(Geometry { srid, sub_type })) =
+            column.column_type
+        {
+            map.insert(GIS_SUB_TYPE_META_KEY.to_string(), sub_type.to_string());
+            map.insert(GIS_SRID_META_KEY.to_string(), srid.to_string());
+        }
+
         let nullable = column.nullable();
-        let mut f = ArrowField::new(&column.name, column.column_type.into(), nullable);
+        let mut f = ArrowField::new(&column.name, column.column_type.clone().into(), nullable);
         f.set_metadata(map);
         f
+    }
+}
+
+impl From<TableColumn> for ArrowField {
+    fn from(column: TableColumn) -> Self {
+        Self::from(&column)
     }
 }
 
@@ -427,27 +657,16 @@ impl TableColumn {
         !matches!(self.column_type, ColumnType::Time(_))
     }
 
-    pub fn encode(&self) -> crate::errors::Result<Vec<u8>> {
-        let buf = bincode::serialize(&self)
-            .map_err(|e| Error::InvalidSerdeMessage { err: e.to_string() })?;
+    pub fn encode(&self) -> ModelResult<Vec<u8>> {
+        let buf = bincode::serialize(&self).context(InvalidSerdeMessageSnafu)?;
 
         Ok(buf)
     }
 
-    pub fn decode(buf: &[u8]) -> crate::errors::Result<Self> {
-        let column = bincode::deserialize::<TableColumn>(buf)
-            .map_err(|e| Error::InvalidSerdeMessage { err: e.to_string() })?;
+    pub fn decode(buf: &[u8]) -> ModelResult<Self> {
+        let column = bincode::deserialize::<TableColumn>(buf).context(InvalidSerdeMessageSnafu)?;
 
         Ok(column)
-    }
-
-    pub fn to_arrow_field(&self) -> ArrowField {
-        let mut f = ArrowField::new(&self.name, self.column_type.clone().into(), self.nullable());
-        let mut map = HashMap::new();
-        map.insert(FIELD_ID.to_string(), self.id.to_string());
-        map.insert(TAG.to_string(), self.column_type.is_tag().to_string());
-        f.set_metadata(map);
-        f
     }
 
     pub fn encoding_valid(&self) -> bool {
@@ -481,27 +700,13 @@ impl From<ColumnType> for ArrowDataType {
             ColumnType::Field(ValueType::Unsigned) => ArrowDataType::UInt64,
             ColumnType::Field(ValueType::String) => ArrowDataType::Utf8,
             ColumnType::Field(ValueType::Boolean) => ArrowDataType::Boolean,
+            ColumnType::Field(ValueType::Geometry(_)) => ArrowDataType::Utf8,
             _ => ArrowDataType::Null,
         }
     }
 }
 
-impl TryFrom<ArrowDataType> for ColumnType {
-    type Error = &'static str;
-
-    fn try_from(value: ArrowDataType) -> Result<Self, Self::Error> {
-        match value {
-            ArrowDataType::Float64 => Ok(Self::Field(ValueType::Float)),
-            ArrowDataType::Int64 => Ok(Self::Field(ValueType::Integer)),
-            ArrowDataType::UInt64 => Ok(Self::Field(ValueType::Unsigned)),
-            ArrowDataType::Utf8 => Ok(Self::Field(ValueType::String)),
-            ArrowDataType::Boolean => Ok(Self::Field(ValueType::Boolean)),
-            _ => Err("Error field type not supported"),
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub enum ColumnType {
     Tag,
     Time(TimeUnit),
@@ -523,6 +728,7 @@ impl ColumnType {
             Self::Field(ValueType::Float) => "F64",
             Self::Field(ValueType::Boolean) => "BOOL",
             Self::Field(ValueType::String) => "STRING",
+            Self::Field(ValueType::Geometry(..)) => "GEOMETRY",
             _ => "Error filed type not supported",
         }
     }
@@ -541,13 +747,13 @@ impl ColumnType {
             Self::Field(ValueType::Integer) => 1,
             Self::Field(ValueType::Unsigned) => 2,
             Self::Field(ValueType::Boolean) => 3,
-            Self::Field(ValueType::String) => 4,
+            Self::Field(ValueType::String) | Self::Field(ValueType::Geometry(_)) => 4,
             _ => 0,
         }
     }
 
-    pub fn from_i32(field_type: i32) -> Self {
-        match field_type {
+    pub fn from_proto_field_type(field_type: protos::models::FieldType) -> Self {
+        match field_type.0 {
             0 => Self::Field(ValueType::Float),
             1 => Self::Field(ValueType::Integer),
             2 => Self::Field(ValueType::Unsigned),
@@ -557,23 +763,40 @@ impl ColumnType {
         }
     }
 
-    pub fn to_sql_type_str(&self) -> &'static str {
+    pub fn to_sql_type_str_with_unit(&self) -> Cow<'static, str> {
         match self {
-            Self::Tag => "STRING",
+            Self::Tag => "STRING".into(),
             Self::Time(unit) => match unit {
-                TimeUnit::Second => "TIMESTAMP(SECOND)",
-                TimeUnit::Millisecond => "TIMESTAMP(MILLISECOND)",
-                TimeUnit::Microsecond => "TIMESTAMP(MICROSECOND)",
-                TimeUnit::Nanosecond => "TIMESTAMP(NANOSECOND)",
+                TimeUnit::Second => "TIMESTAMP(SECOND)".into(),
+                TimeUnit::Millisecond => "TIMESTAMP(MILLISECOND)".into(),
+                TimeUnit::Microsecond => "TIMESTAMP(MICROSECOND)".into(),
+                TimeUnit::Nanosecond => "TIMESTAMP(NANOSECOND)".into(),
             },
             Self::Field(value_type) => match value_type {
-                ValueType::String => "STRING",
-                ValueType::Integer => "BIGINT",
-                ValueType::Unsigned => "BIGINT UNSIGNED",
-                ValueType::Float => "DOUBLE",
-                ValueType::Boolean => "BOOLEAN",
-                ValueType::Unknown => "UNKNOWN",
+                ValueType::String => "STRING".into(),
+                ValueType::Integer => "BIGINT".into(),
+                ValueType::Unsigned => "BIGINT UNSIGNED".into(),
+                ValueType::Float => "DOUBLE".into(),
+                ValueType::Boolean => "BOOLEAN".into(),
+                ValueType::Unknown => "UNKNOWN".into(),
+                ValueType::Geometry(geo) => geo.to_string().into(),
             },
+        }
+    }
+
+    pub fn to_physical_type(&self) -> PhysicalCType {
+        match self {
+            Self::Tag => PhysicalCType::Tag,
+            Self::Time(unit) => PhysicalCType::Time(unit.clone()),
+            Self::Field(value_type) => PhysicalCType::Field(value_type.to_physical_type()),
+        }
+    }
+
+    pub fn to_physical_data_type(&self) -> PhysicalDType {
+        match self {
+            Self::Tag => PhysicalDType::String,
+            Self::Time(_) => PhysicalDType::Integer,
+            Self::Field(value_type) => value_type.to_physical_type(),
         }
     }
 }
@@ -609,6 +832,12 @@ impl ColumnType {
     pub fn is_field(&self) -> bool {
         matches!(self, ColumnType::Field(_))
     }
+
+    pub fn matches_type(&self, other: &ColumnType) -> bool {
+        self.eq(other)
+            || (matches!(self, ColumnType::Field(ValueType::Geometry(..)))
+                && matches!(other, ColumnType::Field(ValueType::String)))
+    }
 }
 
 impl From<ValueType> for ColumnType {
@@ -630,6 +859,18 @@ impl DatabaseSchema {
             tenant: tenant_name.to_string(),
             database: database_name.to_string(),
             config: DatabaseOptions::default(),
+        }
+    }
+
+    pub fn new_with_options(
+        tenant_name: &str,
+        database_name: &str,
+        options: DatabaseOptions,
+    ) -> Self {
+        DatabaseSchema {
+            tenant: tenant_name.to_string(),
+            database: database_name.to_string(),
+            config: options,
         }
     }
 
@@ -681,6 +922,7 @@ pub fn make_owner(tenant_name: &str, database_name: &str) -> String {
     format!("{}.{}", tenant_name, database_name)
 }
 
+/// "tenant.database" -> ("tenant", "database")
 pub fn split_owner(owner: &str) -> (&str, &str) {
     owner
         .find('.')
@@ -704,12 +946,14 @@ pub struct DatabaseOptions {
     replica: Option<u64>,
     // timestamp precision
     precision: Option<Precision>,
+
+    db_is_hidden: bool,
 }
 
 impl DatabaseOptions {
     pub const DEFAULT_TTL: Duration = Duration {
-        time_num: 365,
-        unit: DurationUnit::Day,
+        time_num: 0,
+        unit: DurationUnit::Inf,
     };
     pub const DEFAULT_SHARD_NUM: u64 = 1;
     pub const DEFAULT_REPLICA: u64 = 1;
@@ -718,6 +962,23 @@ impl DatabaseOptions {
         unit: DurationUnit::Day,
     };
     pub const DEFAULT_PRECISION: Precision = Precision::NS;
+
+    pub fn new(
+        ttl: Option<Duration>,
+        shard_num: Option<u64>,
+        vnode_duration: Option<Duration>,
+        replica: Option<u64>,
+        precision: Option<Precision>,
+    ) -> Self {
+        DatabaseOptions {
+            ttl,
+            shard_num,
+            vnode_duration,
+            replica,
+            precision,
+            db_is_hidden: false,
+        }
+    }
 
     pub fn ttl(&self) -> &Option<Duration> {
         &self.ttl
@@ -781,6 +1042,14 @@ impl DatabaseOptions {
 
     pub fn with_precision(&mut self, precision: Precision) {
         self.precision = Some(precision)
+    }
+
+    pub fn get_db_is_hidden(&self) -> bool {
+        self.db_is_hidden
+    }
+
+    pub fn set_db_is_hidden(&mut self, db_is_hidden: bool) {
+        self.db_is_hidden = db_is_hidden;
     }
 }
 
@@ -866,6 +1135,7 @@ pub enum DurationUnit {
     Minutes,
     Hour,
     Day,
+    Inf,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
@@ -880,6 +1150,7 @@ impl fmt::Display for Duration {
             DurationUnit::Minutes => write!(f, "{} Minutes", self.time_num),
             DurationUnit::Hour => write!(f, "{} Hours", self.time_num),
             DurationUnit::Day => write!(f, "{} Days", self.time_num),
+            DurationUnit::Inf => write!(f, "INF"),
         }
     }
 }
@@ -937,6 +1208,7 @@ impl Duration {
             DurationUnit::Minutes => (self.time_num as i64).saturating_mul(MINUTES_NANOS),
             DurationUnit::Hour => (self.time_num as i64).saturating_mul(HOUR_NANOS),
             DurationUnit::Day => (self.time_num as i64).saturating_mul(DAY_NANOS),
+            DurationUnit::Inf => i64::MAX,
         }
     }
 
@@ -945,6 +1217,7 @@ impl Duration {
             DurationUnit::Minutes => (self.time_num as i64).saturating_mul(MINUTES_MICROS),
             DurationUnit::Hour => (self.time_num as i64).saturating_mul(HOUR_MICROS),
             DurationUnit::Day => (self.time_num as i64).saturating_mul(DAY_MICROS),
+            DurationUnit::Inf => i64::MAX,
         }
     }
 
@@ -953,6 +1226,7 @@ impl Duration {
             DurationUnit::Minutes => (self.time_num as i64).saturating_mul(MINUTES_MILLS),
             DurationUnit::Hour => (self.time_num as i64).saturating_mul(HOUR_MILLS),
             DurationUnit::Day => (self.time_num as i64).saturating_mul(DAY_MILLS),
+            DurationUnit::Inf => i64::MAX,
         }
     }
 
@@ -963,9 +1237,18 @@ impl Duration {
             Precision::NS => self.to_nanoseconds(),
         }
     }
+
+    pub fn drop_after_output(&self) -> String {
+        match &self.unit {
+            DurationUnit::Minutes => format!("{}m", self.time_num),
+            DurationUnit::Hour => format!("{}h", self.time_num),
+            DurationUnit::Day => format!("{}d", self.time_num),
+            _ => String::from(""),
+        }
+    }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Tenant {
     id: Oid,
     name: String,
@@ -1001,17 +1284,24 @@ impl Tenant {
 pub struct TenantOptions {
     pub comment: Option<String>,
     pub limiter_config: Option<TenantLimiterConfig>,
+    drop_after: Option<Duration>,
+    // None means now
+    tenant_is_hidden: bool,
 }
 
 impl From<TenantOptions> for TenantOptionsBuilder {
     fn from(value: TenantOptions) -> Self {
         let mut builder = TenantOptionsBuilder::default();
-        if let Some(comment) = value.comment {
+        if let Some(comment) = value.comment.clone() {
             builder.comment(comment);
         }
-        if let Some(config) = value.limiter_config {
+        if let Some(config) = value.limiter_config.clone() {
             builder.limiter_config(config);
         }
+        if let Some(drop_after) = value.get_drop_after() {
+            builder.drop_after(drop_after);
+        }
+        builder.tenant_is_hidden(false);
         builder
     }
 }
@@ -1022,6 +1312,9 @@ impl TenantOptionsBuilder {
     }
     pub fn unset_limiter_config(&mut self) {
         self.limiter_config = None
+    }
+    pub fn unset_drop_after(&mut self) {
+        self.drop_after = None;
     }
 }
 
@@ -1038,6 +1331,18 @@ impl TenantOptions {
             Some(ref limit_config) => limit_config.request_config.as_ref(),
             None => None,
         }
+    }
+
+    pub fn get_tenant_is_hidden(&self) -> bool {
+        self.tenant_is_hidden
+    }
+
+    pub fn set_tenant_is_hidden(&mut self, tenant_is_hidden: bool) {
+        self.tenant_is_hidden = tenant_is_hidden;
+    }
+
+    pub fn get_drop_after(&self) -> Option<Duration> {
+        self.drop_after.clone()
     }
 }
 
@@ -1124,83 +1429,24 @@ impl StreamTable {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-pub enum ScalarValueForkDF {
-    /// represents `DataType::Null` (castable to/from any other type)
-    Null,
-    /// true or false value
-    Boolean(Option<bool>),
-    /// 32bit float
-    Float32(Option<f32>),
-    /// 64bit float
-    Float64(Option<f64>),
-    /// 128bit decimal, using the i128 to represent the decimal, precision scale
-    Decimal128(Option<i128>, u8, u8),
-    /// signed 8bit int
-    Int8(Option<i8>),
-    /// signed 16bit int
-    Int16(Option<i16>),
-    /// signed 32bit int
-    Int32(Option<i32>),
-    /// signed 64bit int
-    Int64(Option<i64>),
-    /// unsigned 8bit int
-    UInt8(Option<u8>),
-    /// unsigned 16bit int
-    UInt16(Option<u16>),
-    /// unsigned 32bit int
-    UInt32(Option<u32>),
-    /// unsigned 64bit int
-    UInt64(Option<u64>),
-    /// utf-8 encoded string.
-    Utf8(Option<String>),
-    /// utf-8 encoded string representing a LargeString's arrow type.
-    LargeUtf8(Option<String>),
-    /// binary
-    Binary(Option<Vec<u8>>),
-    /// fixed size binary
-    FixedSizeBinary(i32, Option<Vec<u8>>),
-    /// large binary
-    LargeBinary(Option<Vec<u8>>),
-    /// list of nested ScalarValue
-    List(Option<Vec<ScalarValueForkDF>>, Box<DFField>),
-    /// Date stored as a signed 32bit int days since UNIX epoch 1970-01-01
-    Date32(Option<i32>),
-    /// Date stored as a signed 64bit int milliseconds since UNIX epoch 1970-01-01
-    Date64(Option<i64>),
-    /// Time stored as a signed 64bit int as nanoseconds since midnight
-    Time64(Option<i64>),
-    /// Timestamp Second
-    TimestampSecond(Option<i64>, Option<String>),
-    /// Timestamp Milliseconds
-    TimestampMillisecond(Option<i64>, Option<String>),
-    /// Timestamp Microseconds
-    TimestampMicrosecond(Option<i64>, Option<String>),
-    /// Timestamp Nanoseconds
-    TimestampNanosecond(Option<i64>, Option<String>),
-    /// Number of elapsed whole months
-    IntervalYearMonth(Option<i32>),
-    /// Number of elapsed days and milliseconds (no leap seconds)
-    /// stored as 2 contiguous 32-bit signed integers
-    IntervalDayTime(Option<i64>),
-    /// A triple of the number of elapsed months, days, and nanoseconds.
-    /// Months and days are encoded as 32-bit signed integers.
-    /// Nanoseconds is encoded as a 64-bit signed integer (no leap seconds).
-    IntervalMonthDayNano(Option<i128>),
-    /// struct of nested ScalarValue
-    Struct(Option<Vec<ScalarValueForkDF>>, Box<Vec<DFField>>),
-    /// Dictionary type: index type and value
-    Dictionary(Box<ArrowDataType>, Box<ScalarValueForkDF>),
+/// column type for tskv
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PhysicalCType {
+    Tag,
+    Time(TimeUnit),
+    Field(PhysicalDType),
 }
 
-impl From<ScalarValue> for ScalarValueForkDF {
-    fn from(value: ScalarValue) -> Self {
-        unsafe { std::mem::transmute::<ScalarValue, Self>(value) }
+impl PhysicalCType {
+    pub fn default_time() -> Self {
+        Self::Time(TimeUnit::Nanosecond)
     }
-}
 
-impl From<ScalarValueForkDF> for ScalarValue {
-    fn from(value: ScalarValueForkDF) -> Self {
-        unsafe { std::mem::transmute::<ScalarValueForkDF, Self>(value) }
+    pub fn to_physical_data_type(&self) -> PhysicalDType {
+        match self {
+            Self::Tag => PhysicalDType::String,
+            Self::Time(_) => PhysicalDType::Integer,
+            Self::Field(value_type) => *value_type,
+        }
     }
 }

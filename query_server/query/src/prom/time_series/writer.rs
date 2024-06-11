@@ -7,8 +7,8 @@ use datafusion::arrow::datatypes::{
 };
 use datafusion::arrow::record_batch::RecordBatch;
 use models::schema::TIME_FIELD_NAME;
-use protos::prompb::types::{Label, Sample, TimeSeries};
-use spi::{QueryError, Result};
+use protos::prompb::prometheus::{Label, Sample, TimeSeries};
+use spi::{CommonSnafu, QueryError, QueryResult};
 use trace::debug;
 
 use crate::prom::METRIC_SAMPLE_COLUMN_NAME;
@@ -27,7 +27,7 @@ pub struct Writer<'a> {
 }
 
 impl Writer<'_> {
-    fn get_labels(&self, batch: &[ArrayRef], row_index: usize) -> Result<Vec<Label>> {
+    fn get_labels(&self, batch: &[ArrayRef], row_index: usize) -> QueryResult<Vec<Label>> {
         let mut labels = Vec::with_capacity(self.tag_name_indices.len());
         for (tag_idx, tag_name) in self.tag_name_indices.iter().zip(&self.tag_names) {
             let col = &batch[*tag_idx];
@@ -39,23 +39,23 @@ impl Writer<'_> {
                     .value(row_index)
                     .to_owned(),
                 _ => {
-                    return Err(QueryError::CommonError {
+                    return Err(CommonSnafu {
                         msg: "Tag noly support string type".to_string(),
-                    });
+                    }
+                    .build());
                 }
             };
 
             labels.push(Label {
                 name: tag_name.to_string(),
                 value: tag_value,
-                ..Default::default()
             });
         }
 
         Ok(labels)
     }
 
-    fn get_sample_value(&self, batch: &[ArrayRef], row_index: usize) -> Result<f64> {
+    fn get_sample_value(&self, batch: &[ArrayRef], row_index: usize) -> QueryResult<f64> {
         let col = &batch[self.sample_value_idx];
         let sample_value = unsafe {
             match col.data_type() {
@@ -77,9 +77,10 @@ impl Writer<'_> {
                         .value(row_index),
                 ),
                 _ => {
-                    return Err(QueryError::CommonError {
+                    return Err(CommonSnafu {
                         msg: "Prom sample value noly support float type".to_string(),
-                    });
+                    }
+                    .build());
                 }
             }
         };
@@ -87,7 +88,7 @@ impl Writer<'_> {
         Ok(sample_value)
     }
 
-    fn get_sample_time(&self, batch: &[ArrayRef], row_index: usize) -> Result<i64> {
+    fn get_sample_time(&self, batch: &[ArrayRef], row_index: usize) -> QueryResult<i64> {
         let col = &batch[self.sample_time_idx];
         let sample_timestamp_ms = unsafe {
             match col.data_type() {
@@ -120,9 +121,10 @@ impl Writer<'_> {
                     }
                 },
                 _ => {
-                    return Err(QueryError::CommonError {
+                    return Err(CommonSnafu {
                         msg: "Prom sample value noly support TimestampMillisecondType".to_string(),
-                    });
+                    }
+                    .build());
                 }
             }
         };
@@ -131,7 +133,7 @@ impl Writer<'_> {
     }
 
     /// Convert a record to a metric
-    fn apply(&mut self, batch: &[ArrayRef], row_index: usize) -> Result<()> {
+    fn apply(&mut self, batch: &[ArrayRef], row_index: usize) -> QueryResult<()> {
         // get labels
         let labels = self.get_labels(batch, row_index)?;
         // get sample value
@@ -142,7 +144,6 @@ impl Writer<'_> {
         let sample = Sample {
             value: sample_value,
             timestamp: sample_timestamp_ms,
-            ..Default::default()
         };
 
         // save Sample
@@ -164,7 +165,7 @@ impl Writer<'_> {
     }
 
     /// Write a vector of record batches to time series vec
-    pub fn write(&mut self, batch: &RecordBatch) -> Result<()> {
+    pub fn write(&mut self, batch: &RecordBatch) -> QueryResult<()> {
         debug_assert_eq!(self.schema.fields(), batch.schema().fields());
 
         let columns = batch.columns();
@@ -194,7 +195,7 @@ impl WriterBuilder {
         sample_value_idx: usize,
         sample_time_idx: usize,
         schema: SchemaRef,
-    ) -> Result<Self> {
+    ) -> QueryResult<Self> {
         // prom remote read only support data type: string(label)/float(sample value)/timestamp(time)
         let _ = schema
             .fields()
@@ -205,10 +206,11 @@ impl WriterBuilder {
                     return Err(QueryError::DataType {
                         data_type: type_.to_string(),
                         column: array.name().to_string(),
+                        prompt: "only support data type: string(label)/float(sample value)/timestamp(time)".to_string(),
                     });
                 }
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<QueryResult<Vec<_>>>()?;
         // valid indices
         let tags = schema.project(&tag_name_indices)?;
         let _ = schema

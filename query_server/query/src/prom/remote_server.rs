@@ -1,5 +1,5 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -7,24 +7,24 @@ use coordinator::service::CoordinatorRef;
 use datafusion::arrow::datatypes::ToByteSlice;
 use meta::error::MetaError;
 use meta::model::MetaClientRef;
-use models::schema::{TskvTableSchema, TIME_FIELD_NAME};
+use models::schema::{TskvTableSchemaRef, TIME_FIELD_NAME};
 use models::snappy::SnappyCodec;
-use protocol_parser::lines_convert::parse_lines_to_points;
 use protocol_parser::Line;
-use protos::kv_service::WritePointsRequest;
-use protos::models_helper::{parse_proto_bytes, to_proto_bytes};
-use protos::prompb::remote::{
-    Query as PromQuery, QueryResult, ReadRequest, ReadResponse, WriteRequest,
+use protos::models_helper::{parse_prost_bytes, to_prost_bytes};
+use protos::prompb::prometheus::label_matcher::Type;
+use protos::prompb::prometheus::{
+    Query as PromQuery, QueryResult as PromQueryResult, ReadRequest, ReadResponse, TimeSeries,
+    WriteRequest,
 };
-use protos::prompb::types::label_matcher::Type;
-use protos::prompb::types::TimeSeries;
 use protos::FieldValue;
 use regex::Regex;
+use snafu::ResultExt;
 use spi::server::dbms::DBMSRef;
 use spi::server::prom::PromRemoteServer;
 use spi::service::protocol::{Context, Query, QueryHandle};
-use spi::{QueryError, Result};
-use trace::{debug, warn, SpanContext, SpanExt, SpanRecorder};
+use spi::{MetaSnafu, QueryError, QueryResult, SnappySnafu};
+use trace::span_ext::SpanExt;
+use trace::{debug, warn, Span, SpanContext};
 
 use super::time_series::writer::WriterBuilder;
 use super::{METRIC_NAME_LABEL, METRIC_SAMPLE_COLUMN_NAME};
@@ -43,24 +43,24 @@ impl PromRemoteServer for PromRemoteSqlServer {
         ctx: &Context,
         req: Bytes,
         span_ctx: Option<&SpanContext>,
-    ) -> Result<Vec<u8>> {
+    ) -> QueryResult<Vec<u8>> {
         let meta = self
             .coord
             .meta_manager()
-            .tenant_manager()
             .tenant_meta(ctx.tenant())
             .await
             .ok_or_else(|| MetaError::TenantNotFound {
                 tenant: ctx.tenant().to_string(),
-            })?;
+            })
+            .context(MetaSnafu)?;
 
         let read_request = self.deserialize_read_request(req).await?;
 
         debug!("Received remote read request: {:?}", read_request);
 
-        let span_recorder = SpanRecorder::new(span_ctx.child_span("process read request"));
+        let span = Span::from_context("process read request", span_ctx);
         let read_response = self
-            .process_read_request(ctx, meta, read_request, span_recorder)
+            .process_read_request(ctx, meta, read_request, span)
             .await?;
 
         debug!("Return remote read response: {:?}", read_response);
@@ -68,12 +68,46 @@ impl PromRemoteServer for PromRemoteSqlServer {
         self.serialize_read_response(read_response).await
     }
 
-    fn remote_write(&self, ctx: &Context, req: Bytes) -> Result<WritePointsRequest> {
+    fn remote_write(&self, req: Bytes) -> QueryResult<WriteRequest> {
         let prom_write_request = self.deserialize_write_request(req)?;
-        let write_points_request =
-            self.prom_write_request_to_write_points_request(ctx, prom_write_request)?;
-        debug!("Received remote write request: {:?}", write_points_request);
-        Ok(write_points_request)
+        Ok(prom_write_request)
+    }
+
+    fn prom_write_request_to_lines<'a>(&self, req: &'a WriteRequest) -> QueryResult<Vec<Line<'a>>> {
+        let mut lines = Vec::with_capacity(req.timeseries.len());
+
+        for ts in req.timeseries.iter() {
+            let mut table_name = DEFAULT_PROM_TABLE_NAME;
+            let tags = ts
+                .labels
+                .iter()
+                .map(|label| {
+                    if label.name.eq(METRIC_NAME_LABEL) {
+                        table_name = label.value.as_ref()
+                    }
+                    (
+                        Cow::Borrowed(label.name.as_ref()),
+                        Cow::Borrowed(label.value.as_ref()),
+                    )
+                })
+                .collect::<Vec<(_, _)>>();
+
+            for sample in ts.samples.iter() {
+                let fields = vec![(
+                    Cow::Borrowed(METRIC_SAMPLE_COLUMN_NAME),
+                    FieldValue::F64(sample.value),
+                )];
+                let timestamp = sample.timestamp * 1000000;
+                lines.push(Line::new(
+                    Cow::Borrowed(table_name),
+                    tags.clone(),
+                    fields,
+                    timestamp,
+                ));
+            }
+        }
+
+        Ok(lines)
     }
 }
 
@@ -86,65 +120,32 @@ impl PromRemoteSqlServer {
         }
     }
 
-    async fn deserialize_read_request(&self, req: Bytes) -> Result<ReadRequest> {
+    async fn deserialize_read_request(&self, req: Bytes) -> QueryResult<ReadRequest> {
         let mut decompressed = Vec::new();
         let compressed = req.to_byte_slice();
 
-        self.codec.decompress(compressed, &mut decompressed, None)?;
+        self.codec
+            .decompress(compressed, &mut decompressed, None)
+            .context(SnappySnafu)?;
 
-        parse_proto_bytes::<ReadRequest>(&decompressed).map_err(|source| {
+        parse_prost_bytes::<ReadRequest>(&decompressed).map_err(|source| {
             QueryError::InvalidRemoteReadReq {
                 source: Box::new(source),
             }
         })
     }
 
-    fn deserialize_write_request(&self, req: Bytes) -> Result<WriteRequest> {
+    fn deserialize_write_request(&self, req: Bytes) -> QueryResult<WriteRequest> {
         let mut decompressed = Vec::new();
         let compressed = req.to_byte_slice();
-        self.codec.decompress(compressed, &mut decompressed, None)?;
-        parse_proto_bytes::<WriteRequest>(&decompressed).map_err(|source| {
+        self.codec
+            .decompress(compressed, &mut decompressed, None)
+            .context(SnappySnafu)?;
+        parse_prost_bytes::<WriteRequest>(&decompressed).map_err(|source| {
             QueryError::InvalidRemoteWriteReq {
                 source: Box::new(source),
             }
         })
-    }
-
-    fn prom_write_request_to_write_points_request(
-        &self,
-        ctx: &Context,
-        req: WriteRequest,
-    ) -> Result<WritePointsRequest> {
-        let mut lines = Vec::with_capacity(req.timeseries.len());
-
-        for ts in req.timeseries.iter() {
-            let mut table_name = DEFAULT_PROM_TABLE_NAME;
-            let tags = ts
-                .labels
-                .iter()
-                .map(|label| {
-                    if label.name.eq(METRIC_NAME_LABEL) {
-                        table_name = label.value.as_ref()
-                    }
-                    (label.name.as_ref(), label.value.as_ref())
-                })
-                .collect::<Vec<(_, _)>>();
-
-            for sample in ts.samples.iter() {
-                let fields = vec![(METRIC_SAMPLE_COLUMN_NAME, FieldValue::F64(sample.value))];
-                let timestamp = sample.timestamp * 1000000;
-                lines.push(Line::new(table_name, tags.clone(), fields, timestamp));
-            }
-        }
-
-        let points = parse_lines_to_points(ctx.database(), &lines);
-        let request = WritePointsRequest {
-            version: 0,
-            meta: None,
-            points,
-        };
-
-        Ok(request)
     }
 
     async fn process_read_request(
@@ -152,8 +153,8 @@ impl PromRemoteSqlServer {
         ctx: &Context,
         meta: MetaClientRef,
         read_request: ReadRequest,
-        span_recorder: SpanRecorder,
-    ) -> Result<ReadResponse> {
+        span: Span,
+    ) -> QueryResult<ReadResponse> {
         let mut results = Vec::with_capacity(read_request.queries.len());
         for q in read_request.queries {
             let mut timeseries: Vec<TimeSeries> = Vec::new();
@@ -164,29 +165,27 @@ impl PromRemoteSqlServer {
             for (idx, sql) in sqls.into_iter().enumerate() {
                 timeseries.append(
                     &mut self
-                        .process_single_sql(ctx, sql, span_recorder.child(idx.to_string()))
+                        .process_single_sql(
+                            ctx,
+                            sql,
+                            Span::enter_with_parent(idx.to_string(), &span),
+                        )
                         .await?,
                 );
             }
 
-            results.push(QueryResult {
-                timeseries,
-                ..Default::default()
-            });
+            results.push(PromQueryResult { timeseries });
         }
 
-        Ok(ReadResponse {
-            results,
-            special_fields: Default::default(),
-        })
+        Ok(ReadResponse { results })
     }
 
     async fn process_single_sql(
         &self,
         ctx: &Context,
         sql: SqlWithTable,
-        span_recorder: SpanRecorder,
-    ) -> Result<Vec<TimeSeries>> {
+        span: Span,
+    ) -> QueryResult<Vec<TimeSeries>> {
         let table_schema = sql.table;
         let tag_name_indices = table_schema.tag_indices();
         let sample_value_idx = table_schema
@@ -205,19 +204,18 @@ impl PromRemoteSqlServer {
         let inner_query = Query::new(ctx.clone(), sql.sql);
         let result = self
             .db
-            .execute(&inner_query, span_recorder.span_ctx())
+            .execute(&inner_query, span.context().as_ref())
             .await?;
 
         transform_time_series(result, tag_name_indices, sample_value_idx, sample_time_idx).await
     }
 
-    async fn serialize_read_response(&self, read_response: ReadResponse) -> Result<Vec<u8>> {
+    async fn serialize_read_response(&self, read_response: ReadResponse) -> QueryResult<Vec<u8>> {
         let mut compressed = Vec::new();
-        let input_buf =
-            to_proto_bytes(read_response).map_err(|source| QueryError::CommonError {
-                msg: source.to_string(),
-            })?;
-        self.codec.compress(&input_buf, &mut compressed)?;
+        let input_buf = to_prost_bytes(&read_response);
+        self.codec
+            .compress(&input_buf, &mut compressed)
+            .context(SnappySnafu)?;
 
         Ok(compressed)
     }
@@ -227,39 +225,33 @@ fn build_sql_with_table(
     ctx: &Context,
     meta: &MetaClientRef,
     query: PromQuery,
-) -> Result<Vec<SqlWithTable>> {
+) -> QueryResult<Vec<SqlWithTable>> {
     let PromQuery {
         start_timestamp_ms,
         end_timestamp_ms,
         matchers,
         hints: _,
-        special_fields: _,
     } = query;
 
     let mut tables = Vec::new();
     let mut filters = Vec::with_capacity(matchers.len());
 
     for m in matchers {
-        let type_ = m
-            .type_
-            .enum_value()
-            .map_err(|e| QueryError::InvalidRemoteReadReq {
-                source: format!("Unknown label matcher type: {e}").into(),
-            })?;
-
         if METRIC_NAME_LABEL == m.name {
-            match type_ {
-                Type::EQ => {
+            match m.r#type() {
+                Type::Eq => {
                     // Get schema of the specified table
                     let table_name = &m.value;
                     let table = meta
-                        .get_tskv_table_schema(ctx.database(), table_name)?
+                        .get_tskv_table_schema(ctx.database(), table_name)
+                        .context(MetaSnafu)?
                         .ok_or_else(|| MetaError::TableNotFound {
                             table: table_name.to_string(),
-                        })?;
+                        })
+                        .context(MetaSnafu)?;
                     tables = vec![table];
                 }
-                Type::RE => {
+                Type::Re => {
                     // Filter table names through regular expressions,
                     // Get the schema of the remaining tables.
                     let pattern =
@@ -268,7 +260,8 @@ fn build_sql_with_table(
                         })?;
 
                     tables = meta
-                        .list_tables(ctx.database())?
+                        .list_tables(ctx.database())
+                        .context(MetaSnafu)?
                         .iter()
                         .filter(|e| pattern.is_match(e))
                         .flat_map(|table_name| {
@@ -292,17 +285,17 @@ fn build_sql_with_table(
             continue;
         }
 
-        match type_ {
-            Type::EQ => {
+        match m.r#type() {
+            Type::Eq => {
                 filters.push(format!("{} = '{}'", m.name, m.value));
             }
-            Type::NEQ => {
+            Type::Neq => {
                 filters.push(format!("{} != '{}'", m.name, m.value));
             }
-            Type::RE => {
+            Type::Re => {
                 filters.push(format!("{} ~ '{}'", m.name, m.value));
             }
-            Type::NRE => {
+            Type::Nre => {
                 filters.push(format!("{} !~ '{}'", m.name, m.value));
             }
         }
@@ -332,7 +325,7 @@ async fn transform_time_series(
     tag_name_indices: Vec<usize>,
     sample_value_idx: usize,
     sample_time_idx: usize,
-) -> Result<Vec<TimeSeries>> {
+) -> QueryResult<Vec<TimeSeries>> {
     let result = query_handle.result();
     let schema = result.schema();
     let batches = result.chunk_result().await?;
@@ -354,7 +347,7 @@ async fn transform_time_series(
 #[derive(Debug)]
 struct SqlWithTable {
     pub sql: String,
-    pub table: Arc<TskvTableSchema>,
+    pub table: TskvTableSchemaRef,
 }
 
 #[cfg(test)]
@@ -365,9 +358,8 @@ mod test {
     use datafusion::arrow::array::{Float64Array, StringArray, TimestampNanosecondArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use datafusion::arrow::record_batch::RecordBatch;
-    use datafusion::from_slice::FromSlice;
     use models::auth::user::{User, UserDesc, UserOptions};
-    use protos::prompb::types::{Label, Sample, TimeSeries};
+    use protos::prompb::prometheus::{Label, Sample, TimeSeries};
     use spi::query::execution::Output;
     use spi::query::recordbatch::RecordBatchStreamWrapper;
     use spi::service::protocol::{ContextBuilder, Query, QueryHandle, QueryId};
@@ -390,11 +382,9 @@ mod test {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(TimestampNanosecondArray::from_slice(vec![
-                    1673069176267000000,
-                ])),
-                Arc::new(StringArray::from_slice(vec!["tag1"])),
-                Arc::new(Float64Array::from_slice(vec![1.1_f64])),
+                Arc::new(TimestampNanosecondArray::from(vec![1673069176267000000])),
+                Arc::new(StringArray::from(vec!["tag1"])),
+                Arc::new(Float64Array::from(vec![1.1_f64])),
             ],
         )
         .unwrap();
@@ -402,7 +392,7 @@ mod test {
         let options = UserOptions::default();
         let desc = UserDesc::new(0_u128, "user".to_string(), options, true);
         let query = Query::new(
-            ContextBuilder::new(User::new(desc, Default::default())).build(),
+            ContextBuilder::new(User::new(desc, Default::default(), None)).build(),
             "content".to_string(),
         );
 
@@ -429,12 +419,10 @@ mod test {
             labels: vec![Label {
                 name: "tag".to_string(),
                 value: "tag1".to_string(),
-                ..Default::default()
             }],
             samples: vec![Sample {
                 value: 1.1_f64,
                 timestamp: 1673069176267_i64,
-                ..Default::default()
             }],
             ..Default::default()
         };

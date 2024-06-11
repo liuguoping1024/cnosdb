@@ -1,81 +1,103 @@
-use std::io::{IoSlice, SeekFrom};
+use std::io::IoSlice;
 use std::path::{Path, PathBuf};
 
 use num_traits::ToPrimitive;
 use snafu::ResultExt;
 
 use super::{
-    file_crc_source_len, Reader, RecordDataType, FILE_FOOTER_LEN, FILE_MAGIC_NUMBER,
+    file_crc_source_len, reader, RecordDataType, FILE_FOOTER_LEN, FILE_MAGIC_NUMBER,
     FILE_MAGIC_NUMBER_LEN, RECORD_MAGIC_NUMBER,
 };
-use crate::error::{self, Error, Result};
-use crate::file_system::file::cursor::FileCursor;
-use crate::file_system::file::IFile;
-use crate::file_system::file_manager;
+use crate::error::{
+    self, IOSnafu, InvalidParamSnafu, ReadFileSnafu, TskvError, TskvResult, WriteFileSnafu,
+};
+use crate::file_system::async_filesystem::{LocalFileSystem, LocalFileType};
+use crate::file_system::file::stream_writer::FileStreamWriter;
+use crate::file_system::FileSystem;
 
 pub struct Writer {
     path: PathBuf,
-    cursor: FileCursor,
+    file: Box<FileStreamWriter>,
     footer: Option<[u8; FILE_FOOTER_LEN]>,
-    file_size: u64,
 }
 
 impl Writer {
-    pub async fn open(path: impl AsRef<Path>, _data_type: RecordDataType) -> Result<Self> {
+    pub async fn open(
+        path: impl AsRef<Path>,
+        _data_type: RecordDataType,
+        buf_size: usize,
+    ) -> TskvResult<Self> {
         let path = path.as_ref();
-        let mut cursor: FileCursor = file_manager::open_create_file(path).await?.into();
-        let mut file_size = 0_u64;
-        let footer = if cursor.is_empty() {
+        let file_system = LocalFileSystem::new(LocalFileType::ThreadPool);
+        let mut file = file_system
+            .open_file_writer(path, buf_size)
+            .await
+            .map_err(|e| TskvError::FileSystemError { source: e })?;
+        if file.is_empty() {
             // For new file, write file magic number, next write is at 4.
-            file_size += cursor
-                .write(&FILE_MAGIC_NUMBER.to_be_bytes())
+            file.write(&FILE_MAGIC_NUMBER.to_be_bytes())
                 .await
-                .context(error::IOSnafu)? as u64;
-            // Get none as footer data.
-            None
+                .context(error::IOSnafu)?;
+            Ok(Writer {
+                path: path.to_path_buf(),
+                file,
+                footer: None,
+            })
         } else {
-            let footer_data = match Reader::read_footer(path).await {
+            let footer = match reader::read_footer(&path).await {
                 Ok((_, f)) => Some(f),
-                Err(Error::NoFooter) => None,
-                Err(e) => return Err(e),
+                Err(TskvError::NoFooter) => None,
+                Err(e) => {
+                    trace::error!(
+                        "Failed to read footer of record_file '{}': {e}",
+                        path.display()
+                    );
+                    return Err(e);
+                }
             };
 
-            // For writed file, skip to footer position, next write is at (file.len() - footer_len).
+            // For wrote file, skip to footer position, next write is at (file.len() - footer_len).
             // Note that footer_len may be zero.
-            let seek_pos_end = footer_data.map(|f| f.len()).unwrap_or(0);
-            // TODO: truncate this file using seek_pos_end.
-            cursor
-                .seek(SeekFrom::End(-(seek_pos_end as i64)))
-                .context(error::IOSnafu)?;
+            let footer_len = footer.map(|f| f.len()).unwrap_or(0);
+            // Truncate this file to overwrite footer data.
+            let file_size = file
+                .len()
+                .checked_sub(footer_len)
+                .unwrap_or(FILE_MAGIC_NUMBER_LEN);
+            file.truncate(file_size).await.context(IOSnafu)?;
 
-            footer_data
-        };
-        Ok(Writer {
-            path: path.to_path_buf(),
-            cursor,
-            footer,
-            file_size,
-        })
+            Ok(Writer {
+                path: path.to_path_buf(),
+                file,
+                footer,
+            })
+        }
     }
 
     // Writes record data and returns the written data size.
-    pub async fn write_record(
+    pub async fn write_record<R, D>(
         &mut self,
         data_version: u8,
         data_type: u8,
-        data: &[&[u8]],
-    ) -> Result<usize> {
-        let data_len: usize = data.iter().map(|d| (*d).len()).sum();
+        data: R,
+    ) -> TskvResult<usize>
+    where
+        D: AsRef<[u8]>,
+        R: AsRef<[D]>,
+    {
+        let data = data.as_ref();
+        let data_len: usize = data.iter().map(|d| d.as_ref().len()).sum();
         let data_len = match data_len.to_u32() {
             Some(v) => v,
             None => {
-                return Err(Error::InvalidParam {
+                return Err(InvalidParamSnafu {
                     reason: format!(
                         "record(type: {}) length ({}) is not a valid u32, ignore this record",
                         data_type,
                         data.len()
                     ),
-                });
+                }
+                .build());
             }
         };
 
@@ -86,7 +108,7 @@ impl Writer {
         let data_len = data_len.to_be_bytes();
         hasher.update(&data_len);
         for d in data.iter() {
-            hasher.update(d);
+            hasher.update(d.as_ref());
         }
         let data_crc = hasher.finalize().to_be_bytes();
 
@@ -97,121 +119,151 @@ impl Writer {
         write_buf.push(IoSlice::new(&data_len));
         write_buf.push(IoSlice::new(&data_crc));
         for d in data {
-            write_buf.push(IoSlice::new(d));
+            write_buf.push(IoSlice::new(d.as_ref()));
         }
 
         // Write record header and record data.
-        let written_size =
-            self.cursor
-                .write_vec(&mut write_buf)
-                .await
-                .context(error::WriteFileSnafu {
-                    path: self.path.clone(),
-                })?;
-        self.file_size += written_size as u64;
+        let written_size = self
+            .file
+            .write_vec(&write_buf)
+            .await
+            .context(WriteFileSnafu {
+                path: self.path.clone(),
+            })?;
         Ok(written_size)
     }
 
-    pub async fn write_footer(&mut self, mut footer: [u8; FILE_FOOTER_LEN]) -> Result<usize> {
+    pub async fn write_footer(&mut self, footer: &mut [u8; FILE_FOOTER_LEN]) -> TskvResult<usize> {
         self.sync().await?;
 
         // Get file crc
-        let mut buf = vec![0_u8; file_crc_source_len(self.file_size(), 0_usize)];
-        self.cursor
-            .read_at(FILE_MAGIC_NUMBER_LEN as u64, &mut buf)
+        let mut buf = vec![0_u8; file_crc_source_len(self.file.len(), 0)];
+        let file_system = LocalFileSystem::new(LocalFileType::ThreadPool);
+        let file = file_system
+            .open_file_reader(&self.path)
             .await
-            .context(error::ReadFileSnafu {
+            .map_err(|e| TskvError::FileSystemError { source: e })?;
+        file.read_at(FILE_MAGIC_NUMBER_LEN, &mut buf)
+            .await
+            .context(ReadFileSnafu {
                 path: self.path.clone(),
             })?;
         let crc = crc32fast::hash(&buf);
 
         // Set file crc to footer
         footer[4..8].copy_from_slice(&crc.to_be_bytes());
-        self.footer = Some(footer);
+        self.footer = Some(*footer);
 
-        self.cursor
-            .write(&footer)
-            .await
-            .context(error::WriteFileSnafu {
-                path: self.path.clone(),
-            })
+        let written_size = self.file.write(footer).await.context(WriteFileSnafu {
+            path: self.path.clone(),
+        })?;
+        // Only add file_size, does not add pos
+        Ok(written_size)
+    }
+
+    pub async fn truncate(&mut self, size: u64) -> TskvResult<()> {
+        self.file.truncate(size as usize).await.context(IOSnafu)?;
+
+        Ok(())
+    }
+
+    pub async fn sync(&mut self) -> TskvResult<()> {
+        self.file.flush().await.context(error::SyncFileSnafu)
+    }
+
+    pub async fn close(&mut self) -> TskvResult<()> {
+        self.sync().await
+    }
+
+    pub async fn new_reader(&mut self) -> TskvResult<reader::Reader> {
+        self.file.flush().await.context(error::SyncFileSnafu)?;
+        if let Some(r) = self.file.shared_file() {
+            let len = r.len();
+            return Ok(reader::Reader::new(
+                r,
+                self.path.clone(),
+                len as u64,
+                self.footer,
+            ));
+        }
+        Err(InvalidParamSnafu {
+            reason: "file is not shared file reader".to_string(),
+        }
+        .build())
+    }
+
+    pub fn path(&self) -> PathBuf {
+        self.path.clone()
     }
 
     pub fn footer(&self) -> Option<[u8; FILE_FOOTER_LEN]> {
         self.footer
     }
 
-    pub async fn sync(&self) -> Result<()> {
-        self.cursor.sync_data().await.context(error::SyncFileSnafu)
-    }
-
-    pub async fn close(&mut self) -> Result<()> {
-        self.sync().await
-    }
-
     pub fn file_size(&self) -> u64 {
-        self.file_size
-    }
-
-    pub fn path(&self) -> PathBuf {
-        self.path.clone()
+        self.file.len() as u64
     }
 }
 
 #[cfg(test)]
-mod test {
-
-    use serial_test::serial;
+pub(crate) mod test {
+    use std::path::PathBuf;
 
     use super::Writer;
-    use crate::error::Result;
-    use crate::file_system::file_manager;
-    use crate::record_file::reader::test::{test_reader, test_reader_read_one};
-    use crate::record_file::{RecordDataType, FILE_FOOTER_LEN};
+    use crate::record_file::reader::test::assert_record_file_data_eq;
+    use crate::record_file::{
+        RecordDataType, FILE_FOOTER_LEN, RECORD_CRC32_NUMBER_LEN, RECORD_DATA_SIZE_LEN,
+        RECORD_DATA_TYPE_LEN, RECORD_DATA_VERSION_LEN, RECORD_MAGIC_NUMBER_LEN,
+    };
 
-    #[tokio::test]
-    #[serial]
-    async fn test_writer() -> Result<()> {
-        let path = "/tmp/test/record_file/1/test.log";
-        if file_manager::try_exists(path) {
-            std::fs::remove_file(path).unwrap();
-        }
-        let mut w = Writer::open(&path, RecordDataType::Summary).await.unwrap();
-        let data_vec = vec![b"hello".to_vec(); 10];
-        for d in data_vec.iter() {
-            let size = w.write_record(1, 1, &[d.as_slice()]).await?;
-            println!("Writed new record(1, 1, {:?}) {} bytes", d, size);
-        }
-        w.write_footer([0_u8; FILE_FOOTER_LEN]).await?;
-        w.close().await?;
+    const TEST_SUMMARY_BUFFER_SIZE: usize = 1024 * 1024;
 
-        println!("Testing read one record.");
-        test_reader_read_one(&path, 23, b"hello").await;
-        println!("Testing read all record.");
-        test_reader(&path, &data_vec).await;
-        Ok(())
+    pub(crate) fn record_length(data_len: usize) -> usize {
+        RECORD_MAGIC_NUMBER_LEN
+            + RECORD_DATA_VERSION_LEN
+            + RECORD_DATA_TYPE_LEN
+            + RECORD_DATA_SIZE_LEN
+            + RECORD_CRC32_NUMBER_LEN
+            + data_len
     }
 
     #[tokio::test]
-    #[serial]
-    async fn test_writer_truncated() -> Result<()> {
-        let path = "/tmp/test/record_file/2/test.log";
-        if file_manager::try_exists(path) {
-            std::fs::remove_file(path).unwrap();
-        }
-        let mut w = Writer::open(&path, RecordDataType::Summary).await.unwrap();
-        let data_vec = vec![b"hello".to_vec(); 10];
-        for d in data_vec.iter() {
-            let size = w.write_record(1, 1, &[d.as_slice()]).await?;
-            println!("Writed new record(1, 1, {:?}) {} bytes", d, size);
-        }
-        // Do not write footer.
-        w.close().await?;
+    async fn test_record_writer() {
+        let dir = PathBuf::from("/tmp/test/record_file/writer/1");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
 
-        println!("Testing read one record.");
-        test_reader_read_one(&path, 23, b"hello").await;
-        println!("Testing read all record.");
-        test_reader(&path, &data_vec).await;
-        Ok(())
+        let records = vec![[b"hello".to_vec(), b" ".to_vec(), b"world".to_vec()]; 10];
+        let mut footer = [0_u8; FILE_FOOTER_LEN];
+        {
+            // Test write a record file with footer.
+            let path = dir.join("has_footer.log");
+
+            let mut writer = Writer::open(&path, RecordDataType::Summary, TEST_SUMMARY_BUFFER_SIZE)
+                .await
+                .unwrap();
+            for data in records.iter() {
+                let data_size = writer.write_record(1, 1, data).await.unwrap();
+                assert_eq!(data_size, record_length(11));
+            }
+            let footer_size = writer.write_footer(&mut footer).await.unwrap();
+            assert_eq!(footer_size, FILE_FOOTER_LEN);
+            writer.close().await.unwrap();
+            assert_record_file_data_eq(&path, &records, true).await;
+        }
+        {
+            // Test write a record file that has no footer.
+            let path = dir.join("no_footer.log");
+
+            let mut writer = Writer::open(&path, RecordDataType::Summary, TEST_SUMMARY_BUFFER_SIZE)
+                .await
+                .unwrap();
+            for data in records.iter() {
+                let data_size = writer.write_record(1, 1, data).await.unwrap();
+                assert_eq!(data_size, record_length(11));
+            }
+            writer.close().await.unwrap();
+            assert_record_file_data_eq(&path, &records, false).await;
+        }
     }
 }

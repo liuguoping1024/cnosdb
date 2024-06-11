@@ -6,7 +6,7 @@
   <a href="https://github.com/cnosdb/cnosdb/actions">
   <img alt="CI" src="https://github.com/cnosdb/cnosdb/actions/workflows/makefile.yml/badge.svg" />
   </a>
-
+  
   <a href="https://www.rust-lang.org/">
   <img alt="Rust" src="https://img.shields.io/badge/Language-Rust-blue.svg" />
   </a>
@@ -23,14 +23,23 @@
   <img alt="linkedin" src="https://img.shields.io/badge/linkedin--white.svg?logo=linkedin&style=social" />
   </a>
 </p>
-
+<p align="center">
+  <a class="discord-widget" href="https://discord.com/invite/D8cB4WGpP4" title="Join us on Discord">
+    <img src="https://discordapp.com/api/guilds/1104023581194715229/embed.png">
+  </a>
+</p>
 <h3 align="center">
+    <a href="https://www.cnosdb.cloud/">CnosDB Cloud</a>
+    •
     <a href="https://www.cnosdb.com/">Website</a>
     •
     <a href="https://docs.cnosdb.com/">Documentation</a>
     •
-    <a href="https://docs.cnosdb.com/en/quick_start.html">Quick Start</a>
+    <a href="https://docs.cnosdb.com/en/latest/start/quick_start.html">Quick Start</a>
+    •
+    <a href="https://docs.cnosdb.com/en/eco-integration">Eco-Integration</a>
 </h3>
+
 
 English | [简体中文](./README_CN.md)
 
@@ -41,6 +50,8 @@ In its design, we fully utilize the characteristics of time-series data, includi
 - **High performance**: CnosDB addresses the issue of time-series data expansion and theoretically supports unlimited time-series data. It supports aggregate queries along the timeline, including queries divided by equal intervals, queries divided by enumeration values of a column, and queries divided by the length of the time interval between adjacent time-series records. It also has caching capabilities for the latest data and the cache space can be configured for fast access to the latest data.
 - **Easy to use**: CnosDB provides clear and simple interfaces, easy configuration options, standard SQL support, seamless integration with third-party tools, and convenient data access functions. It supports schema-less writing mode and supports historical data supplement(including out of order writing).
 - **Cloud native**: CnosDB has a native distributed design, data sharding and partitioning, separation of storage and computing, Quorum mechanism, Kubernetes deployment and complete observability, ensuring final consistency. It can be deployed in public clouds, private clouds, and hybrid clouds. t also supports multi-tenancy and has role-based permission control. The computing and storage nodes support horizontal scaling.
+
+  **CnosDB Cloud is now live, [click here](https://www.cnosdb.cloud/) to get started now.**
 
 # Architecture
 
@@ -101,6 +112,19 @@ $ cmake -G "Xcode" -DCMAKE_BUILD_TYPE=Release
 $ sudo make install
 ```
 
+4. Install Protobuf
+
+```shell
+# Arch Linux
+pacman -S protobuf
+# Fedora
+dnf install protobuf
+# Ubuntu
+snap install protobuf
+# macOS
+brew install protobuf
+```
+
 ### **Compile**
 
 ```shell
@@ -112,7 +136,7 @@ make build
 
 #### Run CnosDB
 
-The following is a single node startup. If you need to start a cluster, see [Start a CnosDB Cluster](https://docs.cnosdb.com/en/latest/deploy/install.html#start-a-cnosdb-cluster)
+The following is a single node startup. If you need to start a cluster, see the [Deploy](https://docs.cnosdb.com/en/docs/deploy/) section.
 
 ```bash
 ./target/debug/cnosdb run -M singleton --config ./config/config.toml
@@ -149,7 +173,7 @@ cnosdb-cli
 - [SQL](https://docs.cnosdb.com/en/latest/reference/sql.html#insert)
 - [influxdb line-protocol](https://docs.influxdata.com/influxdb/v2.6/reference/syntax/line-protocol/)
 - [bulk loading](https://docs.cnosdb.com/en/latest/develop/write.html#load-data)
-- [telegraf](https://docs.cnosdb.com/en/latest/versatility/collect/telegraf.html)
+- [telegraf](https://docs.cnosdb.com/en/eco-integration/telegraf)
 
 The following will show an example of using cli to write data by SQL
 
@@ -215,7 +239,7 @@ Query took 0.038 seconds.
 ## Query data
 
 - [SQL](https://docs.cnosdb.com/en/latest/reference/sql.html), compatible with SQL standard.
-- [Prometheus remote read](https://docs.cnosdb.com/en/latest/versatility/collect/prometheus.html#remote-read).
+- [Prometheus remote read](https://docs.cnosdb.com/en/eco-integration/prometheus#remote-read).
 
 The following will show an example of SQL query using cli
 
@@ -258,12 +282,15 @@ Please refer to the "Connector" section in the documentation for the above examp
 
 # Join the community
 
-All developers/users who love time series databases are welcome to participate in the CnosDB User Group. Scan the QR
-code below and add CC to join the group.
+Welcome to join our developer community at discord: 
+  
+  https://discord.com/invite/D8cB4WGpP4
 
-Please check [Instructions for joining the group](./docs/guidelines/CnosDBWeChatUserGroupGuidelines.md) beforehand.
-
-<img src="docs/source/_static/img/u.jpg" width="300" alt=""/>
+<p align="left">
+  <a class="discord-widget" href="https://discord.com/invite/D8cB4WGpP4" title="Join us on Discord">
+    <img src="https://discordapp.com/api/guilds/1104023581194715229/embed.png?style=banner1">
+  </a>
+</p>
 
 ## Contributing
 
@@ -275,3 +302,5 @@ Please refer to [Contribution Guide](./CONTRIBUTING_EN.md) to contribute to Cnos
 - CnosDB 2.0's query engine is powered by [Apache Arrow DataFusion](https://github.com/apache/arrow-datafusion).
 - CnosDB 2.0's bug detection is powered by [SQLancer](https://github.com/sqlancer/sqlancer).
 - CnosDB 2.0's integration test framework is powered by [sqllogictest-rs](https://github.com/risinglightdb/sqllogictest-rs).
+- CnosDB 2.0 combining [LangChain](https://github.com/hwchase17/langchain) to realize the natural language to communicate with the database。
+

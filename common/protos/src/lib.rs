@@ -1,15 +1,23 @@
 mod generated;
-pub mod prompb;
-use crate::models::{
-    Field, FieldBuilder, FieldType, Points, Schema, SchemaBuilder, Table, Tag, TagBuilder,
-};
-use flatbuffers::{FlatBufferBuilder, WIPOffset};
 pub use generated::*;
-use snafu::Snafu;
-use std::collections::HashMap;
-use utils::bitset::BitSet;
-
+use tonic::codec::CompressionEncoding;
 pub mod models_helper;
+pub mod prompb;
+pub mod test_helper;
+
+use std::fmt::{Display, Formatter};
+use std::time::Duration;
+
+use crate::kv_service::tskv_service_client::TskvServiceClient;
+use crate::models::{Column, Points, Table};
+use crate::raft_service::raft_service_client::RaftServiceClient;
+use flatbuffers::{ForwardsUOffset, Vector};
+use snafu::{Backtrace, Location, OptionExt, Snafu};
+use tonic::transport::Channel;
+use tower::timeout::Timeout;
+
+// Default 100 MB
+pub const DEFAULT_GRPC_SERVER_MESSAGE_LEN: usize = 100 * 1024 * 1024;
 
 type PointsResult<T> = Result<T, PointsError>;
 
@@ -17,7 +25,59 @@ type PointsResult<T> = Result<T, PointsError>;
 #[snafu(visibility(pub))]
 pub enum PointsError {
     #[snafu(display("{}", msg))]
-    Points { msg: String },
+    Points {
+        msg: String,
+        location: Location,
+        backtrace: Backtrace,
+    },
+
+    #[snafu(display("Flatbuffers 'Points' missing database name (db)"))]
+    PointsMissingDatabaseName {
+        location: Location,
+        backtrace: Backtrace,
+    },
+
+    #[snafu(display("Flatbuffers 'Points' missing tables data (tables)"))]
+    PointsMissingTables {
+        location: Location,
+        backtrace: Backtrace,
+    },
+
+    #[snafu(display("Flatbuffers 'Table' missing table name (tab)"))]
+    TableMissingName {
+        location: Location,
+        backtrace: Backtrace,
+    },
+
+    #[snafu(display("Flatbuffers 'Table' missing points data (points)"))]
+    TableMissingColumns {
+        location: Location,
+        backtrace: Backtrace,
+    },
+
+    #[snafu(display("Flatbuffers 'Point' missing tags data (tags)"))]
+    PointMissingTags {
+        location: Location,
+        backtrace: Backtrace,
+    },
+
+    #[snafu(display("Flatbuffers 'Column' missing values"))]
+    ColumnMissingValues {
+        location: Location,
+        backtrace: Backtrace,
+    },
+
+    #[snafu(display("Flatbuffers 'Column' missing names"))]
+    ColumnMissingNames {
+        location: Location,
+        backtrace: Backtrace,
+    },
+
+    #[snafu(display("Flatbuffers 'Column' missing nullbits"))]
+    ColumnMissingNullbits {
+        location: Location,
+        backtrace: Backtrace,
+    },
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -29,243 +89,317 @@ pub enum FieldValue {
     Bool(bool),
 }
 
-pub fn fb_table_name(table: &Table) -> PointsResult<String> {
-    unsafe {
-        Ok(String::from_utf8_unchecked(
-            table
-                .tab()
-                .ok_or(PointsError::Points {
-                    msg: "table missing table name in point".to_string(),
-                })?
-                .bytes()
-                .into(),
-        ))
+impl<'a> Points<'a> {
+    pub fn db_ext(&'a self) -> PointsResult<&'a str> {
+        self.db().context(PointsMissingDatabaseNameSnafu)
+    }
+
+    pub fn tables_iter_ext(&'a self) -> PointsResult<impl Iterator<Item = Table<'a>>> {
+        Ok(self.tables().context(PointsMissingTablesSnafu)?.iter())
     }
 }
 
-pub fn schema_tag_name<'a>(schema: &'a Schema) -> PointsResult<Vec<&'a str>> {
-    Ok(schema
-        .tag_name()
-        .unwrap_or_default()
-        .iter()
-        .collect::<Vec<_>>())
-}
+impl<'a> Table<'a> {
+    pub fn tab_ext(&'a self) -> PointsResult<&'a str> {
+        let name = self.tab().context(TableMissingNameSnafu)?;
+        Ok(name)
+    }
 
-pub fn schema_field_name<'a>(schema: &'a Schema) -> PointsResult<Vec<&'a str>> {
-    Ok(schema
-        .field_name()
-        .unwrap_or_default()
-        .iter()
-        .collect::<Vec<_>>())
-}
-
-pub fn schema_field_type(schema: &Schema) -> PointsResult<Vec<FieldType>> {
-    Ok(schema
-        .field_type()
-        .unwrap_or_default()
-        .iter()
-        .collect::<Vec<_>>())
-}
-
-pub fn get_db_from_fb_points(fb_points: &Points) -> PointsResult<String> {
-    unsafe {
-        Ok(String::from_utf8_unchecked(
-            fb_points
-                .db()
-                .ok_or(PointsError::Points {
-                    msg: "write point miss database name".to_string(),
-                })?
-                .bytes()
-                .into(),
-        ))
+    pub fn columns_iter_ext(&'a self) -> PointsResult<impl Iterator<Item = Column<'a>>> {
+        Ok(self.columns().context(TableMissingColumnsSnafu)?.iter())
     }
 }
 
-#[derive(Default)]
-pub struct FbSchema<'a> {
-    tag_name: HashMap<&'a str, usize>,
-    field: HashMap<&'a str, usize>,
-    field_type: Vec<FieldType>,
+impl<'a> Column<'a> {
+    pub fn name_ext(&'a self) -> PointsResult<&'a str> {
+        let name = self.name().context(ColumnMissingNamesSnafu)?;
+        Ok(name)
+    }
+
+    pub fn nullbit_ext(&self) -> PointsResult<Vector<u8>> {
+        let nullbit = self.nullbits().context(ColumnMissingNullbitsSnafu)?;
+        Ok(nullbit)
+    }
+
+    pub fn string_values_len(&self) -> PointsResult<usize> {
+        let len = self
+            .col_values()
+            .context(ColumnMissingValuesSnafu)?
+            .string_value()
+            .map(|v| v.len())
+            .unwrap_or(0);
+        Ok(len)
+    }
+
+    pub fn string_values(&self) -> PointsResult<Vector<ForwardsUOffset<&str>>> {
+        let values = self
+            .col_values()
+            .context(ColumnMissingValuesSnafu)?
+            .string_value()
+            .unwrap_or_default();
+        Ok(values)
+    }
+
+    pub fn bool_values_len(&self) -> PointsResult<usize> {
+        let len = self
+            .col_values()
+            .context(ColumnMissingValuesSnafu)?
+            .bool_value()
+            .map(|v| v.len())
+            .unwrap_or(0);
+        Ok(len)
+    }
+
+    pub fn bool_values(&self) -> PointsResult<Vector<bool>> {
+        let values = self
+            .col_values()
+            .context(ColumnMissingValuesSnafu)?
+            .bool_value()
+            .unwrap_or_default();
+        Ok(values)
+    }
+
+    pub fn int_values_len(&self) -> PointsResult<usize> {
+        let len = self
+            .col_values()
+            .context(ColumnMissingValuesSnafu)?
+            .int_value()
+            .map(|v| v.len())
+            .unwrap_or(0);
+        Ok(len)
+    }
+
+    pub fn int_values(&self) -> PointsResult<Vector<i64>> {
+        let values = self
+            .col_values()
+            .context(ColumnMissingValuesSnafu)?
+            .int_value()
+            .unwrap_or_default();
+        Ok(values)
+    }
+
+    pub fn float_values_len(&self) -> PointsResult<usize> {
+        let len = self
+            .col_values()
+            .context(ColumnMissingValuesSnafu)?
+            .float_value()
+            .map(|v| v.len())
+            .unwrap_or(0);
+        Ok(len)
+    }
+
+    pub fn float_values(&self) -> PointsResult<Vector<f64>> {
+        let values = self
+            .col_values()
+            .context(ColumnMissingValuesSnafu)?
+            .float_value()
+            .unwrap_or_default();
+        Ok(values)
+    }
+
+    pub fn uint_values_len(&self) -> PointsResult<usize> {
+        let len = self
+            .col_values()
+            .context(ColumnMissingValuesSnafu)?
+            .uint_value()
+            .map(|v| v.len())
+            .unwrap_or(0);
+        Ok(len)
+    }
+
+    pub fn uint_values(&self) -> PointsResult<Vector<u64>> {
+        let values = self
+            .col_values()
+            .context(ColumnMissingValuesSnafu)?
+            .uint_value()
+            .unwrap_or_default();
+        Ok(values)
+    }
 }
 
-impl<'a> FbSchema<'a> {
-    pub fn new(
-        tag_name: HashMap<&'a str, usize>,
-        field: HashMap<&'a str, usize>,
-        field_type: Vec<FieldType>,
-    ) -> Self {
-        Self {
-            tag_name,
-            field,
-            field_type,
-        }
-    }
-
-    pub fn add_tag(&mut self, tag_key: &'a str) {
-        let len = self.tag_name.len();
-        self.tag_name.entry(tag_key).or_insert(len);
-    }
-
-    pub fn add_field(&mut self, field_key: &'a str, field_type: FieldType) {
-        self.field.entry(field_key).or_insert_with(|| {
-            self.field_type.push(field_type);
-            self.field_type.len() - 1
-        });
-    }
-
-    pub fn tag_len(&self) -> usize {
-        self.tag_name.len()
-    }
-
-    pub fn field_len(&self) -> usize {
-        self.field.len()
-    }
-
-    pub fn tag_names(&self) -> &HashMap<&str, usize> {
-        &self.tag_name
-    }
-
-    pub fn field(&self) -> &HashMap<&str, usize> {
-        &self.field
-    }
-
-    pub fn field_type(&self) -> &[FieldType] {
-        &self.field_type
-    }
-}
-
-pub fn init_tags<'fbb: 'mut_fbb, 'mut_fbb>(
-    fbb: &'mut_fbb mut FlatBufferBuilder<'fbb>,
-    tags: &mut Vec<WIPOffset<Tag<'fbb>>>,
-    len: usize,
-) {
-    for _ in 0..len {
-        let fbv = fbb.create_vector("".as_bytes());
-        let mut tag_builder = TagBuilder::new(fbb);
-        tag_builder.add_value(fbv);
-
-        tags.push(tag_builder.finish());
-    }
-}
-
-pub fn init_fields<'fbb: 'mut_fbb, 'mut_fbb>(
-    fbb: &'mut_fbb mut FlatBufferBuilder<'fbb>,
-    fields: &mut Vec<WIPOffset<Field<'fbb>>>,
-    len: usize,
-) {
-    for _ in 0..len {
-        let fbv = fbb.create_vector("".as_bytes());
-        let mut field_builder = FieldBuilder::new(fbb);
-        field_builder.add_value(fbv);
-
-        fields.push(field_builder.finish());
-    }
-}
-
-pub fn build_fb_schema_offset<'fbb>(
-    fbb: &mut FlatBufferBuilder<'fbb>,
-    schema: &FbSchema,
-) -> WIPOffset<Schema<'fbb>> {
-    let mut tags_name = schema.tag_names().iter().collect::<Vec<_>>();
-    tags_name.sort_by(|a, b| a.1.cmp(b.1));
-    let tags_name = tags_name
-        .iter()
-        .map(|item| fbb.create_string(item.0))
-        .collect::<Vec<_>>();
-
-    let mut fields_name = schema.field().iter().collect::<Vec<_>>();
-    fields_name.sort_by(|a, b| a.1.cmp(b.1));
-    let fields_name = fields_name
-        .iter()
-        .map(|item| fbb.create_string(item.0))
-        .collect::<Vec<_>>();
-
-    let tags_name = fbb.create_vector(&tags_name);
-    let fields_name = fbb.create_vector(&fields_name);
-    let field_type = fbb.create_vector(schema.field_type());
-
-    let mut schema_builder = SchemaBuilder::new(fbb);
-    schema_builder.add_tag_name(tags_name);
-    schema_builder.add_field_name(fields_name);
-    schema_builder.add_field_type(field_type);
-
-    schema_builder.finish()
-}
-
-pub fn init_tags_and_nullbits<'a, 'fbb: 'mut_fbb, 'mut_fbb>(
-    fbb: &'mut_fbb mut FlatBufferBuilder<'fbb>,
-    schema: &'a FbSchema<'a>,
-) -> (Vec<WIPOffset<Tag<'fbb>>>, BitSet) {
-    let mut tags = Vec::with_capacity(schema.tag_names().len());
-    init_tags(fbb, &mut tags, schema.tag_names().len());
-
-    let tags_nullbit = BitSet::with_size(schema.tag_names().len());
-    (tags, tags_nullbit)
-}
-
-pub fn init_fields_and_nullbits<'a, 'fbb: 'mut_fbb, 'mut_fbb>(
-    fbb: &'mut_fbb mut FlatBufferBuilder<'fbb>,
-    schema: &'a FbSchema,
-) -> (Vec<WIPOffset<Field<'fbb>>>, BitSet) {
-    let mut fields = Vec::with_capacity(schema.field().len());
-    init_fields(fbb, &mut fields, schema.field().len());
-
-    let fields_nullbits = BitSet::with_size(schema.field().len());
-    (fields, fields_nullbits)
-}
-
-pub fn insert_tag<'a, 'fbb: 'mut_fbb, 'mut_fbb>(
-    fbb: &'mut_fbb mut FlatBufferBuilder<'fbb>,
-    tags: &mut [WIPOffset<Tag<'fbb>>],
-    tag_nullbits: &'a mut BitSet,
-    schema: &'a FbSchema,
-    tag_key: &str,
-    tag_value: &str,
-) {
-    let tag_index = match schema.tag_names().get(tag_key) {
-        None => return,
-        Some(v) => *v,
-    };
-
-    let tag_value = fbb.create_vector(tag_value.as_bytes());
-
-    let mut tag_builder = TagBuilder::new(fbb);
-    tag_builder.add_value(tag_value);
-    tags[tag_index] = tag_builder.finish();
-
-    tag_nullbits.set(tag_index);
-}
-
-pub fn insert_field<'a, 'fbb: 'mut_fbb, 'mut_fbb>(
-    fbb: &'mut_fbb mut FlatBufferBuilder<'fbb>,
-    fields: &mut [WIPOffset<Field<'fbb>>],
-    field_nullbits: &'a mut BitSet,
-    schema: &'a FbSchema,
-    field_key: &str,
-    field_value: &FieldValue,
-) {
-    let field_index = match schema.field().get(field_key) {
-        None => return,
-        Some(v) => *v,
-    };
-
-    let field_value = match field_value {
-        FieldValue::U64(field_val) => fbb.create_vector(&field_val.to_be_bytes()),
-        FieldValue::I64(field_val) => fbb.create_vector(&field_val.to_be_bytes()),
-        FieldValue::Str(field_val) => fbb.create_vector(field_val),
-        FieldValue::F64(field_val) => fbb.create_vector(&field_val.to_be_bytes()),
-        FieldValue::Bool(field_val) => {
-            if *field_val {
-                fbb.create_vector(&[1_u8][..])
-            } else {
-                fbb.create_vector(&[0_u8][..])
+impl<'a> Display for Points<'a> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "==============================")?;
+        writeln!(f, "Database: {}", self.db_ext().unwrap_or("{!BAD_DB_NAME}"))?;
+        writeln!(f, "------------------------------")?;
+        match self.tables_iter_ext() {
+            Ok(tables) => {
+                for table in tables {
+                    write!(
+                        f,
+                        "Table: {}",
+                        table.tab_ext().unwrap_or("{!BAD_TABLE_NAME}")
+                    )?;
+                    writeln!(f, "{}", table)?;
+                    writeln!(f, "------------------------------")?;
+                }
+            }
+            Err(_) => {
+                writeln!(f, "No tables")?;
             }
         }
-    };
 
-    let mut field_builder = FieldBuilder::new(fbb);
-    field_builder.add_value(field_value);
-    fields[field_index] = field_builder.finish();
+        Ok(())
+    }
+}
 
-    field_nullbits.set(field_index);
+impl<'a> Display for Table<'a> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let columns = match self.columns_iter_ext() {
+            Ok(p) => p,
+            Err(_) => {
+                writeln!(f, "{{!BAD_TABLE_POINTS}}")?;
+                return Ok(());
+            }
+        };
+        for column in columns {
+            write!(
+                f,
+                "\nColumn: {}",
+                column.name_ext().unwrap_or("{!BAD_COLUMN_NAME}")
+            )?;
+            writeln!(f, "\nColumn Type: {:?}", column.column_type())?;
+            writeln!(f, "\nField Type: {:?}", column.field_type())?;
+            writeln!(f, "\nColumn Value: {:?}", column.col_values())?;
+            writeln!(f, "\nNullBits: {:?}", column.nullbit_ext())?;
+        }
+        Ok(())
+    }
+}
+
+pub fn tskv_service_time_out_client(
+    channel: Channel,
+    time_out: Duration,
+    max_message_size: usize,
+    grpc_enable_gzip: bool,
+) -> TskvServiceClient<Timeout<Channel>> {
+    let timeout_channel = Timeout::new(channel, time_out);
+    let client = TskvServiceClient::<Timeout<Channel>>::new(timeout_channel);
+    let client = TskvServiceClient::max_decoding_message_size(client, max_message_size);
+    if grpc_enable_gzip {
+        TskvServiceClient::max_encoding_message_size(client, max_message_size)
+            .accept_compressed(CompressionEncoding::Gzip)
+            .send_compressed(CompressionEncoding::Gzip)
+    } else {
+        TskvServiceClient::max_encoding_message_size(client, max_message_size)
+    }
+}
+
+pub fn raft_service_time_out_client(
+    channel: Channel,
+    time_out: Duration,
+    max_message_size: usize,
+    grpc_enable_gzip: bool,
+) -> RaftServiceClient<Timeout<Channel>> {
+    let timeout_channel = Timeout::new(channel, time_out);
+    let client = RaftServiceClient::<Timeout<Channel>>::new(timeout_channel);
+    let client = RaftServiceClient::max_decoding_message_size(client, max_message_size);
+    if grpc_enable_gzip {
+        RaftServiceClient::max_encoding_message_size(client, max_message_size)
+            .accept_compressed(CompressionEncoding::Gzip)
+            .send_compressed(CompressionEncoding::Gzip)
+    } else {
+        RaftServiceClient::max_encoding_message_size(client, max_message_size)
+    }
+}
+
+#[cfg(test)]
+pub mod test {
+    use flatbuffers::FlatBufferBuilder;
+    use std::collections::HashMap;
+
+    use crate::models::{FieldType, Points};
+    use crate::models_helper::create_const_points;
+
+    #[test]
+    #[ignore = "Checked by human"]
+    fn test_format_fb_model_points() {
+        let mut fbb = FlatBufferBuilder::new();
+        let points = create_const_points(
+            &mut fbb,
+            "test_database",
+            "test_table",
+            vec![("ta", "1111"), ("tb", "22222")],
+            vec![
+                ("i1", 2_i64.to_be_bytes().as_slice()),
+                ("f2", 2.0_f64.to_be_bytes().as_slice()),
+                ("s3", "111111".as_bytes()),
+            ],
+            HashMap::from([
+                ("i1", FieldType::Integer),
+                ("f2", FieldType::Float),
+                ("s3", FieldType::String),
+            ]),
+            0,
+            10,
+        );
+        fbb.finish(points, None);
+        let points_bytes = fbb.finished_data().to_vec();
+        let fb_points = flatbuffers::root::<Points>(&points_bytes).unwrap();
+        let fb_points_str = format!("{fb_points}");
+        // println!("{fb_points}");
+        assert_eq!(
+            &fb_points_str,
+            r#"==============================
+Database: test_database
+------------------------------
+Table: test_table
+Column: ta
+Column Type: Tag
+
+Field Type: String
+
+Column Value: Some(Values { float_value: None, int_value: None, uint_value: None, bool_value: None, string_value: Some(["1111", "1111", "1111", "1111", "1111", "1111", "1111", "1111", "1111", "1111"]) })
+
+NullBits: Ok([255, 3])
+
+Column: tb
+Column Type: Tag
+
+Field Type: String
+
+Column Value: Some(Values { float_value: None, int_value: None, uint_value: None, bool_value: None, string_value: Some(["22222", "22222", "22222", "22222", "22222", "22222", "22222", "22222", "22222", "22222"]) })
+
+NullBits: Ok([255, 3])
+
+Column: i1
+Column Type: Field
+
+Field Type: Integer
+
+Column Value: Some(Values { float_value: None, int_value: Some([2, 2, 2, 2, 2, 2, 2, 2, 2, 2]), uint_value: None, bool_value: None, string_value: None })
+
+NullBits: Ok([255, 3])
+
+Column: f2
+Column Type: Field
+
+Field Type: Float
+
+Column Value: Some(Values { float_value: Some([2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0]), int_value: None, uint_value: None, bool_value: None, string_value: None })
+
+NullBits: Ok([255, 3])
+
+Column: s3
+Column Type: Field
+
+Field Type: String
+
+Column Value: Some(Values { float_value: None, int_value: None, uint_value: None, bool_value: None, string_value: Some(["111111", "111111", "111111", "111111", "111111", "111111", "111111", "111111", "111111", "111111"]) })
+
+NullBits: Ok([255, 3])
+
+Column: time
+Column Type: Field
+
+Field Type: Boolean
+
+Column Value: Some(Values { float_value: None, int_value: Some([10, 10, 10, 10, 10, 10, 10, 10, 10, 10]), uint_value: None, bool_value: None, string_value: None })
+
+NullBits: Ok([255, 3])
+
+------------------------------
+"#
+        );
+    }
 }

@@ -1,0 +1,115 @@
+statement ok
+--#DATABASE=cli_precision
+--#precision=us
+
+statement ok
+DROP DATABASE IF EXISTS cli_precision;
+
+statement ok
+CREATE DATABASE cli_precision WITH TTL '100000d' precision 'us';
+
+statement ok
+--#LP_BEGIN
+test1,ta=a1,tb=b1 fa=1,fb=2 1667456411000001
+--#LP_END
+
+statement ok
+--#OPENTSDB_BEGIN
+test2 1667456411000001 1 ta=a1 tb=b1
+--#OPENTSDB_END
+
+statement ok
+--#OPENTSDB_JSON_BEGIN
+[
+    {
+        "metric": "nice",
+        "timestamp": 1667456411000001,
+        "value": 18,
+        "tags": {
+           "host": "web01",
+           "dc": "lga"
+        }
+    },
+    {
+        "metric": "nice",
+        "timestamp": 1667456411000002,
+        "value": 9,
+        "tags": {
+           "host": "web02",
+           "dc": "lga"
+        }
+    }
+]
+--#OPENTSDB_JSON_END
+
+query PTTRR
+select * from test1;
+----
+2022-11-03T06:20:11.000001 "a1" "b1" 1.0 2.0
+
+query PTTR
+select * from test2;
+----
+2022-11-03T06:20:11.000001 "a1" "b1" 1.0
+
+query PTTR
+select * from nice order by host;
+----
+2022-11-03T06:20:11.000001 "lga" "web01" 18.0
+2022-11-03T06:20:11.000002 "lga" "web02" 9.0
+
+statement ok
+drop database cli_precision;
+
+statement ok
+CREATE DATABASE cli_precision WITH TTL '100000d' precision 'ms';
+
+statement ok
+--#LP_BEGIN
+test1,ta=a1,tb=b1 fa=1,fb=2 1667456411000001
+--#LP_END
+
+statement ok
+--#OPENTSDB_BEGIN
+test2 1667456411000001 1 ta=a1 tb=b1
+--#OPENTSDB_END
+
+statement ok
+--#OPENTSDB_JSON_BEGIN
+[
+    {
+        "metric": "nice",
+        "timestamp": 1667456411000001,
+        "value": 18,
+        "tags": {
+           "host": "web01",
+           "dc": "lga"
+        }
+    },
+    {
+        "metric": "nice",
+        "timestamp": 1667456411000002,
+        "value": 9,
+        "tags": {
+           "host": "web02",
+           "dc": "lga"
+        }
+    }
+]
+--#OPENTSDB_JSON_END
+
+query PTTRR
+select * from test1;
+----
+2022-11-03T06:20:11 "a1" "b1" 1.0 2.0
+
+query PTTR
+select * from test2;
+----
+2022-11-03T06:20:11 "a1" "b1" 1.0
+
+query PTTR
+select * from nice order by host;
+----
+2022-11-03T06:20:11 "lga" "web01" 18.0
+2022-11-03T06:20:11 "lga" "web02" 9.0

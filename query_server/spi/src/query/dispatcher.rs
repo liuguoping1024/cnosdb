@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use models::auth::user::UserDesc;
+use models::auth::user::User;
 use models::oid::{Identifier, Oid};
 use serde::{Deserialize, Serialize};
 use trace::SpanContext;
@@ -11,11 +11,11 @@ use super::execution::QueryState;
 use crate::query::execution::{Output, QueryStateMachine};
 use crate::query::logical_planner::Plan;
 use crate::service::protocol::{Query, QueryId};
-use crate::Result;
+use crate::QueryResult;
 
 #[async_trait]
 pub trait QueryDispatcher: Send + Sync {
-    async fn start(&self) -> Result<()>;
+    async fn start(&self) -> QueryResult<()>;
 
     fn stop(&self);
 
@@ -29,18 +29,18 @@ pub trait QueryDispatcher: Send + Sync {
         id: QueryId,
         query: &Query,
         span: Option<&SpanContext>,
-    ) -> Result<Output>;
+    ) -> QueryResult<Output>;
 
     async fn build_logical_plan(
         &self,
         query_state_machine: Arc<QueryStateMachine>,
-    ) -> Result<Option<Plan>>;
+    ) -> QueryResult<Option<Plan>>;
 
     async fn execute_logical_plan(
         &self,
         logical_plan: Plan,
         query_state_machine: Arc<QueryStateMachine>,
-    ) -> Result<Output>;
+    ) -> QueryResult<Output>;
 
     async fn build_query_state_machine(
         &self,
@@ -48,7 +48,7 @@ pub trait QueryDispatcher: Send + Sync {
         id: QueryId,
         query: Query,
         span: Option<&SpanContext>,
-    ) -> Result<Arc<QueryStateMachine>>;
+    ) -> QueryResult<Arc<QueryStateMachine>>;
 
     fn running_query_infos(&self) -> Vec<QueryInfo>;
 
@@ -64,7 +64,8 @@ pub struct QueryInfo {
 
     tenant_id: Oid,
     tenant_name: String,
-    user: UserDesc,
+    database_name: String,
+    user: User,
 }
 
 impl QueryInfo {
@@ -73,13 +74,15 @@ impl QueryInfo {
         query: String,
         tenant_id: Oid,
         tenant_name: String,
-        user: UserDesc,
+        database_name: String,
+        user: User,
     ) -> Self {
         Self {
             query_id,
             query,
             tenant_id,
             tenant_name,
+            database_name,
             user,
         }
     }
@@ -100,16 +103,20 @@ impl QueryInfo {
         &self.tenant_name
     }
 
-    pub fn user_desc(&self) -> &UserDesc {
+    pub fn database_name(&self) -> &str {
+        &self.database_name
+    }
+
+    pub fn user(&self) -> &User {
         &self.user
     }
 
     pub fn user_id(&self) -> Oid {
-        *self.user.id()
+        *self.user.desc().id()
     }
 
     pub fn user_name(&self) -> &str {
-        self.user.name()
+        self.user.desc().name()
     }
 }
 

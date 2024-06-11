@@ -1,26 +1,33 @@
-#![allow(dead_code)]
-#![allow(unreachable_patterns)]
+#![recursion_limit = "256"]
 
-use std::fmt::Debug;
+use std::fmt::{Debug, Display, Formatter};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 pub use compaction::check::vnode_table_checksum_schema;
+use compaction::CompactTask;
+use context::GlobalContext;
 use datafusion::arrow::record_batch::RecordBatch;
-use models::meta_data::VnodeId;
-use models::predicate::domain::{ColumnDomains, TimeRange};
-use models::schema::{Precision, TableColumn};
-use models::{ColumnId, SeriesId, SeriesKey};
-use protos::kv_service::{WritePointsRequest, WritePointsResponse};
-use trace::SpanContext;
+use models::meta_data::{NodeId, VnodeId};
+use models::predicate::domain::ColumnDomains;
+use models::{SeriesId, SeriesKey};
+use serde::{Deserialize, Serialize};
+use summary::SummaryTask;
+use tokio::runtime::Runtime;
+use tokio::sync::mpsc::Sender;
+use tokio::sync::RwLock;
+use tseries_family::Version;
+use version_set::VersionSet;
+use vnode_store::VnodeStorage;
 
-pub use crate::error::{Error, Result};
+pub use crate::error::{TskvError, TskvResult};
 pub use crate::kv_option::Options;
 use crate::kv_option::StorageOptions;
 pub use crate::kvcore::TsKv;
 pub use crate::summary::{print_summary_statistics, Summary, VersionEdit};
 use crate::tseries_family::SuperVersion;
-pub use crate::tsm::print_tsm_statistics;
+// todo: add a method for print tsm statistics
+// pub use crate::tsm::print_tsm_statistics;
 pub use crate::wal::print_wal_statistics;
 
 pub mod byte_utils;
@@ -36,135 +43,135 @@ pub mod index;
 pub mod kv_option;
 mod kvcore;
 mod memcache;
-pub mod query_iterator;
+// TODO supposedly private
+pub mod reader;
 mod record_file;
 mod schema;
 mod summary;
 mod tseries_family;
 pub mod tsm;
 mod version_set;
-mod wal;
+pub mod vnode_store;
+pub mod wal;
 
+/// The column file ID is unique in a KV instance
+/// and uniquely corresponds to one column file.
 pub type ColumnFileId = u64;
-type TseriesFamilyId = u32;
+type TseriesFamilyId = VnodeId;
 type LevelId = u32;
-
-pub fn tenant_name_from_request(req: &protos::kv_service::WritePointsRequest) -> String {
-    match &req.meta {
-        Some(meta) => meta.tenant.clone(),
-        None => models::schema::DEFAULT_CATALOG.to_string(),
-    }
-}
 
 pub type EngineRef = Arc<dyn Engine>;
 
+#[derive(PartialEq, Eq, Hash)]
+pub struct UpdateSetValue<K, V> {
+    pub key: K,
+    pub value: Option<V>,
+}
+
 #[async_trait]
 pub trait Engine: Send + Sync + Debug {
-    async fn write(
+    /// open a tsfamily, if already exist just return.
+    async fn open_tsfamily(
         &self,
-        span_ctx: Option<&SpanContext>,
-        id: u32,
-        precision: Precision,
-        write_batch: WritePointsRequest,
-    ) -> Result<WritePointsResponse>;
+        tenant: &str,
+        db_name: &str,
+        vnode_id: VnodeId,
+    ) -> TskvResult<VnodeStorage>;
 
-    async fn write_from_wal(
-        &self,
-        id: u32,
-        precision: Precision,
-        write_batch: WritePointsRequest,
-        seq: u64,
-    ) -> Result<()>;
-
-    async fn drop_database(&self, tenant: &str, database: &str) -> Result<()>;
-
-    async fn drop_table(&self, tenant: &str, database: &str, table: &str) -> Result<()>;
-
-    async fn remove_tsfamily(&self, tenant: &str, database: &str, id: u32) -> Result<()>;
-
-    async fn prepare_copy_vnode(&self, tenant: &str, database: &str, vnode_id: u32) -> Result<()>;
-    async fn flush_tsfamily(&self, tenant: &str, database: &str, id: u32) -> Result<()>;
-
-    async fn add_table_column(
+    /// Remove the storage unit(caches and files) managed by engine,
+    /// then remove directory of the storage unit.
+    async fn remove_tsfamily(
         &self,
         tenant: &str,
         database: &str,
-        table: &str,
-        column: TableColumn,
-    ) -> Result<()>;
+        vnode_id: VnodeId,
+    ) -> TskvResult<()>;
 
-    async fn drop_table_column(
+    /// Flush all caches of the storage unit into a file.
+    async fn flush_tsfamily(
         &self,
         tenant: &str,
         database: &str,
-        table: &str,
-        column: &str,
-    ) -> Result<()>;
+        vnode_id: VnodeId,
+        trigger_compact: bool,
+    ) -> TskvResult<()>;
 
-    async fn change_table_column(
-        &self,
-        tenant: &str,
-        database: &str,
-        table: &str,
-        column_name: &str,
-        new_column: TableColumn,
-    ) -> Result<()>;
-
-    async fn delete_series(
-        &self,
-        tenant: &str,
-        database: &str,
-        series_ids: &[SeriesId],
-        field_ids: &[ColumnId],
-        time_range: &TimeRange,
-    ) -> Result<()>;
-
+    /// Read index of a storage unit, find series ids that matches the filter.
     async fn get_series_id_by_filter(
         &self,
         tenant: &str,
-        db: &str,
-        tab: &str,
+        database: &str,
+        table: &str,
         vnode_id: VnodeId,
         filter: &ColumnDomains<String>,
-    ) -> Result<Vec<SeriesId>>;
+    ) -> TskvResult<Vec<SeriesId>>;
 
+    /// Read index of a storage unit, get `SeriesKey` of the geiven series id.
     async fn get_series_key(
         &self,
         tenant: &str,
-        db: &str,
-        vnode_id: u32,
-        sid: SeriesId,
-    ) -> Result<Option<SeriesKey>>;
+        database: &str,
+        table: &str,
+        vnode_id: VnodeId,
+        series_id: &[SeriesId],
+    ) -> TskvResult<Vec<SeriesKey>>;
 
+    /// Get a `SuperVersion` that contains the latest version of caches and files
+    /// of the storage unit.
     async fn get_db_version(
         &self,
         tenant: &str,
-        db: &str,
+        database: &str,
         vnode_id: u32,
-    ) -> Result<Option<Arc<SuperVersion>>>;
+    ) -> TskvResult<Option<Arc<SuperVersion>>>;
 
+    /// Get the storage options which was used to install the engine.
     fn get_storage_options(&self) -> Arc<StorageOptions>;
 
-    async fn get_vnode_summary(
-        &self,
-        tenant: &str,
-        database: &str,
-        vnode_id: u32,
-    ) -> Result<Option<VersionEdit>>;
+    /// For the specified storage units, flush all caches into files, then compact
+    /// files into larger files.
+    async fn compact(&self, vnode_ids: Vec<TseriesFamilyId>) -> TskvResult<()>;
 
-    async fn apply_vnode_summary(
-        &self,
-        tenant: &str,
-        database: &str,
-        vnode_id: u32,
-        summary: VersionEdit,
-    ) -> Result<()>;
+    /// Get a compressed hash_tree(ID and checksum of each vnode) of engine.
+    async fn get_vnode_hash_tree(&self, vnode_id: VnodeId) -> TskvResult<RecordBatch>;
 
-    async fn drop_vnode(&self, id: TseriesFamilyId) -> Result<()>;
-
-    async fn compact(&self, vnode_ids: Vec<TseriesFamilyId>) -> Result<()>;
-
-    async fn get_vnode_hash_tree(&self, vnode_id: VnodeId) -> Result<RecordBatch>;
-
+    /// Close all background jobs of engine.
     async fn close(&self);
+}
+
+#[derive(Debug, Clone)]
+pub struct TsKvContext {
+    pub runtime: Arc<Runtime>,
+    pub options: Arc<Options>,
+    pub global_ctx: Arc<GlobalContext>,
+    pub version_set: Arc<RwLock<VersionSet>>,
+
+    pub compact_task_sender: Sender<CompactTask>,
+    pub summary_task_sender: Sender<SummaryTask>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct VnodeSnapshot {
+    pub node_id: NodeId,
+    pub vnode_id: VnodeId,
+    pub last_seq_no: u64,
+    pub create_time: String,
+    pub version_edit: VersionEdit,
+
+    //filed version using Option just for compat Serialize, Deserialize
+    #[serde(skip_serializing, skip_deserializing)]
+    pub version: Option<Arc<Version>>,
+    #[serde(skip_serializing, skip_deserializing)]
+    pub active_time: i64, //active timestamp
+}
+
+impl Display for VnodeSnapshot {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "node id: {}, vnode id: {}, last seq no: {}, create time: {}, active time: {}, ve: {:?}",    
+         self.node_id, self.vnode_id, self.last_seq_no, self.create_time, self.active_time, self.version_edit)
+    }
+}
+
+pub mod test {
+    pub use crate::memcache::test::{get_one_series_cache_data, put_rows_to_cache};
 }

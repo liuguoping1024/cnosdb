@@ -13,24 +13,26 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use models::predicate::domain::TimeRange;
-use models::FieldId;
+use models::{ColumnId, SeriesId};
+use tokio::sync::Mutex as AsyncMutex;
 use trace::error;
 
-use super::DataBlock;
-use crate::file_system::file_manager;
+use crate::file_system::async_filesystem::LocalFileSystem;
+use crate::file_system::FileSystem;
 use crate::record_file::{self, RecordDataType, RecordDataVersion};
-use crate::{byte_utils, file_utils, Error, Result};
+use crate::{byte_utils, file_utils, TskvError, TskvResult};
 
-const TOMBSTONE_FILE_SUFFIX: &str = ".tombstone";
-const FOOTER_MAGIC_NUMBER: u32 = u32::from_be_bytes([b'r', b'o', b'm', b'b']);
-const FOOTER_MAGIC_NUMBER_LEN: usize = 4;
-const ENTRY_LEN: usize = 24; // 8 + 8 + 8
+pub const TOMBSTONE_FILE_SUFFIX: &str = "tombstone";
+const ENTRY_LEN: usize = 24; // 4 + 4 + 8 + 8
 
+const TOMBSTONE_BUFFER_SIZE: usize = 1024 * 1024;
 #[derive(Debug, Clone, Copy)]
 pub struct Tombstone {
-    pub field_id: FieldId,
+    pub series_id: SeriesId,
+    pub column_id: ColumnId,
     pub time_range: TimeRange,
 }
 
@@ -39,30 +41,42 @@ pub struct Tombstone {
 /// - file_name: _%06d.tombstone
 /// - header: b"TOMB" 4 bytes
 /// - loop begin
-/// - - field_id: u64 8 bytes
+/// - - series_id: u32 4 bytes
+/// - - column_id: u64 4 bytes
 /// - - min: i64 8 bytes
 /// - - max: i64 8 bytes
 /// - loop end
 pub struct TsmTombstone {
-    tombstones: HashMap<FieldId, Vec<TimeRange>>,
+    /// Tombstone caches.
+    tombstones: HashMap<(SeriesId, ColumnId), Vec<TimeRange>>,
 
     path: PathBuf,
-    writer: Option<record_file::Writer>,
-    write_buf: [u8; ENTRY_LEN],
+    /// Async record file writer.
+    ///
+    /// If you want to use self::writer and self::tombstones at the same time,
+    /// lock writer first then tombstones.
+    writer: Arc<AsyncMutex<Option<record_file::Writer>>>,
 }
 
 impl TsmTombstone {
-    pub async fn open(path: impl AsRef<Path>, file_id: u64) -> Result<Self> {
-        let path = file_utils::make_tsm_tombstone_file_name(path, file_id);
-        let (mut reader, writer) = if file_manager::try_exists(&path) {
+    pub async fn open(path: impl AsRef<Path>, tsm_file_id: u64) -> TskvResult<Self> {
+        let path = file_utils::make_tsm_tombstone_file(path, tsm_file_id);
+        let (mut reader, writer) = if LocalFileSystem::try_exists(&path) {
             (
                 Some(record_file::Reader::open(&path).await?),
-                Some(record_file::Writer::open(&path, RecordDataType::Tombstone).await?),
+                Some(
+                    record_file::Writer::open(
+                        &path,
+                        RecordDataType::Tombstone,
+                        TOMBSTONE_BUFFER_SIZE,
+                    )
+                    .await?,
+                ),
             )
         } else {
             (None, None)
         };
-        let mut tombstones: HashMap<u64, Vec<TimeRange>> = HashMap::new();
+        let mut tombstones = HashMap::new();
         if let Some(r) = reader.as_mut() {
             Self::load_all(r, &mut tombstones).await?;
         }
@@ -70,27 +84,27 @@ impl TsmTombstone {
         Ok(Self {
             tombstones,
             path,
-            writer,
-            write_buf: [0_u8; ENTRY_LEN],
+            writer: Arc::new(AsyncMutex::new(writer)),
         })
     }
 
     #[cfg(test)]
-    pub async fn with_path(path: impl AsRef<Path>) -> Result<Self> {
+    pub async fn with_path(path: impl AsRef<Path>) -> TskvResult<Self> {
         let path = path.as_ref();
         let parent = path.parent().expect("a valid tsm/tombstone file path");
-        let tsm_id = file_utils::get_tsm_file_id_by_path(path)?;
-        Self::open(parent, tsm_id).await
+        let tsm_file_id = file_utils::get_tsm_file_id_by_path(path)?;
+        Self::open(parent, tsm_file_id).await
     }
 
     async fn load_all(
         reader: &mut record_file::Reader,
-        tombstones: &mut HashMap<FieldId, Vec<TimeRange>>,
-    ) -> Result<()> {
+        tombstones: &mut HashMap<(SeriesId, ColumnId), Vec<TimeRange>>,
+    ) -> TskvResult<()> {
         loop {
             let data = match reader.read_record().await {
                 Ok(r) => r.data,
-                Err(Error::Eof) => break,
+                Err(TskvError::Eof) => break,
+                Err(TskvError::RecordFileHashCheckFailed { .. }) => continue,
                 Err(e) => return Err(e),
             };
             if data.len() < ENTRY_LEN {
@@ -100,11 +114,12 @@ impl TsmTombstone {
                 );
                 break;
             }
-            let field_id = byte_utils::decode_be_u64(&data[0..8]);
+            let series_id = byte_utils::decode_be_u32(&data[0..4]);
+            let column_id = byte_utils::decode_be_u32(&data[4..8]);
             let min_ts = byte_utils::decode_be_i64(&data[8..16]);
             let max_ts = byte_utils::decode_be_i64(&data[16..24]);
             tombstones
-                .entry(field_id)
+                .entry((series_id, column_id))
                 .or_default()
                 .push(TimeRange { min_ts, max_ts });
         }
@@ -116,47 +131,63 @@ impl TsmTombstone {
         self.tombstones.is_empty()
     }
 
-    pub async fn add_range(&mut self, field_ids: &[FieldId], time_range: &TimeRange) -> Result<()> {
-        if self.writer.is_none() {
-            self.writer =
-                Some(record_file::Writer::open(&self.path, RecordDataType::Tombstone).await?);
+    pub async fn add_range(
+        &mut self,
+        columns: &[(SeriesId, ColumnId)],
+        time_range: &TimeRange,
+    ) -> TskvResult<()> {
+        let mut writer_lock = self.writer.lock().await;
+        if writer_lock.is_none() {
+            *writer_lock = Some(
+                record_file::Writer::open(
+                    &self.path,
+                    RecordDataType::Tombstone,
+                    TOMBSTONE_BUFFER_SIZE,
+                )
+                .await?,
+            );
         }
-        let writer = self.writer.as_mut().expect("initialized file");
+        let writer = writer_lock
+            .as_mut()
+            .expect("initialized record file writer");
 
-        for field_id in field_ids.iter() {
-            self.write_buf[0..8].copy_from_slice((*field_id).to_be_bytes().as_slice());
-            self.write_buf[8..16].copy_from_slice(time_range.min_ts.to_be_bytes().as_slice());
-            self.write_buf[16..24].copy_from_slice(time_range.max_ts.to_be_bytes().as_slice());
+        let mut write_buf = [0_u8; ENTRY_LEN];
+        for (series_id, column_id) in columns {
+            write_buf[0..4].copy_from_slice((*series_id).to_be_bytes().as_slice());
+            write_buf[4..8].copy_from_slice((*column_id).to_be_bytes().as_slice());
+            write_buf[8..16].copy_from_slice(time_range.min_ts.to_be_bytes().as_slice());
+            write_buf[16..24].copy_from_slice(time_range.max_ts.to_be_bytes().as_slice());
             writer
                 .write_record(
                     RecordDataVersion::V1 as u8,
                     RecordDataType::Tombstone as u8,
-                    &[&self.write_buf],
+                    &[&write_buf],
                 )
                 .await?;
 
             self.tombstones
-                .entry(*field_id)
+                .entry((*series_id, *column_id))
                 .or_default()
                 .push(*time_range);
         }
+
         Ok(())
     }
 
-    pub async fn flush(&mut self) -> Result<()> {
-        if let Some(w) = self.writer.as_mut() {
+    pub async fn flush(&self) -> TskvResult<()> {
+        if let Some(w) = self.writer.lock().await.as_mut() {
             w.sync().await?;
         }
         Ok(())
     }
 
-    /// Returns all TimeRanges for a FieldId cloned from TsmTombstone.
-    pub(crate) fn get_cloned_time_ranges(&self, field_id: FieldId) -> Option<Vec<TimeRange>> {
-        self.tombstones.get(&field_id).cloned()
-    }
-
-    pub fn overlaps(&self, field_id: FieldId, time_range: &TimeRange) -> bool {
-        if let Some(time_ranges) = self.tombstones.get(&field_id) {
+    pub fn overlaps(
+        &self,
+        seires_id: SeriesId,
+        column_id: ColumnId,
+        time_range: &TimeRange,
+    ) -> bool {
+        if let Some(time_ranges) = self.tombstones.get(&(seires_id, column_id)) {
             for t in time_ranges.iter() {
                 if t.overlaps(time_range) {
                     return true;
@@ -171,36 +202,21 @@ impl TsmTombstone {
     /// Returns None if there is nothing to return, or `TimeRange`s is empty.
     pub fn get_overlapped_time_ranges(
         &self,
-        field_id: FieldId,
+        series_id: SeriesId,
+        column_id: ColumnId,
         time_range: &TimeRange,
-    ) -> Option<Vec<TimeRange>> {
-        if let Some(time_ranges) = self.tombstones.get(&field_id) {
+    ) -> Vec<TimeRange> {
+        if let Some(time_ranges) = self.tombstones.get(&(series_id, column_id)) {
             let mut trs = Vec::new();
             for t in time_ranges.iter() {
                 if t.overlaps(time_range) {
                     trs.push(*t);
                 }
             }
-            if trs.is_empty() {
-                return None;
-            }
-            return Some(trs);
+            return trs;
         }
 
-        None
-    }
-
-    pub fn data_block_exclude_tombstones(&self, field_id: FieldId, data_block: &mut DataBlock) {
-        if let Some(tr_tuple) = data_block.time_range() {
-            let time_range: &TimeRange = &tr_tuple.into();
-            if let Some(time_ranges) = self.tombstones.get(&field_id) {
-                for t in time_ranges.iter() {
-                    if t.overlaps(time_range) {
-                        data_block.exclude(t);
-                    }
-                }
-            }
-        }
+        vec![]
     }
 }
 
@@ -211,19 +227,19 @@ mod test {
     use models::predicate::domain::TimeRange;
 
     use super::TsmTombstone;
-    use crate::file_system::file_manager;
+    use crate::file_system::async_filesystem::LocalFileSystem;
+    use crate::file_system::FileSystem;
 
     #[tokio::test]
     async fn test_write_read_1() {
         let dir = PathBuf::from("/tmp/test/tombstone/1".to_string());
-        let _ = std::fs::remove_dir(&dir);
-        if !file_manager::try_exists(&dir) {
+        let _ = std::fs::remove_dir_all(&dir);
+        if !LocalFileSystem::try_exists(&dir) {
             std::fs::create_dir_all(&dir).unwrap();
         }
         let mut tombstone = TsmTombstone::open(&dir, 1).await.unwrap();
-        // tsm_tombstone.load().unwrap();
         tombstone
-            .add_range(&[0], &TimeRange::new(0, 0))
+            .add_range(&[(0, 0)], &TimeRange::new(0, 0))
             .await
             .unwrap();
         tombstone.flush().await.unwrap();
@@ -231,6 +247,7 @@ mod test {
 
         let tombstone = TsmTombstone::open(&dir, 1).await.unwrap();
         assert!(tombstone.overlaps(
+            0,
             0,
             &TimeRange {
                 max_ts: 0,
@@ -242,15 +259,15 @@ mod test {
     #[tokio::test]
     async fn test_write_read_2() {
         let dir = PathBuf::from("/tmp/test/tombstone/2".to_string());
-        let _ = std::fs::remove_dir(&dir);
-        if !file_manager::try_exists(&dir) {
+        let _ = std::fs::remove_dir_all(&dir);
+        if !LocalFileSystem::try_exists(&dir) {
             std::fs::create_dir_all(&dir).unwrap();
         }
 
         let mut tombstone = TsmTombstone::open(&dir, 1).await.unwrap();
         // tsm_tombstone.load().unwrap();
         tombstone
-            .add_range(&[1, 2, 3], &TimeRange::new(1, 100))
+            .add_range(&[(0, 1), (0, 2), (0, 3)], &TimeRange::new(1, 100))
             .await
             .unwrap();
         tombstone.flush().await.unwrap();
@@ -258,6 +275,7 @@ mod test {
 
         let tombstone = TsmTombstone::open(&dir, 1).await.unwrap();
         assert!(tombstone.overlaps(
+            0,
             1,
             &TimeRange {
                 max_ts: 2,
@@ -265,6 +283,7 @@ mod test {
             }
         ));
         assert!(tombstone.overlaps(
+            0,
             2,
             &TimeRange {
                 max_ts: 2,
@@ -272,6 +291,7 @@ mod test {
             }
         ));
         assert!(!tombstone.overlaps(
+            0,
             3,
             &TimeRange {
                 max_ts: 101,
@@ -283,8 +303,8 @@ mod test {
     #[tokio::test]
     async fn test_write_read_3() {
         let dir = PathBuf::from("/tmp/test/tombstone/3".to_string());
-        let _ = std::fs::remove_dir(&dir);
-        if !file_manager::try_exists(&dir) {
+        let _ = std::fs::remove_dir_all(&dir);
+        if !LocalFileSystem::try_exists(&dir) {
             std::fs::create_dir_all(&dir).unwrap();
         }
 
@@ -293,7 +313,11 @@ mod test {
         for i in 0..10000 {
             tombstone
                 .add_range(
-                    &[3 * i as u64 + 1, 3 * i as u64 + 2, 3 * i as u64 + 3],
+                    &[
+                        (0, 3 * i as u32 + 1),
+                        (0, 3 * i as u32 + 2),
+                        (0, 3 * i as u32 + 3),
+                    ],
                     &TimeRange::new(i as i64 * 2, i as i64 * 2 + 100),
                 )
                 .await
@@ -304,6 +328,7 @@ mod test {
 
         let tombstone = TsmTombstone::open(&dir, 1).await.unwrap();
         assert!(tombstone.overlaps(
+            0,
             1,
             &TimeRange {
                 max_ts: 2,
@@ -311,6 +336,7 @@ mod test {
             }
         ));
         assert!(tombstone.overlaps(
+            0,
             2,
             &TimeRange {
                 max_ts: 3,
@@ -318,6 +344,7 @@ mod test {
             }
         ));
         assert!(!tombstone.overlaps(
+            0,
             3,
             &TimeRange {
                 max_ts: 4,

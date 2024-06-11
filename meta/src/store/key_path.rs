@@ -5,10 +5,10 @@ use models::oid::Oid;
 // **    /cluster_name/tenants/tenant ->
 // **    /cluster_name/tenants/tenant/roles/roles ->
 // **    /cluster_name/tenants/tenant/members/user_id ->
+// **    /cluster_name/tenants/tenant/limiter ->
 // **    /cluster_name/auto_incr_id -> id
 // **    /cluster_name/data_nodes/node_id -> [NodeInfo] 集群、数据节点等信息
 
-// **    /cluster_name/tenant_name/users/name -> [UserInfo] 租户下用户信息、访问权限等
 // **    /cluster_name/tenant_name/dbs/db_name -> [DatabaseInfo] db相关信息、保留策略等
 // **    /cluster_name/tenant_name/dbs/db_name/buckets/id -> [BucketInfo] bucket相关信息
 // **    /cluster_name/tenant_name/dbs/db_name/schemas/name -> [TskvTableSchema] schema相关信息
@@ -20,8 +20,12 @@ pub const BUCKETS: &str = "buckets";
 pub const SCHEMAS: &str = "schemas";
 pub const TENANTS: &str = "tenants";
 pub const MEMBERS: &str = "members";
+pub const LIMITER: &str = "limiter";
 pub const DATA_NODES: &str = "data_nodes";
 pub const AUTO_INCR_ID: &str = "auto_incr_id";
+pub const DATA_NODES_METRICS: &str = "data_nodes_metrics";
+pub const RESOURCE_INFOS: &str = "resourceinfos";
+pub const RESOURCE_INFOS_MARK: &str = "resourceinfosmark";
 
 pub struct KeyPath {}
 
@@ -45,6 +49,14 @@ impl KeyPath {
         "/data_version".to_string()
     }
 
+    pub fn test_alive() -> String {
+        "/test_alive".to_string()
+    }
+
+    pub fn already_init() -> String {
+        "/already_init_key".to_string()
+    }
+
     pub fn data_nodes(cluster: &str) -> String {
         format!("/{}/data_nodes", cluster)
     }
@@ -60,14 +72,6 @@ impl KeyPath {
     pub fn data_node_metrics(cluster: &str, id: u64) -> String {
         format!("/{}/data_nodes_metrics/{}", cluster, id)
     }
-
-    pub fn tenant_users(cluster: &str, tenant: &str) -> String {
-        format!("/{}/tenants/{}/users", cluster, tenant)
-    }
-
-    // pub fn tenant_user_name(cluster: &str, tenant: &str, name: &str) -> String {
-    //     format!("/{}/{}/users/{}", cluster, tenant, name)
-    // }
 
     pub fn tenant_dbs(cluster: &str, tenant: &str) -> String {
         format!("/{}/tenants/{}/dbs", cluster, tenant)
@@ -126,5 +130,13 @@ impl KeyPath {
 
     pub fn limiter(cluster: &str, tenant_name: &str) -> String {
         format!("/{cluster}/tenants/{tenant_name}/limiter")
+    }
+
+    pub fn resourceinfos(cluster: &str, name: &str) -> String {
+        format!("/{}/resourceinfos/{}", cluster, name)
+    }
+
+    pub fn resourceinfosmark(cluster: &str) -> String {
+        format!("/{}/resourceinfosmark", cluster)
     }
 }

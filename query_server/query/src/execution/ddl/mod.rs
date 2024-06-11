@@ -3,7 +3,7 @@ use spi::query::datasource::stream::checker::StreamCheckerManagerRef;
 use spi::query::dispatcher::{QueryInfo, QueryStatus};
 use spi::query::execution::{Output, QueryExecution, QueryStateMachineRef};
 use spi::query::logical_planner::DDLPlan;
-use spi::Result;
+use spi::QueryResult;
 
 use self::alter_tenant::AlterTenantTask;
 use self::alter_user::AlterUserTask;
@@ -17,14 +17,19 @@ use self::drop_database_object::DropDatabaseObjectTask;
 use self::drop_global_object::DropGlobalObjectTask;
 use self::drop_tenant_object::DropTenantObjectTask;
 use self::grant_revoke::GrantRevokeTask;
+use self::recover_database::RecoverDatabaseTask;
+use self::recover_tenant::RecoverTenantTask;
+use self::replica_add::ReplicaAddTask;
+use self::replica_destory::ReplicaDestoryTask;
+use self::replica_promote::ReplicaPromoteTask;
+use self::replica_remove::ReplicaRemoveTask;
+use self::show_replica::ShowReplicasTask;
 use crate::execution::ddl::alter_database::AlterDatabaseTask;
 use crate::execution::ddl::alter_table::AlterTableTask;
 use crate::execution::ddl::checksum_group::ChecksumGroupTask;
 use crate::execution::ddl::compact_vnode::CompactVnodeTask;
 use crate::execution::ddl::copy_vnode::CopyVnodeTask;
 use crate::execution::ddl::create_database::CreateDatabaseTask;
-use crate::execution::ddl::describe_database::DescribeDatabaseTask;
-use crate::execution::ddl::describe_table::DescribeTableTask;
 use crate::execution::ddl::drop_vnode::DropVnodeTask;
 use crate::execution::ddl::move_node::MoveVnodeTask;
 
@@ -42,19 +47,24 @@ mod create_stream_table;
 mod create_table;
 mod create_tenant;
 mod create_user;
-mod describe_database;
-mod describe_table;
 mod drop_database_object;
 mod drop_global_object;
 mod drop_tenant_object;
 mod drop_vnode;
 mod grant_revoke;
 mod move_node;
+mod recover_database;
+mod recover_tenant;
+mod replica_add;
+mod replica_destory;
+mod replica_promote;
+mod replica_remove;
+mod show_replica;
 
 /// Traits that DDL tasks should implement
 #[async_trait]
 trait DDLDefinitionTask: Send + Sync {
-    async fn execute(&self, query_state_machine: QueryStateMachineRef) -> Result<Output>;
+    async fn execute(&self, query_state_machine: QueryStateMachineRef) -> QueryResult<Output>;
 }
 
 pub struct DDLExecution {
@@ -82,7 +92,7 @@ impl DDLExecution {
 impl QueryExecution for DDLExecution {
     // execute ddl task
     // This logic usually does not change
-    async fn start(&self) -> Result<Output> {
+    async fn start(&self) -> QueryResult<Output> {
         let query_state_machine = &self.query_state_machine;
 
         query_state_machine.begin_schedule();
@@ -90,7 +100,7 @@ impl QueryExecution for DDLExecution {
         let _span_recorder = self
             .query_state_machine
             .session
-            .get_child_span_recorder("execute ddl");
+            .get_child_span("execute ddl");
 
         let result = self
             .task_factory
@@ -103,7 +113,7 @@ impl QueryExecution for DDLExecution {
         result
     }
 
-    fn cancel(&self) -> Result<()> {
+    fn cancel(&self) -> QueryResult<()> {
         // ddl ignore
         Ok(())
     }
@@ -115,7 +125,8 @@ impl QueryExecution for DDLExecution {
             qsm.query.content().to_string(),
             *qsm.session.tenant_id(),
             qsm.session.tenant().to_string(),
-            qsm.session.user().desc().clone(),
+            qsm.session.default_database().to_string(),
+            qsm.session.user().clone(),
         )
     }
 
@@ -156,10 +167,6 @@ impl DDLDefinitionTaskFactory {
             DDLPlan::CreateTenant(sub_plan) => Box::new(CreateTenantTask::new(*sub_plan.clone())),
             DDLPlan::CreateUser(sub_plan) => Box::new(CreateUserTask::new(sub_plan.clone())),
             DDLPlan::CreateRole(sub_plan) => Box::new(CreateRoleTask::new(sub_plan.clone())),
-            DDLPlan::DescribeDatabase(sub_plan) => {
-                Box::new(DescribeDatabaseTask::new(sub_plan.clone()))
-            }
-            DDLPlan::DescribeTable(sub_plan) => Box::new(DescribeTableTask::new(sub_plan.clone())),
             DDLPlan::AlterDatabase(sub_plan) => Box::new(AlterDatabaseTask::new(sub_plan.clone())),
             DDLPlan::AlterTable(sub_plan) => Box::new(AlterTableTask::new(sub_plan.clone())),
             DDLPlan::AlterTenant(sub_plan) => Box::new(AlterTenantTask::new(sub_plan.clone())),
@@ -169,11 +176,26 @@ impl DDLDefinitionTaskFactory {
             DDLPlan::CopyVnode(sub_plan) => Box::new(CopyVnodeTask::new(sub_plan.clone())),
             DDLPlan::MoveVnode(sub_plan) => Box::new(MoveVnodeTask::new(sub_plan.clone())),
             DDLPlan::CompactVnode(sub_plan) => Box::new(CompactVnodeTask::new(sub_plan.clone())),
-            DDLPlan::ChecksumGroup(sub_plan) => Box::new(ChecksumGroupTask::new(sub_plan.clone())),
+            DDLPlan::ChecksumGroup(sub_plan) => {
+                Box::new(ChecksumGroupTask::new(sub_plan.clone(), self.plan.schema()))
+            }
             DDLPlan::CreateStreamTable(sub_plan) => {
                 let checker = self.stream_checker_manager.checker(&sub_plan.stream_type);
 
                 Box::new(CreateStreamTableTask::new(checker, sub_plan.clone()))
+            }
+            DDLPlan::RecoverDatabase(sub_plan) => {
+                Box::new(RecoverDatabaseTask::new(sub_plan.clone()))
+            }
+            DDLPlan::RecoverTenant(sub_plan) => Box::new(RecoverTenantTask::new(sub_plan.clone())),
+            DDLPlan::ShowReplicas => Box::new(ShowReplicasTask::new()),
+            DDLPlan::ReplicaDestory(sub_plan) => {
+                Box::new(ReplicaDestoryTask::new(sub_plan.clone()))
+            }
+            DDLPlan::ReplicaAdd(sub_plan) => Box::new(ReplicaAddTask::new(sub_plan.clone())),
+            DDLPlan::ReplicaRemove(sub_plan) => Box::new(ReplicaRemoveTask::new(sub_plan.clone())),
+            DDLPlan::ReplicaPromote(sub_plan) => {
+                Box::new(ReplicaPromoteTask::new(sub_plan.clone()))
             }
         }
     }

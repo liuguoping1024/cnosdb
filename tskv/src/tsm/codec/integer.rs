@@ -4,8 +4,7 @@ use integer_encoding::*;
 
 use super::simple8b;
 use crate::tsm::codec::timestamp::{
-    ts_q_compress_decode, ts_q_compress_encode, ts_without_compress_decode,
-    ts_without_compress_encode,
+    ts_pco_decode, ts_pco_encode, ts_without_compress_decode, ts_without_compress_encode,
 };
 use crate::tsm::codec::Encoding;
 
@@ -20,11 +19,8 @@ pub enum DeltaEncoding {
     Rle = 2,
 }
 
-pub fn i64_q_compress_encode(
-    src: &[i64],
-    dst: &mut Vec<u8>,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
-    ts_q_compress_encode(src, dst)
+pub fn i64_pco_encode(src: &[i64], dst: &mut Vec<u8>) -> Result<(), Box<dyn Error + Send + Sync>> {
+    ts_pco_encode(src, dst)
 }
 
 pub fn i64_without_compress_encode(
@@ -44,10 +40,10 @@ pub fn i64_zigzag_simple8b_encode(
     src: &[i64],
     dst: &mut Vec<u8>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    dst.clear(); // reset buffer.
     if src.is_empty() {
         return Ok(());
     }
+    dst.push(Encoding::Delta as u8);
 
     let mut max: u64 = 0;
     let mut deltas = i64_to_u64_vector(src);
@@ -75,15 +71,14 @@ pub fn i64_zigzag_simple8b_encode(
             // count is the number of deltas repeating excluding first value.
             encode_rle(deltas[0], deltas[1], deltas.len() as u64 - 1, dst);
             // 4 high bits of first byte used for the encoding type
-            dst[0] |= (DeltaEncoding::Rle as u8) << 4;
-            dst.insert(0, Encoding::Delta as u8);
+            dst[1] |= (DeltaEncoding::Rle as u8) << 4;
             return Ok(());
         }
     }
 
     // write block uncompressed
     if max > simple8b::MAX_VALUE {
-        let cap = 1 + (deltas.len() * 8); // 8 bytes per value plus header byte
+        let cap = 2 + (deltas.len() * 8); // 8 bytes per value plus header byte
         if dst.capacity() < cap {
             dst.reserve_exact(cap - dst.capacity());
         }
@@ -91,7 +86,6 @@ pub fn i64_zigzag_simple8b_encode(
         for delta in &deltas {
             dst.extend_from_slice(&delta.to_be_bytes());
         }
-        dst.insert(0, Encoding::Delta as u8);
         return Ok(());
     }
 
@@ -100,7 +94,6 @@ pub fn i64_zigzag_simple8b_encode(
     dst.push((DeltaEncoding::Simple8b as u8) << 4);
     dst.extend_from_slice(&deltas[0].to_be_bytes()); // encode first value
     simple8b::encode(&deltas[1..], dst)?;
-    dst.insert(0, Encoding::Delta as u8);
     Ok(())
 }
 
@@ -134,7 +127,7 @@ fn encode_rle(v: u64, delta: u64, count: u64, dst: &mut Vec<u8>) {
     use super::MAX_VAR_INT_64;
     dst.push(0); // save a byte for encoding type
     dst.extend_from_slice(&v.to_be_bytes()); // write the first value in as a byte array.
-    let mut n = 9;
+    let mut n = 10;
 
     if dst.len() - n <= MAX_VAR_INT_64 {
         dst.resize(n + MAX_VAR_INT_64, 0);
@@ -251,11 +244,8 @@ pub fn i64_without_compress_decode(
     ts_without_compress_decode(src, dst)
 }
 
-pub fn i64_q_compress_decode(
-    src: &[u8],
-    dst: &mut Vec<i64>,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
-    ts_q_compress_decode(src, dst)
+pub fn i64_pco_decode(src: &[u8], dst: &mut Vec<i64>) -> Result<(), Box<dyn Error + Send + Sync>> {
+    ts_pco_decode(src, dst)
 }
 
 #[cfg(test)]
@@ -266,8 +256,8 @@ mod tests {
 
     #[test]
     fn zig_zag_encoding() {
-        let input = vec![-2147483648, -2, -1, 0, 1, 2147483647];
-        let exp = vec![4294967295, 3, 1, 0, 2, 4294967294];
+        let input = [-2147483648, -2, -1, 0, 1, 2147483647];
+        let exp = [4294967295, 3, 1, 0, 2, 4294967294];
         for (i, v) in input.iter().enumerate() {
             let encoded = zig_zag_encode(*v);
             assert_eq!(encoded, exp[i]);
@@ -284,7 +274,7 @@ mod tests {
 
         // check for error
         i64_zigzag_simple8b_encode(&src, &mut dst).expect("failed to encode src");
-        i64_q_compress_encode(&src, &mut dst).unwrap();
+        i64_pco_encode(&src, &mut dst).unwrap();
         i64_without_compress_encode(&src, &mut dst).unwrap();
 
         // verify encoded no values.
@@ -309,18 +299,18 @@ mod tests {
     }
 
     #[test]
-    fn encode_q_compress_and_uncompress() {
+    fn encode_pco_and_uncompress() {
         let src: Vec<i64> = vec![-1000, 0, simple8b::MAX_VALUE as i64, 213123421];
         let mut dst = vec![];
         let mut got = vec![];
         let exp = src.clone();
 
-        i64_q_compress_encode(&src, &mut dst).unwrap();
+        i64_pco_encode(&src, &mut dst).unwrap();
         let exp_code_type = Encoding::Quantile;
         let got_code_type = get_encoding(&dst);
         assert_eq!(exp_code_type, got_code_type);
 
-        i64_q_compress_decode(&dst, &mut got).unwrap();
+        i64_pco_decode(&dst, &mut got).unwrap();
         assert_eq!(exp, got);
 
         dst.clear();

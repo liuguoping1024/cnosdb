@@ -9,11 +9,11 @@ use datafusion::logical_expr::{
 };
 use datafusion::physical_expr::functions::make_scalar_function;
 use spi::query::function::FunctionMetadataManager;
-use spi::Result;
+use spi::QueryResult;
 
 use super::TOPK;
 
-pub fn register_udf(func_manager: &mut dyn FunctionMetadataManager) -> Result<ScalarUDF> {
+pub fn register_udf(func_manager: &mut dyn FunctionMetadataManager) -> QueryResult<ScalarUDF> {
     let udf = new();
     func_manager.register_udf(udf.clone())?;
     Ok(udf)
@@ -34,6 +34,7 @@ fn new() -> ScalarUDF {
         .chain(NUMERICS.iter())
         .chain(TIMESTAMPS.iter())
         .chain(DATES.iter())
+        // .chain(iter::once(str_dict_data_type()))
         // .chain(TIMES.iter())
         .map(|t| TypeSignature::Exact(vec![t.clone(), DataType::Int64]))
         .collect();

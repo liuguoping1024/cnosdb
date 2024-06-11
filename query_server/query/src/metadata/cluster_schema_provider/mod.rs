@@ -14,6 +14,9 @@ use super::CLUSTER_SCHEMA;
 mod builder;
 mod factory;
 
+pub const CLUSTER_SCHEMA_TENANTS: &str = "TENANTS";
+pub const CLUSTER_SCHEMA_USERS: &str = "USERS";
+
 pub struct ClusterSchemaProvider {
     table_factories: HashMap<String, BoxSystemTableFactory>,
 }
@@ -51,7 +54,7 @@ impl ClusterSchemaProvider {
         metadata: MetaRef,
     ) -> Result<Arc<dyn TableProvider>, MetaError> {
         match self.table_factories.get(name.to_ascii_lowercase().as_str()) {
-            Some(f) => Ok(f.create(user, metadata.clone())),
+            Some(f) => Ok(f.create(user, metadata)),
             None => Err(MetaError::TableNotFound {
                 table: name.to_string(),
             }),

@@ -17,12 +17,15 @@ use datafusion::physical_plan::{
 };
 use futures::{Stream, StreamExt};
 use models::codec::Encoding;
+use models::datafusion::limit_record_batch::limit_record_batch;
 use models::predicate::domain::PredicateRef;
 use models::predicate::PlacedSplit;
 use models::schema::{ColumnType, TableColumn, TskvTableSchema, TskvTableSchemaRef, TIME_FIELD};
-use spi::{QueryError, Result};
-use trace::{debug, SpanContext, SpanExt, SpanRecorder};
-use tskv::query_iterator::QueryOption;
+use snafu::ResultExt;
+use spi::{CommonSnafu, CoordinatorSnafu, QueryResult};
+use trace::span_ext::SpanExt;
+use trace::{debug, Span, SpanContext};
+use tskv::reader::QueryOption;
 
 use crate::extension::physical::plan_node::TableScanMetrics;
 
@@ -131,7 +134,10 @@ impl ExecutionPlan for TskvExec {
             split,
             batch_size,
             metrics,
-            SpanRecorder::new(span_ctx.child_span(format!("TableScanStream ({partition})"))),
+            Span::from_context(
+                format!("TableScanStream ({partition})"),
+                span_ctx.as_deref(),
+            ),
         )
         .map_err(|err| DataFusionError::External(Box::new(err)))?;
 
@@ -140,7 +146,7 @@ impl ExecutionPlan for TskvExec {
 
     fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter) -> std::fmt::Result {
         match t {
-            DisplayFormatType::Default => {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 let filter = self.filter();
                 let fields: Vec<_> = self
                     .proj_schema
@@ -188,9 +194,10 @@ impl<'a> Display for PredicateDisplay<'a> {
         let filter = self.0;
         write!(
             f,
-            "limit={:?}, predicate={:?}",
+            "limit={:?}, predicate={:?}, filter={:?}",
             filter.limit(),
             filter.filter(),
+            filter.physical_expr().map(|e| e.to_string()),
         )
     }
 }
@@ -206,7 +213,7 @@ pub struct TableScanStream {
     remain: Option<usize>,
     metrics: TableScanMetrics,
     #[allow(unused)]
-    span_recorder: SpanRecorder,
+    span: Span,
 }
 
 impl TableScanStream {
@@ -217,8 +224,8 @@ impl TableScanStream {
         split: PlacedSplit,
         batch_size: usize,
         metrics: TableScanMetrics,
-        span_recorder: SpanRecorder,
-    ) -> Result<Self> {
+        span: Span,
+    ) -> QueryResult<Self> {
         let mut proj_fileds = Vec::with_capacity(proj_schema.fields().len());
         for item in proj_schema.fields().iter() {
             let field_name = item.name();
@@ -239,12 +246,13 @@ impl TableScanStream {
             if let Some(v) = table_schema.column(field_name) {
                 proj_fileds.push(v.clone());
             } else {
-                return Err(QueryError::CommonError {
+                return Err(CommonSnafu {
                     msg: format!(
                         "table stream build fail, because can't found field: {}",
                         field_name
                     ),
-                });
+                }
+                .build());
             }
         }
 
@@ -262,11 +270,13 @@ impl TableScanStream {
             split,
             None,
             proj_schema.clone(),
-            proj_table_schema,
+            proj_table_schema.into(),
         );
 
-        let span_ctx = span_recorder.span_ctx();
-        let iterator = coord.table_scan(option, span_ctx)?;
+        let span_ctx = span.context();
+        let iterator = coord
+            .table_scan(option, span_ctx.as_ref())
+            .context(CoordinatorSnafu)?;
 
         Ok(Self {
             proj_schema,
@@ -275,7 +285,7 @@ impl TableScanStream {
             remain,
             iterator,
             metrics,
-            span_recorder,
+            span,
         })
     }
 
@@ -286,7 +296,7 @@ impl TableScanStream {
         iterator: SendableCoordinatorRecordBatchStream,
         remain: Option<usize>,
         metrics: TableScanMetrics,
-        span_recorder: SpanRecorder,
+        span: Span,
     ) -> Self {
         Self {
             proj_schema,
@@ -295,7 +305,7 @@ impl TableScanStream {
             iterator,
             remain,
             metrics,
-            span_recorder,
+            span,
         }
     }
 }
@@ -312,21 +322,9 @@ impl Stream for TableScanStream {
         let timer = metrics.elapsed_compute().timer();
 
         let result = match this.iterator.poll_next_unpin(cx) {
-            Poll::Ready(Some(Ok(batch))) => match this.remain.as_mut() {
-                Some(remain) => {
-                    if *remain == 0 {
-                        Poll::Ready(None)
-                    } else if *remain > batch.num_rows() {
-                        *remain -= batch.num_rows();
-                        Poll::Ready(Some(Ok(batch)))
-                    } else {
-                        let batch = batch.slice(0, *remain);
-                        *remain = 0;
-                        Poll::Ready(Some(Ok(batch)))
-                    }
-                }
-                None => Poll::Ready(Some(Ok(batch))),
-            },
+            Poll::Ready(Some(Ok(batch))) => {
+                Poll::Ready(limit_record_batch(this.remain.as_mut(), batch).map(Ok))
+            }
             Poll::Ready(Some(Err(e))) => {
                 Poll::Ready(Some(Err(DataFusionError::External(Box::new(e)))))
             }

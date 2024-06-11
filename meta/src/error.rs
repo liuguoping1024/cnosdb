@@ -1,18 +1,14 @@
-use std::error::Error;
-use std::io;
-
 use error_code::{ErrorCode, ErrorCoder};
-use openraft::{AnyError, ErrorSubject, ErrorVerb, StorageError, StorageIOError};
+use models::auth::privilege::TenantObjectPrivilege;
+use models::ModelError;
+use serde::{Deserialize, Serialize};
 use snafu::Snafu;
 
 use crate::limiter::limiter_kind::RequestLimiterKind;
-use crate::{client, ClusterNodeId};
 
-pub type StorageIOResult<T> = Result<T, StorageIOError<ClusterNodeId>>;
-pub type StorageResult<T> = Result<T, StorageError<ClusterNodeId>>;
 pub type MetaResult<T> = Result<T, MetaError>;
 
-#[derive(Snafu, Debug, ErrorCoder)]
+#[derive(Snafu, Serialize, Deserialize, Debug, ErrorCoder)]
 #[snafu(visibility(pub))]
 #[error_code(mod_code = "03")]
 pub enum MetaError {
@@ -101,105 +97,138 @@ pub enum MetaError {
     #[error_code(code = 20)]
     TableAlreadyExists { table_name: String },
 
-    #[snafu(display("Module raft error reason: {}", source))]
-    #[error_code(code = 21)]
-    Raft {
-        source: StorageIOError<ClusterNodeId>,
-    },
-
-    #[snafu(display("Module sled error reason: {}", source))]
+    #[snafu(display("Module sled error reason: {}", msg))]
     #[error_code(code = 22)]
-    SledConflict {
-        source: sled::transaction::ConflictableTransactionError<AnyError>,
-    },
-
-    #[snafu(display("Module raft network error reason: {}", source))]
-    #[error_code(code = 23)]
-    RaftConnect { source: tonic::transport::Error },
+    SledConflict { msg: String },
 
     #[snafu(display("{} reached limit", kind))]
     #[error_code(code = 24)]
     RequestLimit { kind: RequestLimiterKind },
 
-    #[snafu(display("An error occurred while processing the data. Please try again"))]
+    #[snafu(display(
+        "An error occurred while processing the data: {}. Please try again",
+        msg
+    ))]
     #[error_code(code = 25)]
-    Retry,
+    Retry { msg: String },
 
     #[snafu(display("{}", msg))]
     ObjectLimit { msg: String },
-    // RaftRPC{
-    //     source: RPCError<ClusterNodeId, ClusterNode, Err>
-    // }
-    #[snafu(display("Connect to Meta error reason: {}", msg))]
+
+    #[snafu(display("Connect to Server({}) error reason: {}", addr, msg))]
     #[error_code(code = 26)]
-    ConnectMetaError { msg: String },
+    ConnectServerError { addr: String, msg: String },
+
+    #[snafu(display("Encode/Decode message error reason: {}", err))]
+    #[error_code(code = 27)]
+    SerdeMsgInvalid { err: String },
+
+    #[snafu(display("Raft group replication error: {}", err))]
+    #[error_code(code = 28)]
+    ReplicationErr { err: String },
+
+    #[snafu(display("Operation meta store io error: {}", err))]
+    #[error_code(code = 29)]
+    MetaStoreIO { err: String },
+
+    #[snafu(display("Data node already exist: {}", addr))]
+    #[error_code(code = 30)]
+    DataNodeExist { addr: String },
+
+    #[snafu(display("The bucket {} not found", id))]
+    #[error_code(code = 31)]
+    BucketNotFound { id: u32 },
+
+    #[snafu(display("database {} attribute invalid!", name))]
+    #[error_code(code = 32)]
+    DatabaseSchemaInvalid { name: String },
+
+    #[snafu(display("update table {} conflict", name))]
+    #[error_code(code = 33)]
+    UpdateTableConflict { name: String },
+
+    #[snafu(display("Operation not support: {}", msg))]
+    #[error_code(code = 34)]
+    NotSupport { msg: String },
+
+    #[snafu(display("Create limiter fail: {}", msg))]
+    #[error_code(code = 35)]
+    LimiterCreate { msg: String },
+
+    #[snafu(display("Operation request need to send to new address: {}", new_leader))]
+    #[error_code(code = 36)]
+    ChangeLeader { new_leader: String },
+
+    #[snafu(display("The vnode {} not found", id))]
+    #[error_code(code = 37)]
+    VnodeNotFound { id: u32 },
+
+    #[snafu(display(
+        "Valid node is not enough, need: {}, but found: {}",
+        need,
+        valid_node_num
+    ))]
+    #[error_code(code = 53)]
+    ValidNodeNotEnough { need: u64, valid_node_num: u32 },
+
+    #[error_code(code = 54)]
+    #[snafu(display("Invalid configuration: {msg}"))]
+    InvalidInitialConfig { msg: String },
+
+    #[error_code(code = 55)]
+    #[snafu(display("resourceinfo mark is lock by: {node_id}"))]
+    ResourceInfosMarkIsLock { node_id: u64 },
+
+    #[snafu(display("cannot revoke the privilege {privilege} of role"))]
+    #[error_code(code = 56)]
+    PrivilegeCannotRevoke { privilege: TenantObjectPrivilege },
 }
+
 impl MetaError {
     pub fn error_code(&self) -> &dyn ErrorCode {
         self
     }
 }
 
-pub fn sm_r_err<E: Error + 'static>(e: E) -> StorageIOError<ClusterNodeId> {
-    StorageIOError::new(
-        ErrorSubject::StateMachine,
-        ErrorVerb::Read,
-        AnyError::new(&e),
-    )
-}
-pub fn sm_w_err<E: Error + 'static>(e: E) -> StorageIOError<ClusterNodeId> {
-    StorageIOError::new(
-        ErrorSubject::StateMachine,
-        ErrorVerb::Write,
-        AnyError::new(&e),
-    )
-}
-pub fn s_r_err<E: Error + 'static>(e: E) -> StorageIOError<ClusterNodeId> {
-    StorageIOError::new(ErrorSubject::Store, ErrorVerb::Read, AnyError::new(&e))
-}
-pub fn s_w_err<E: Error + 'static>(e: E) -> StorageIOError<ClusterNodeId> {
-    StorageIOError::new(ErrorSubject::Store, ErrorVerb::Write, AnyError::new(&e))
-}
-pub fn v_r_err<E: Error + 'static>(e: E) -> StorageIOError<ClusterNodeId> {
-    StorageIOError::new(ErrorSubject::Vote, ErrorVerb::Read, AnyError::new(&e))
-}
-pub fn v_w_err<E: Error + 'static>(e: E) -> StorageIOError<ClusterNodeId> {
-    StorageIOError::new(ErrorSubject::Vote, ErrorVerb::Write, AnyError::new(&e))
-}
-pub fn l_r_err<E: Error + 'static>(e: E) -> StorageIOError<ClusterNodeId> {
-    StorageIOError::new(ErrorSubject::Logs, ErrorVerb::Read, AnyError::new(&e))
-}
-pub fn l_w_err<E: Error + 'static>(e: E) -> StorageIOError<ClusterNodeId> {
-    StorageIOError::new(ErrorSubject::Logs, ErrorVerb::Write, AnyError::new(&e))
-}
-
-pub fn ct_err<E: Error + 'static>(e: E) -> MetaError {
-    MetaError::SledConflict {
-        source: sled::transaction::ConflictableTransactionError::Abort(AnyError::new(&e)),
-    }
-}
-
-impl From<StorageIOError<ClusterNodeId>> for MetaError {
-    fn from(err: StorageIOError<ClusterNodeId>) -> Self {
-        MetaError::Raft { source: err }
-    }
-}
-
-impl From<io::Error> for MetaError {
-    fn from(err: io::Error) -> Self {
-        MetaError::CommonError {
-            msg: err.to_string(),
+impl From<std::io::Error> for MetaError {
+    fn from(err: std::io::Error) -> Self {
+        MetaError::MetaStoreIO {
+            err: err.to_string(),
         }
     }
 }
 
-impl From<client::WriteError> for MetaError {
-    fn from(err: client::WriteError) -> Self {
-        MetaError::MetaClientErr {
-            msg: err.to_string(),
+impl From<heed::Error> for MetaError {
+    fn from(err: heed::Error) -> Self {
+        MetaError::MetaStoreIO {
+            err: err.to_string(),
         }
     }
 }
+
+impl From<serde_json::Error> for MetaError {
+    fn from(e: serde_json::Error) -> Self {
+        MetaError::SerdeMsgInvalid { err: e.to_string() }
+    }
+}
+
+impl From<replication::errors::ReplicationError> for MetaError {
+    fn from(err: replication::errors::ReplicationError) -> Self {
+        MetaError::ReplicationErr {
+            err: err.to_string(),
+        }
+    }
+}
+
+impl From<models::ModelError> for MetaError {
+    fn from(value: ModelError) -> Self {
+        Self::CommonError {
+            msg: value.to_string(),
+        }
+    }
+}
+
+impl warp::reject::Reject for MetaError {}
 
 #[test]
 fn test_mod_code() {

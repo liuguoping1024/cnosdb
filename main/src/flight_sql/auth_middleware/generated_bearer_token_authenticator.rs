@@ -29,7 +29,6 @@ where
 {
     pub fn new(initial_authenticator: T) -> Self {
         let bearer_to_identifier = Cache::builder()
-            .thread_pool_enabled(false)
             // Time to idle (TTL): 10 minutes
             // If bearer is not used within 10 minutes, it will expire
             .time_to_idle(Duration::from_secs(10 * 60))
@@ -150,11 +149,12 @@ mod test {
             let options = unsafe {
                 UserOptionsBuilder::default()
                     .password("123456")
+                    .unwrap_unchecked()
                     .build()
                     .unwrap_unchecked()
             };
             let mock_desc = UserDesc::new(0_u128, "name".to_string(), options, false);
-            let mock_user = User::new(mock_desc, UserRole::Dba.to_privileges());
+            let mock_user = User::new(mock_desc, UserRole::Dba.to_privileges(), None);
             Ok(CommonAuthResult { user: mock_user })
         }
     }

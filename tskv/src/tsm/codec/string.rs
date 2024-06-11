@@ -31,10 +31,10 @@ pub fn str_snappy_encode(
     src: &[&[u8]],
     dst: &mut Vec<u8>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    dst.clear(); // reset buffer
     if src.is_empty() {
         return Ok(());
     }
+    dst.push(Encoding::Snappy as u8);
 
     // strings shouldn't be longer than 64kb
     let length_of_lengths = src.len() * super::MAX_VAR_INT_32;
@@ -57,14 +57,14 @@ pub fn str_snappy_encode(
     let compressed_size = max_encoded_len + HEADER_LEN;
     let total_size = source_size + compressed_size;
 
-    if dst.len() < total_size {
-        dst.resize(total_size, 0);
+    if dst.len() < total_size + 1 {
+        dst.resize(total_size + 1, 0);
     }
 
     // write the data to be compressed *after* the space needed for snappy
     // compression. The compressed data is at the start of the allocated buffer,
     // ensuring the entire capacity is returned and available for subsequent use.
-    let (compressed_data, data) = dst.split_at_mut(compressed_size);
+    let (compressed_data, data) = dst.split_at_mut(compressed_size + 1);
     let mut n = 0;
     for s in src {
         let len = s.len();
@@ -75,16 +75,15 @@ pub fn str_snappy_encode(
     }
     let data = &data[..n];
 
-    let (header, compressed_data) = compressed_data.split_at_mut(HEADER_LEN);
+    let (header, compressed_data) = compressed_data.split_at_mut(HEADER_LEN + 1);
 
-    header[0] = STRING_COMPRESSED_SNAPPY << 4; // write compression type
+    header[1] = STRING_COMPRESSED_SNAPPY << 4; // write compression type
 
     // TODO: snap docs say it is beneficial to reuse an `Encoder` when possible
     let mut encoder = snap::raw::Encoder::new();
     let actual_compressed_size = encoder.compress(data, compressed_data)?;
 
-    dst.truncate(HEADER_LEN + actual_compressed_size);
-    dst.insert(0, Encoding::Gorilla as u8);
+    dst.truncate(HEADER_LEN + actual_compressed_size + 1);
 
     Ok(())
 }
@@ -93,7 +92,6 @@ pub fn str_zstd_encode(
     src: &[&[u8]],
     dst: &mut Vec<u8>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    dst.clear(); // reset buffer
     if src.is_empty() {
         return Ok(());
     }
@@ -114,7 +112,6 @@ pub fn str_gzip_encode(
     src: &[&[u8]],
     dst: &mut Vec<u8>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    dst.clear(); // reset buffer
     if src.is_empty() {
         return Ok(());
     }
@@ -138,7 +135,6 @@ pub fn str_bzip_encode(
     src: &[&[u8]],
     dst: &mut Vec<u8>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    dst.clear(); // reset buffer
     if src.is_empty() {
         return Ok(());
     }
@@ -162,7 +158,6 @@ pub fn str_zlib_encode(
     src: &[&[u8]],
     dst: &mut Vec<u8>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    dst.clear(); // reset buffer
     if src.is_empty() {
         return Ok(());
     }
@@ -184,7 +179,6 @@ pub fn str_without_compress_encode(
     src: &[&[u8]],
     dst: &mut Vec<u8>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    dst.clear(); // reset buffer
     if src.is_empty() {
         return Ok(());
     }

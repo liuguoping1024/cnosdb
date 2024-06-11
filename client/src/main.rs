@@ -2,15 +2,19 @@ use std::path::{Path, PathBuf};
 use std::{env, fs};
 
 use clap::builder::PossibleValuesParser;
-use clap::{value_parser, Parser};
+use clap::{value_parser, Args, Parser, Subcommand};
 use client::ctx::{SessionConfig, SessionContext};
 use client::print_format::PrintFormat;
 use client::print_options::PrintOptions;
 use client::{exec, CNOSDB_CLI_VERSION};
+use http_protocol::encoding::Encoding;
 
-#[derive(Debug, Parser, PartialEq)]
+#[derive(Debug, Clone, Parser, PartialEq)]
 #[command(author, version, about, long_about= None)]
-struct Args {
+struct CliArgs {
+    #[command(subcommand)]
+    subcommand: Option<CliCommand>,
+
     /// Host of CnosDB server.
     #[arg(
         short = 'H', long,
@@ -31,9 +35,9 @@ struct Args {
     #[arg(short, long, default_value = "root")]
     user: String,
 
-    /// Password to connect to CnosDB server.
-    #[arg(short, long)]
-    password: Option<String>,
+    /// Use password to connect to CnosDB server.
+    #[arg(short, long, default_value = "false")]
+    password: bool,
 
     /// Rsa private key path for key pair authentication used to connect to the CnosDB.
     #[arg(long)]
@@ -62,6 +66,14 @@ struct Args {
     /// Path to your data, default to current directory
     #[arg(long, value_parser = try_parse_data_dir)]
     data_path: Option<String>,
+
+    /// HTTP response encoding. Support deflate, gzip, br, zstd.
+    #[arg(long,  value_parser = try_parse_encoding)]
+    receive_data_encoding: Option<Encoding>,
+
+    /// HTTP request encoding. Support deflate, gzip, br, zstd.
+    #[arg(long,  value_parser = try_parse_encoding)]
+    send_data_encoding: Option<Encoding>,
 
     // #[arg(
     //     long,
@@ -109,17 +121,62 @@ struct Args {
     /// The certificate(s) must be in PEM format.
     #[arg(long, value_name = "FILE")]
     cacert: Vec<String>,
+
+    /// Enable chunk mode, and CnosDB server uses http streaming output
+    #[arg(long, default_value = "false")]
+    chunked: bool,
+
+    /// Stop when an error is encounter
+    #[arg(long, default_value = "false")]
+    error_stop: bool,
+
+    /// Enable client command
+    #[arg(long, default_value = "false")]
+    process_cli_command: bool,
+}
+
+#[derive(Debug, Clone, Subcommand, PartialOrd, PartialEq)]
+enum CliCommand {
+    DumpDDL(DumpDDL),
+
+    RestoreDumpDDL(RestoreDumpDDL),
+}
+
+/// Dump ddl to files, Support multi tenants
+#[derive(Debug, Clone, Args, PartialOrd, PartialEq)]
+struct DumpDDL {
+    /// Dump tenants
+    #[arg(short, long)]
+    tenant: Vec<Option<String>>,
+}
+
+/// Restore database from files
+#[derive(Debug, Clone, Args, PartialOrd, PartialEq)]
+struct RestoreDumpDDL {
+    /// Tenant wanna restore
+    #[arg(short, long)]
+    tenant: Option<String>,
+
+    /// Restore files
+    #[arg()]
+    files: Vec<String>,
 }
 
 #[tokio::main]
 pub async fn main() -> Result<(), anyhow::Error> {
     env_logger::init();
-    let args = Args::parse();
+    let args = CliArgs::parse();
 
-    if !args.quiet {
+    if !args.quiet && args.subcommand.is_none() {
         println!("CnosDB CLI v{}", CNOSDB_CLI_VERSION);
         println!("Input arguments: {:?}", args);
     }
+
+    let password = if args.password {
+        Some(rpassword::prompt_password("password: ").unwrap())
+    } else {
+        None
+    };
 
     if let Some(ref path) = args.data_path {
         let p = Path::new(path);
@@ -135,17 +192,22 @@ pub async fn main() -> Result<(), anyhow::Error> {
         .with_host(args.host)
         .with_port(args.port)
         .with_user(args.user)
-        .with_password(args.password)
+        .with_password(password)
         .with_private_key(private_key)
         .with_tenant(args.tenant)
         .with_database(args.database)
         .with_target_partitions(args.target_partitions)
         .with_stream_trigger_interval(args.stream_trigger_interval)
+        .with_accept_encoding(args.receive_data_encoding)
+        .with_content_encoding(args.send_data_encoding)
         .with_result_format(args.format)
         .with_precision(args.precision)
         .with_ssl(args.use_ssl)
         .with_unsafe_ssl(args.use_unsafe_ssl)
-        .with_ca_certs(args.cacert);
+        .with_ca_certs(args.cacert)
+        .with_chunked(args.chunked)
+        .with_process_cli_command(args.process_cli_command)
+        .with_error_stop(args.error_stop);
 
     let mut ctx = SessionContext::new(session_config);
     if let Some(ref path) = args.write_line_protocol {
@@ -153,12 +215,29 @@ pub async fn main() -> Result<(), anyhow::Error> {
         return Ok(());
     }
 
-    let mut print_options = PrintOptions {
+    let print_options = PrintOptions {
         format: args.format,
         quiet: args.quiet,
     };
 
-    let files = args.file;
+    match args.subcommand {
+        Some(CliCommand::DumpDDL(d)) => {
+            let res = ctx.dump(d.tenant).await?;
+            println!("{}", res);
+            return Ok(());
+        }
+        Some(CliCommand::RestoreDumpDDL(r)) => {
+            ctx.get_mut_session_config().process_cli_command = true;
+            if let Some(t) = r.tenant {
+                ctx.set_tenant(t)
+            }
+            let files = r.files;
+            return exec::exec_from_files(files, &mut ctx, &print_options).await;
+        }
+        None => {}
+    }
+
+    let files = args.file.clone();
     let rc = match args.rc {
         Some(file) => file,
         None => {
@@ -173,13 +252,14 @@ pub async fn main() -> Result<(), anyhow::Error> {
             files
         }
     };
+
     if !files.is_empty() {
-        exec::exec_from_files(files, &mut ctx, &print_options).await
+        exec::exec_from_files(files, &mut ctx, &print_options).await?;
     } else {
         if !rc.is_empty() {
-            exec::exec_from_files(rc, &mut ctx, &print_options).await
+            exec::exec_from_files(rc, &mut ctx, &print_options).await?;
         }
-        exec::exec_from_repl(&mut ctx, &mut print_options).await;
+        exec::exec_from_repl(&mut ctx, &print_options).await;
     }
 
     Ok(())
@@ -212,5 +292,12 @@ fn try_parse_target_partitions(size: &str) -> std::result::Result<usize, String>
     match size.parse::<usize>() {
         Ok(s) if s > 0 => Ok(s),
         _ => Err(format!("target-partitions is not in 1..={}", usize::MAX)),
+    }
+}
+
+fn try_parse_encoding(encoding: &str) -> std::result::Result<Encoding, String> {
+    match Encoding::from_str_opt(encoding) {
+        Some(encoding) => Ok(encoding),
+        _ => Err(format!("encoding not support: {}", encoding)),
     }
 }

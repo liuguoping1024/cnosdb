@@ -2,11 +2,11 @@ use std::sync::Arc;
 
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::optimizer::common_subexpr_eliminate::CommonSubexprEliminate;
-use datafusion::optimizer::decorrelate_where_exists::DecorrelateWhereExists;
-use datafusion::optimizer::decorrelate_where_in::DecorrelateWhereIn;
+use datafusion::optimizer::decorrelate_predicate_subquery::DecorrelatePredicateSubquery;
 use datafusion::optimizer::eliminate_cross_join::EliminateCrossJoin;
 use datafusion::optimizer::eliminate_duplicated_expr::EliminateDuplicatedExpr;
 use datafusion::optimizer::eliminate_filter::EliminateFilter;
+use datafusion::optimizer::eliminate_join::EliminateJoin;
 use datafusion::optimizer::eliminate_limit::EliminateLimit;
 use datafusion::optimizer::eliminate_outer_join::EliminateOuterJoin;
 use datafusion::optimizer::eliminate_project::EliminateProjection;
@@ -27,14 +27,15 @@ use datafusion::optimizer::unwrap_cast_in_comparison::UnwrapCastInComparison;
 use datafusion::optimizer::OptimizerRule;
 use spi::query::analyzer::AnalyzerRef;
 use spi::query::session::SessionCtx;
-use spi::Result;
+use spi::QueryResult;
 use trace::debug;
+use trace::span_ext::SpanExt;
 
 use crate::extension::logical::optimizer_rule::rewrite_tag_scan::RewriteTagScan;
 use crate::sql::analyzer::DefaultAnalyzer;
 
 pub trait LogicalOptimizer: Send + Sync {
-    fn optimize(&self, plan: &LogicalPlan, session: &SessionCtx) -> Result<LogicalPlan>;
+    fn optimize(&self, plan: &LogicalPlan, session: &SessionCtx) -> QueryResult<LogicalPlan>;
 
     fn inject_optimizer_rule(&mut self, optimizer_rule: Arc<dyn OptimizerRule + Send + Sync>);
 }
@@ -64,8 +65,8 @@ impl Default for DefaultLogicalOptimizer {
             Arc::new(SimplifyExpressions::new()),
             Arc::new(UnwrapCastInComparison::new()),
             Arc::new(ReplaceDistinctWithAggregate::new()),
-            Arc::new(DecorrelateWhereExists::new()),
-            Arc::new(DecorrelateWhereIn::new()),
+            Arc::new(EliminateJoin::new()),
+            Arc::new(DecorrelatePredicateSubquery::new()),
             Arc::new(ScalarSubqueryToJoin::new()),
             Arc::new(ExtractEquijoinPredicate::new()),
             // simplify expressions does not simplify expressions in subqueries, so we
@@ -106,22 +107,24 @@ impl Default for DefaultLogicalOptimizer {
 }
 
 impl LogicalOptimizer for DefaultLogicalOptimizer {
-    fn optimize(&self, plan: &LogicalPlan, session: &SessionCtx) -> Result<LogicalPlan> {
+    fn optimize(&self, plan: &LogicalPlan, session: &SessionCtx) -> QueryResult<LogicalPlan> {
         let analyzed_plan = {
-            let mut span_recorder = session.get_child_span_recorder("analyze plan");
+            let mut span = session.get_child_span("analyze plan");
 
             self.analyzer
                 .analyze(plan, session)
                 .map(|p| {
-                    span_recorder.ok("analyzer");
-                    span_recorder.set_metadata(
-                        "analyzed logical plan",
-                        p.display_indent_schema().to_string(),
-                    );
+                    span.ok("analyzer");
+                    span.add_property(|| {
+                        (
+                            "analyzed logical plan",
+                            p.display_indent_schema().to_string(),
+                        )
+                    });
                     p
                 })
                 .map_err(|e| {
-                    span_recorder.error(e.to_string());
+                    span.error(e.to_string());
                     e
                 })?
         };
@@ -129,22 +132,24 @@ impl LogicalOptimizer for DefaultLogicalOptimizer {
         debug!("Analyzed logical plan:\n{}\n", plan.display_indent_schema(),);
 
         let optimizeed_plan = {
-            let mut span_recorder = session.get_child_span_recorder("optimize logical plan");
+            let mut span = session.get_child_span("optimize logical plan");
             session
                 .inner()
-                .state()
+                .clone()
                 .with_optimizer_rules(self.rules.clone())
                 .optimize(&analyzed_plan)
                 .map(|p| {
-                    span_recorder.ok("optimize");
-                    span_recorder.set_metadata(
-                        "optimized logical plan",
-                        p.display_indent_schema().to_string(),
-                    );
+                    span.ok("optimize");
+                    span.add_property(|| {
+                        (
+                            "optimized logical plan",
+                            p.display_indent_schema().to_string(),
+                        )
+                    });
                     p
                 })
                 .map_err(|e| {
-                    span_recorder.error(e.to_string());
+                    span.error(e.to_string());
                     e
                 })?
         };
